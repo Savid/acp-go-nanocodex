@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	flags.Var(seedFiles, "seed-file", "file seeded into the Nanocodex config root as <relpath>=<hostpath>; repeatable")
 	debug := flags.Bool("debug", false, "write debug logs to stderr")
 	printVersion := flags.Bool("version", false, "print adapter version and exit")
+	printHelperRelease := flags.Bool("nanocodex-helper-release", false, "print the required helper release and fingerprint as JSON and exit")
 
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -40,6 +42,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		_, _ = fmt.Fprintln(stdout, version())
 
 		return 0
+	}
+
+	if *printHelperRelease {
+		return writeHelperRelease(stdout, stderr)
 	}
 
 	level := slog.LevelWarn
@@ -86,6 +92,23 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 
 	if shutdownErr != nil {
 		_, _ = fmt.Fprintf(stderr, "acp-go-nanocodex: shutdown OpenTelemetry: %v\n", shutdownErr)
+
+		return 1
+	}
+
+	return 0
+}
+
+// writeHelperRelease prints the helper identity that initialization requires.
+func writeHelperRelease(stdout, stderr io.Writer) int {
+	helperVersion, helperFingerprint := nanocodexacp.HelperRelease()
+
+	err := json.NewEncoder(stdout).Encode(struct {
+		HelperVersion     string `json:"helperVersion"`
+		HelperFingerprint string `json:"helperFingerprint"`
+	}{helperVersion, helperFingerprint})
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "acp-go-nanocodex: write helper release: %v\n", err)
 
 		return 1
 	}

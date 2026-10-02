@@ -19,6 +19,8 @@ runs between prompts. New and restored sessions use short observation runs.
 - `native/`: the Rust helper, pinned upstream library, and protocol reference.
 - `integration/`: gated tests against the built helper.
 - `bin/`: built Go adapter and matching Rust helper; never committed.
+- `scripts/release.py`: release tag checks, reproducible builds, archive
+  smoke, and the release manifest. `dist/` holds its output; never committed.
 
 ## Commands
 
@@ -31,6 +33,9 @@ make native-test
 make native-vuln
 make test-integration-smoke
 make test-integration-live
+make release-check TAG=vX.Y.Z
+make release-build TAG=vX.Y.Z
+make release-smoke TAG=vX.Y.Z RELEASE_TARGET=linux_amd64
 ```
 
 `make build` stages both executables under `bin/`. The native toolchain is
@@ -42,6 +47,12 @@ executables under `bin/`; `ACP_GO_NANOCODEX_AGENT_BINARY` and
 `ACP_GO_NANOCODEX_HARNESS_PATH` override their paths. The integration Make
 targets build both executables first. Only the live target spends model tokens,
 and it requires explicit operator intent.
+
+Release targets require a clean commit whose `HelperVersion` and native
+package version equal the tag. `make release-build` installs pinned zig and
+cargo-zigbuild under `.tmp/` for Linux targets, builds with a glibc 2.28
+floor on Linux and a macOS 13 floor on darwin, and writes archives under
+`dist/`. CI runs the release jobs only for `v*` tags, after audit passes.
 
 `make native-vuln` installs pinned `cargo-audit` under `.tmp/` on first use and
 checks `native/Cargo.lock` against the RustSec advisory database. `make audit`
@@ -68,8 +79,10 @@ and macOS.
 
 Run `make test` and `make lint` for Go or Rust changes. Run `make audit` once
 changes settle. Run the integration smoke target after changing the native
-protocol, persistence, or executable packaging. Tests must verify externally
-visible behavior and concrete failure boundaries.
+protocol, persistence, or executable packaging. After changing release
+packaging, run `make release-build` and `make release-smoke` for the host
+target. Tests must verify externally visible behavior and concrete failure
+boundaries.
 
 ## Boundaries
 
@@ -77,4 +90,4 @@ visible behavior and concrete failure boundaries.
 - Keep provider credentials in environment or native auth files. Never log
   credentials, prompts, tool contents, or raw native event bodies by default.
 - Never run live model tests without explicit operator intent.
-- Never push or publish without user authorization.
+- Never push, tag, or publish without user authorization.

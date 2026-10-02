@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
 
+	nanocodexacp "github.com/savid/acp-go-nanocodex"
 	"github.com/stretchr/testify/require"
 )
 
@@ -19,6 +21,22 @@ func TestRunVersionFlag(t *testing.T) {
 	code := run(context.Background(), []string{"-version"}, strings.NewReader(""), &stdout, &stderr)
 	require.Equal(t, 0, code)
 	require.Equal(t, "dev\n", stdout.String())
+}
+
+func TestRunHelperReleaseFlag(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr bytes.Buffer
+
+	code := run(context.Background(), []string{"-nanocodex-helper-release"}, strings.NewReader(""), &stdout, &stderr)
+	require.Equal(t, 0, code)
+	require.Empty(t, stderr.String())
+
+	var release map[string]string
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &release))
+
+	helperVersion, helperFingerprint := nanocodexacp.HelperRelease()
+	require.Equal(t, map[string]string{"helperVersion": helperVersion, "helperFingerprint": helperFingerprint}, release)
 }
 
 func TestRunBadFlag(t *testing.T) {

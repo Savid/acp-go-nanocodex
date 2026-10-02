@@ -12,6 +12,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/wire"
+	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
 	"github.com/stretchr/testify/require"
 )
 
@@ -198,4 +199,13 @@ func TestAgentCloseReapsHelperThatIgnoresCancel(t *testing.T) {
 	resultPrompt := awaitAgentResult(t, prompted)
 	require.NoError(t, resultPrompt.err)
 	require.Equal(t, acp.StopReasonCancelled, resultPrompt.response.StopReason)
+}
+
+func TestHelperReleaseReportsRequiredHelper(t *testing.T) {
+	t.Parallel()
+
+	version, fingerprint := HelperRelease()
+	require.Equal(t, nanocodex.HelperVersion, version)
+	require.Equal(t, nativeHelperFingerprint, fingerprint)
+	require.Regexp(t, `^[0-9a-f]{64}$`, fingerprint)
 }

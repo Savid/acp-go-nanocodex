@@ -263,9 +263,11 @@ func TestConformanceEnvironmentCaptureScopeAndPathPrecedence(t *testing.T) {
 	require.Equal(t, "agent", captured[1]["scope"])
 	require.Equal(t, extraDir+string(os.PathListSeparator)+sessionDir, captured[0]["path"])
 	require.Equal(t, baseDir, captured[1]["path"])
+	expectedHome, err := filepath.EvalSymlinks(home)
+	require.NoError(t, err)
 	for _, row := range captured {
 		require.Equal(t, "before-construction", row["inherited"])
-		require.Equal(t, home, row["home"])
+		require.Equal(t, expectedHome, row["home"])
 		require.Empty(t, row["internal"])
 	}
 }
