@@ -232,11 +232,11 @@ A tag `vX.Y.Z` releases the commit whose `HelperVersion` and
 `native/Cargo.toml` version are both `X.Y.Z`; pre-release tags such as
 `vX.Y.Z-rc.1` follow the same rule. The tagged commit must be on the default
 branch, and the built helper must report the fingerprint the Go command
-requires at initialization. After audit and integration smoke pass for the
-tagged commit, CI builds every archive and smoke-tests each on its own
-platform. It then requires the Go module proxy to resolve the tag to that
-commit, attests the archives and manifest, verifies the assets of a draft
-release, and publishes it. Fix a faulty release with a new version.
+requires at initialization. CI builds each archive natively on its own
+platform and runs integration smoke against its extracted executables. It then
+requires the Go module proxy to resolve the tag to that commit, attests the
+archives and manifest, verifies the assets of a draft release, and publishes
+it. Fix a faulty release with a new version.
 
 | Asset | Contents |
 |---|---|

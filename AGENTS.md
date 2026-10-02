@@ -52,7 +52,8 @@ Release targets require a clean commit whose `HelperVersion` and native
 package version equal the tag. `make release-build` installs pinned zig and
 cargo-zigbuild under `.tmp/` for Linux targets, builds with a glibc 2.28
 floor on Linux and a macOS 13 floor on darwin, and writes archives under
-`dist/`. CI runs the release jobs only for `v*` tags, after audit passes.
+`dist/`. CI runs the release jobs only for `v*` tags, and tag pushes skip
+audit.
 
 `make native-vuln` installs pinned `cargo-audit` under `.tmp/` on first use and
 checks `native/Cargo.lock` against the RustSec advisory database. `make audit`
