@@ -1,0 +1,111 @@
+version: "2"
+run:
+  issues-exit-code: 1
+linters:
+  default: none
+  enable:
+    - asasalint
+    - bidichk
+    - bodyclose
+    - containedctx
+    - copyloopvar
+    - decorder
+    - dogsled
+    - durationcheck
+    - errcheck
+    - errname
+    - goconst
+    - gocritic
+    - gocyclo
+    - godot
+    - goheader
+    - goprintffuncname
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - nakedret
+    - nilerr
+    - nilnil
+    - nlreturn
+    - nolintlint
+    - nosprintfhostport
+    - prealloc
+    - predeclared
+    - promlinter
+    - reassign
+    - sloglint
+    - staticcheck
+    - tagliatelle
+    - thelper
+    - tparallel
+    - unconvert
+    - unused
+    - whitespace
+    - wsl_v5
+  settings:
+    errcheck:
+      check-type-assertions: true
+    goconst:
+      min-len: 2
+      min-occurrences: 3
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        # These are intentionally noisy for ACP/generated-style method
+        # signatures and local readability preferences. Keep gocritic enabled
+        # for bug-prone checks while avoiding mechanical churn.
+        - hugeParam
+        - paramTypeCombine
+        - tooManyResultsChecker
+        - unnamedResult
+    govet:
+      enable:
+        - shadow
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    sloglint:
+      no-mixed-args: true
+      kv-only: false
+      attr-only: true
+      context: scope
+      static-msg: true
+      key-naming-case: snake
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - gocritic
+          - goconst
+          - gosec
+          - wsl_v5
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

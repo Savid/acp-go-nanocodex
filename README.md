@@ -1,0 +1,246 @@
+# acp-go-nanocodex
+
+An [Agent Client Protocol](https://agentclientprotocol.com/) adapter for the
+[Nanocodex](https://github.com/gakonst/nanocodex) Rust agent library. The Go
+package implements ACP; the bundled Rust helper runs the native agent and
+tools. Each prompt launches a helper, resumes the conversation, runs its tool
+loop, flushes native history, and exits before the prompt settles.
+
+## Build and run
+
+Install Go, Rust through rustup, a C toolchain, and Make. The Go module and
+`native/rust-toolchain.toml` select the required toolchains; Cargo pins the
+upstream source revision and dependency graph.
+
+```sh
+make build
+install -m 755 bin/acp-go-nanocodex bin/acp-go-nanocodex-native ~/.local/bin/
+acp-go-nanocodex
+```
+
+The Go command also supports `go install ./cmd/acp-go-nanocodex`; install
+the matching built helper on `PATH` alongside it.
+
+Both binaries must be installed from the same release. The adapter checks the
+helper release, protocol version, and a fingerprint of the helper build inputs
+and Go wire declarations during initialization. Rebuild both binaries after
+changing those inputs. Alternatively, run
+from the checkout:
+
+```sh
+bin/acp-go-nanocodex -path "$PWD/bin/acp-go-nanocodex-native"
+```
+
+The command speaks ACP JSON-RPC on stdin/stdout. Diagnostics go to stderr.
+Configure authentication through `OPENAI_API_KEY` or native `auth.json` in
+`CODEX_HOME` (default `$HOME/.codex`). Rollouts therefore use the caller's real
+`~/.codex/sessions` by default; use `-home` or `WithHome` for a separate root.
+The helper runs tools with the caller's
+identity, environment, and session working directory. There is no ACP approval
+or elicitation surface.
+
+For **OpenRouter, OMP auth-gateway, and OpenCode Go**, see [provider configuration](PROVIDERS.md).
+Configured API-key HTTPS routes use standard Responses requests with complete
+history, `store:false`, and native function tools. All six model IDs accepted by Nanocodex are supported, including the three
+omitted from its default picker. A gateway namespace is configured separately
+with `NANOCODEX_MODEL_ID_PREFIX`; arbitrary provider models are not supported.
+
+## Embed
+
+```go
+package main
+
+import (
+    "context"
+    "os"
+
+    nanocodexacp "github.com/savid/acp-go-nanocodex"
+)
+
+func main() {
+    if err := nanocodexacp.Serve(context.Background(), os.Stdin, os.Stdout,
+        nanocodexacp.WithExecutablePath("/opt/bin/acp-go-nanocodex-native"),
+        nanocodexacp.WithDefaultModel("gpt-6.1-sol"),
+    ); err != nil {
+        panic(err)
+    }
+}
+```
+
+`Serve` closes its agent when the connection or context ends. It accepts
+caller-supplied streams and does not take ownership of their underlying files.
+`NewAgent` exposes the ACP methods for direct integration.
+
+### Process options
+
+| Option | Meaning |
+|---|---|
+| `WithExecutablePath` | Helper path or name on the base `PATH`; default `acp-go-nanocodex-native`. |
+| `WithHome` | Absolute native root, passed as `CODEX_HOME`. |
+| `WithScratchDir` | Accepted absolute scratch parent; this adapter allocates no scratch state. |
+| `WithInputHandoffRoot` | Absolute read root for verified image handoff files. |
+| `WithDefaultModel` | Default native model ID for new sessions. |
+| `WithConfiguredModels` | Explicit model IDs appended to the native selector. Native validation still applies. |
+| `WithEnv` | Environment overlay applied after the inherited environment. |
+| `WithSeedFiles` | Relative native-home files written before launch; existing unmanaged files are refused. |
+| `WithSessionStore` | Authoritative `acpcore.SessionStore`; defaults to a fresh in-memory store. |
+| `WithLogger` | Structured diagnostic logger. |
+| `WithAgentName`, `WithAgentTitle`, `WithAgentVersion` | ACP implementation identity. |
+| `WithTracerProvider`, `WithMeterProvider`, `WithTextMapPropagator` | OpenTelemetry providers and propagation. |
+| `WithConcurrencyLimits` | `MaxActiveSessions` (default 32) and `MaxConcurrentClientCalls` (default 16). The helper needs no client calls. |
+| `WithImageLimits` | Decoded input/output byte bounds; each field defaults to 6 MiB. Zero disables that policy bound while transport bounds remain. |
+
+`Options`, `Option`, `ConcurrencyLimits`, and `ImageLimits` configure the
+adapter. Invalid construction options fail before native launch.
+
+### Command flags
+
+| Flag | Meaning |
+|---|---|
+| `-path` | Helper executable. |
+| `-home` | Native configuration root. |
+| `-scratch-dir` | Absolute scratch parent. |
+| `-model` | Default native model ID. |
+| `-seed-file` | Repeatable `relative/path=/host/file` seed. |
+| `-debug` | Enable diagnostic logging to stderr. |
+| `-version` | Print the adapter version and exit. |
+
+The command configures telemetry through `OTEL_*` environment variables.
+Library use does not change global telemetry providers.
+
+## Sessions and configuration
+
+`NanocodexOptions` is the typed `_meta.nanocodex.options` namespace. Construct
+it with `NewNanocodexOptions`, then attach it using
+`WithSessionNanocodexOptions` and request builders from
+`github.com/savid/acp-go-core/wire`.
+
+| Field | Constructor | Meaning |
+|---|---|---|
+| `model` | `WithNanocodexModel` | Native model ID. |
+| `thinking` | `WithNanocodexThinking` | Native reasoning effort. |
+| `env` | `WithNanocodexEnv` | Session environment overlay. |
+| `extraPathDirs` | `WithNanocodexExtraPathDirs` | Ordered absolute directories prepended to `PATH`. |
+| `apiBaseUrl` | `WithNanocodexAPIBaseURL` | Responses API base URL. |
+| `websocketUrl` | `WithNanocodexWebsocketURL` | Native Responses WebSocket endpoint. |
+| `modelIdPrefix` | `WithNanocodexModelIDPrefix` | Provider wire namespace, such as `openai` or `openai-codex`. |
+| `transport` | `WithNanocodexTransport` | `https` (default) or `websocket`. |
+| `apiKeyEnv` | `WithNanocodexAPIKeyEnv` | Environment variable containing the provider key; defaults to `OPENAI_API_KEY`. |
+| `authFile` | `WithNanocodexAuthFile` | Native authentication file. |
+
+`ValidateNanocodexSessionMeta` validates this namespace without launching a
+helper. Unknown own-namespace fields are refused. Environment and path values
+are copied and stored with the session. Explicit session options override
+native environment defaults.
+
+ACP config selectors are `model` (category `model`) and `thought_level`
+(category `thought_level`). The model can change before the first committed
+turn; later turns retain that model. Effort can change between turns.
+`SetModelRequest` builds a model selector request.
+
+Text, resource links, embedded text resources, and raster images are accepted.
+Image validation uses `github.com/savid/acp-go-core/image`. Ordered text and
+images are preserved. Handoff files are read only when `WithInputHandoffRoot`
+is configured. Additional directories, MCP servers, structured output,
+session modes, account-usage reads, and slash-command discovery are unsupported.
+Slash-prefixed text is ordinary prompt text.
+
+`WithSessionRawEvents(true)` enables `RawEventMethod`
+(`_nanocodex/rawEvent`) for the live prompt. Notifications are bounded,
+non-authoritative, and omit inline image payloads. They are never replayed.
+
+The negotiated `acp-go.dev/lifecycle` extension reports
+`updatesOutsidePrompt:false` and no activity kinds. Each prompt owns a fresh
+stream. A second foreground operation receives backpressure. `session/cancel`
+cancels the native turn. The prompt response waits for native cleanup, the
+store commit, and final lifecycle publication. Cancelling a handler context
+does not release turn ownership or cancel native work.
+
+## Persistence
+
+`SessionStoreFormat` is `nanocodex-rollout-jsonl-v1`. The main subpath contains
+raw native rollout rows; `config` contains the ACP/native identities, relative
+rollout path, working directory, provider/model settings, accepted environment,
+title, and timestamp. `github.com/savid/acp-go-core` supplies the store types
+and atomic mirror operations.
+
+The store is authoritative even when the default in-memory store is used.
+An adapter never adopts a native-only session that lacks a store entry.
+`session/load` restores state and replays messages, visible reasoning summaries,
+and function/custom tool calls with their text results. Multimodal tool results
+replay only their text parts. `session/resume` restores without replay.
+A native file with additional rows
+is adopted only when its shared prefix agrees with the store. Divergence fails
+restore. Deletion tombstones the store and leaves native files intact.
+
+Native files live under `CODEX_HOME/sessions/`. The Go adapter holds the native
+UUID lock from before hydration until the helper has exited and been reaped. New, load, and resume responses and
+list entries expose that UUID in `_meta.nanocodex.nativeSessionId`, distinct
+from the ACP `sessionId`. After shutdown, use it as both `sessionId` and `resumeSessionId` in the
+[native helper protocol](native/PROTOCOL.md) to continue independently.
+
+An untouched native rollout has no resumable conversation. The next launch
+after `session/new`, including a prompt or config change, creates a new native
+binding when the existing state is a verified header-only rollout. Each such
+launch preserves the old metadata file and commits the new binding before
+accepting input or returning configuration success. The ACP session ID
+stays stable. Malformed or nonempty native state never takes this path.
+
+An unexpected native session or rollout identity change returns
+`nanocodex_session_poisoned` with cause `native_session_identity_drift`.
+The session refuses further work with the same cause until explicitly closed
+or deleted. After closing, load or resume can attempt store-backed restoration.
+
+A failed prompt mirror commit returns `nanocodex_turn_failed` with cause
+`transport` and message `session mirror commit failed`. Store failures outside
+a prompt return `nanocodex_internal_failure` without a class. Failed restoration returns
+`nanocodex_restore_failed` and leaves the store entry intact. Other internal
+failures may carry one of these `class` values:
+
+| Class | Condition |
+|---|---|
+| `native_start` | Helper launch or initialization failed. |
+| `native_state` | The helper reported invalid state fields or a rollout path outside its session tree. |
+| `lifecycle` | Publishing the prompt's terminal lifecycle update failed. |
+
+## Scope
+
+Configured API-key HTTPS gateways expose native function tools, including
+shell execution and file operations through the shell. Code Mode and freeform
+patch tools are excluded on those routes. Gateway remote compaction and
+automatic retries are unavailable; a failed operation preserves its committed
+history. Native default and WebSocket routes retain upstream transport behavior.
+Shell sessions and other in-memory tool state last for one prompt; subsequent
+prompts resume the saved conversation in a new helper.
+Image tool outputs are not projected as ACP images.
+
+## Development
+
+```sh
+make build
+make test
+make audit
+make test-integration-smoke
+```
+
+Unit tests use a scripted helper and require neither provider credentials nor
+an installed native binary. Rust tests and integration smoke use real helper
+processes with local deterministic provider fixtures. They spend no model
+tokens. Missing binaries skip the smoke tests with a prerequisite message.
+
+`make test-integration-live` explicitly enables a token-spending tool call to
+resolve a marker executable through session `extraPathDirs`, raw event
+delivery, store-backed replay and resume, conversation continuation,
+cancellation, and deletion. It uses a
+temporary native home. Supply `OPENAI_API_KEY` (or the variable selected by
+`NANOCODEX_API_KEY_ENV`), or set `ACP_GO_NANOCODEX_HOME` to a native home whose
+`auth.json` can be copied into the temporary home. Provider route environment
+variables are inherited. `ACP_GO_NANOCODEX_MODEL` selects the live model;
+`ACP_GO_NANOCODEX_HARNESS_PATH` and `ACP_GO_NANOCODEX_AGENT_BINARY` select
+prebuilt executables. Explicitly enabled live tests fail on missing prerequisites.
+
+`make audit` runs formatting, lint, both builds, race/coverage checks, module
+tidiness, vulnerability scanning, and modernization checks. Rust formatting,
+Clippy, and native tests participate in those gates. `make native-vuln` scans
+Cargo.lock with pinned `cargo-audit`, installed under `.tmp/` on first use.
+CI runs audit and the real-helper integration smoke tests on Linux and macOS.

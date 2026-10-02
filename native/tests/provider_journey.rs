@@ -1,0 +1,1171 @@
+use axum::{
+    Json, Router,
+    body::{Body, Bytes},
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
+};
+use futures_util::{StreamExt, stream};
+use serde_json::{Value, json};
+use std::{
+    collections::VecDeque,
+    convert::Infallible,
+    path::Path,
+    process::Stdio,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tempfile::TempDir;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    net::TcpListener,
+    process::{Child, ChildStdin, ChildStdout, Command},
+    task::JoinHandle,
+    time::timeout,
+};
+
+const DEADLINE: Duration = Duration::from_secs(20);
+
+struct Helper {
+    child: Child,
+    input: ChildStdin,
+    output: Lines<BufReader<ChildStdout>>,
+    events: Vec<Value>,
+}
+
+impl Helper {
+    fn start(workspace: &Path, native_home: &Path, key_env: &str) -> Self {
+        Self::start_with_env(workspace, native_home, key_env, &[])
+    }
+
+    fn start_with_env(
+        workspace: &Path,
+        native_home: &Path,
+        key_env: &str,
+        extra: &[(&str, &str)],
+    ) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_acp-go-nanocodex-native"))
+            .current_dir(workspace)
+            .env("CODEX_HOME", native_home)
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
+            .env_remove("NANOCODEX_MODEL_ID_PREFIX")
+            .env_remove("NANOCODEX_TRANSPORT")
+            .env_remove("NANOCODEX_API_KEY_ENV")
+            .env(key_env, "fixture-bearer-token")
+            .envs(extra.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start helper");
+        Self {
+            input: child.stdin.take().expect("helper stdin"),
+            output: BufReader::new(child.stdout.take().expect("helper stdout")).lines(),
+            child,
+            events: Vec::new(),
+        }
+    }
+
+    async fn send(&mut self, id: u64, method: &str, params: Value) {
+        let mut encoded =
+            serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
+                .expect("encode request");
+        encoded.push(b'\n');
+        self.input.write_all(&encoded).await.expect("write request");
+        self.input.flush().await.expect("flush request");
+    }
+
+    async fn next(&mut self) -> Value {
+        let line = timeout(DEADLINE, self.output.next_line())
+            .await
+            .expect("helper frame deadline")
+            .expect("read helper frame")
+            .expect("helper exited before reply");
+        serde_json::from_str(&line).expect("helper stdout must contain JSONL only")
+    }
+
+    async fn reply(&mut self, id: u64) -> Value {
+        loop {
+            let frame = self.next().await;
+            if frame.get("event").is_some() {
+                self.events.push(frame);
+                continue;
+            }
+            assert_eq!(frame["id"], id, "reply ID");
+            return frame;
+        }
+    }
+
+    async fn call(&mut self, id: u64, method: &str, params: Value) -> Value {
+        self.send(id, method, params).await;
+        let frame = self.reply(id).await;
+        assert!(
+            frame.get("error").is_none(),
+            "helper rejected request: {frame}; events: {:?}",
+            self.events
+        );
+        frame["result"].clone()
+    }
+
+    async fn shutdown(mut self, id: u64) {
+        self.call(id, "shutdown", json!({})).await;
+        let status = timeout(DEADLINE, self.child.wait())
+            .await
+            .expect("shutdown deadline")
+            .expect("wait for shutdown");
+        assert!(status.success(), "helper shutdown failed: {status}");
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ObservedRequest {
+    headers: HeaderMap,
+    body: Value,
+}
+
+enum Reply {
+    Text(&'static str),
+    TextWithoutCreated(&'static str),
+    CompletedText(&'static str),
+    IdlessShell,
+    IdlessText {
+        streamed: bool,
+    },
+    Shell,
+    Hang,
+    Rejected,
+    ErrorEvent {
+        code: String,
+        nested: bool,
+    },
+    PartialShell,
+    Oversized,
+    LineEndings {
+        newline: &'static str,
+        fragmented: bool,
+    },
+}
+
+struct ProviderState {
+    requests: Vec<ObservedRequest>,
+    replies: VecDeque<Reply>,
+}
+
+struct Provider {
+    base_url: String,
+    state: Arc<Mutex<ProviderState>>,
+    server: JoinHandle<()>,
+}
+
+impl Drop for Provider {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+impl Provider {
+    async fn start(replies: impl IntoIterator<Item = Reply>) -> Self {
+        let state = Arc::new(Mutex::new(ProviderState {
+            requests: Vec::new(),
+            replies: replies.into_iter().collect(),
+        }));
+        let app = Router::new()
+            .route("/v1/responses", post(respond).get(|| async {
+                (StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"provider body includes fixture-bearer-token"}})))
+            }))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("fixture address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fixture");
+        });
+        Self {
+            base_url,
+            state,
+            server,
+        }
+    }
+
+    fn requests(&self) -> Vec<ObservedRequest> {
+        self.state.lock().expect("fixture state").requests.clone()
+    }
+}
+
+fn sse(event: Value) -> Bytes {
+    Bytes::from(format!(
+        "event: {}\ndata: {event}\n\n",
+        event["type"].as_str().expect("event type")
+    ))
+}
+
+fn complete(id: &str, output: Value) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {
+            "id": id, "status": "completed", "output": output,
+            "usage": {
+                "input_tokens": 12, "output_tokens": 3, "total_tokens": 15,
+                "input_tokens_details": {"cached_tokens": 4},
+                "output_tokens_details": {"reasoning_tokens": 1}
+            }
+        }
+    })
+}
+
+async fn respond(
+    State(state): State<Arc<Mutex<ProviderState>>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let identified_client = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("acp-go-nanocodex/"));
+    if !identified_client {
+        return (StatusCode::BAD_REQUEST, "gateway requires client identity").into_response();
+    }
+    assert!(!headers.contains_key("x-opencode-session"));
+    let standard_tools = body["tools"].as_array().is_some_and(|tools| {
+        tools.iter().all(|tool| tool["type"] == "function")
+            && tools.iter().any(|tool| tool["name"] == "exec_command")
+    });
+    let standard_input = body["input"].as_array().is_some_and(|items| {
+        items.iter().all(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("message" | "reasoning" | "function_call" | "function_call_output")
+            )
+        })
+    });
+    if !standard_tools || !standard_input {
+        return (
+            StatusCode::BAD_REQUEST,
+            "gateway requires top-level function tools and standard Responses items",
+        )
+            .into_response();
+    }
+    let (reply, number) = {
+        let mut state = state.lock().expect("fixture state");
+        state.requests.push(ObservedRequest { headers, body });
+        (state.replies.pop_front(), state.requests.len())
+    };
+    let Some(reply) = reply else {
+        return (StatusCode::BAD_REQUEST, "unexpected model request").into_response();
+    };
+    if matches!(reply, Reply::Rejected) {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": {"message":"provider body includes fixture-bearer-token", "type":"invalid_request_error"}
+        }))).into_response();
+    }
+    if let Reply::ErrorEvent { code, nested } = &reply {
+        let error = json!({"type":"too_many_requests", "code":code, "message":"provider body includes fixture-bearer-token"});
+        let event = if *nested {
+            json!({"type":"response.failed", "response":{"error":error}})
+        } else {
+            json!({"type":"error", "error":error})
+        };
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from(sse(event)),
+        )
+            .into_response();
+    }
+    if matches!(reply, Reply::Oversized) {
+        let chunks = stream::iter(
+            (0..33).map(|_| Ok::<_, Infallible>(Bytes::from(vec![b'x'; 1024 * 1024]))),
+        );
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(chunks),
+        )
+            .into_response();
+    }
+    let id = format!("resp_{number}");
+    let created =
+        sse(json!({"type":"response.created", "response":{"id":id,"status":"in_progress"}}));
+    if let Reply::LineEndings {
+        newline,
+        fragmented,
+    } = reply
+    {
+        let message = json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"line endings accepted"}]});
+        let completed = complete(&id, json!([message]));
+        let body = format!("event: response.completed{newline}data: {completed}{newline}{newline}");
+        let pieces = if fragmented {
+            body.bytes()
+                .map(|byte| Bytes::from(vec![byte]))
+                .collect::<Vec<_>>()
+        } else {
+            vec![Bytes::from(body)]
+        };
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(stream::iter(pieces.into_iter().map(Ok::<_, Infallible>))),
+        )
+            .into_response();
+    }
+    let bytes = match reply {
+        Reply::Text(text) | Reply::TextWithoutCreated(text) | Reply::CompletedText(text) => {
+            let item = json!({"id":format!("msg_{number}"),"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]});
+            let mut events = Vec::new();
+            let mut output = Vec::new();
+            if matches!(reply, Reply::Text(_)) {
+                events.push(created);
+            }
+            if !matches!(reply, Reply::CompletedText(_)) {
+                events.push(sse(json!({"type":"response.reasoning_summary_text.delta","item_id":format!("rs_{number}"),"output_index":0,"summary_index":0,"delta":"visible reasoning"})));
+                events.push(sse(
+                    json!({"type":"response.output_text.delta","item_id":format!("msg_{number}"),"output_index":1,"content_index":0,"delta":text}),
+                ));
+                output.push(json!({"id":format!("rs_{number}"),"type":"reasoning","summary":[{"type":"summary_text","text":"visible reasoning"}]}));
+            }
+            output.push(item);
+            events.push(sse(complete(&id, json!(output))));
+            events
+        }
+        Reply::IdlessShell => vec![
+            created,
+            sse(complete(
+                &id,
+                json!([
+                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking"}]},
+                    {"type":"function_call","call_id":"call_idless","name":"exec_command","arguments":"{\"cmd\":\"printf fixture-idless-tool\",\"login\":false}"}
+                ]),
+            )),
+        ],
+        Reply::IdlessText { streamed } => {
+            let item = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking complete"}]});
+            let mut events = Vec::new();
+            if streamed {
+                events.push(sse(json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Checking"})));
+                events.push(sse(
+                    json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                ));
+            }
+            events.push(sse(complete(&id, json!([item.clone(), item]))));
+            events
+        }
+        Reply::Shell => vec![
+            created,
+            sse(complete(
+                &id,
+                json!([{
+                    "id":"fc_shell", "type":"function_call", "call_id":"call_shell",
+                    "name":"exec_command", "status":"completed",
+                    "arguments":json!({"cmd":"printf 'fixture-file-value' > provider-tool.txt; printf 'fixture-tool-output'", "login":false}).to_string()
+                }]),
+            )),
+        ],
+        Reply::Hang => {
+            let first = stream::iter(vec![
+                Ok::<_, Infallible>(created),
+                Ok(sse(
+                    json!({"type":"response.output_text.delta","item_id":"msg_hang","output_index":0,"content_index":0,"delta":"still working"}),
+                )),
+            ]);
+            return (
+                [("content-type", "text/event-stream")],
+                Body::from_stream(first.chain(stream::pending())),
+            )
+                .into_response();
+        }
+        Reply::PartialShell => vec![
+            created,
+            sse(json!({
+                "type":"response.output_item.done", "output_index":0,
+                "item":{"id":"fc_partial", "type":"function_call", "name":"exec_command",
+                    "call_id":"call_partial", "arguments":json!({"cmd":"touch must-not-run", "login":false}).to_string()}
+            })),
+        ],
+        Reply::Rejected
+        | Reply::ErrorEvent { .. }
+        | Reply::Oversized
+        | Reply::LineEndings { .. } => unreachable!(),
+    };
+    let stream = stream::iter(bytes.into_iter().map(Ok::<_, Infallible>));
+    (
+        [("content-type", "text/event-stream")],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+fn initialize(provider: &Provider, key_env: &str, prefix: &str) -> Value {
+    json!({
+        "sessionId": uuid::Uuid::now_v7().to_string(),
+        "model": "gpt-6.1-sol", "thinking": "low", "transport": "https",
+        "apiBaseUrl": provider.base_url, "apiKeyEnv": key_env, "modelIdPrefix": prefix,
+    })
+}
+
+fn prompt(text: &str) -> Value {
+    json!({"content":[{"type":"text","text":text}]})
+}
+
+fn assert_stateless(request: &ObservedRequest, model: &str) {
+    assert_eq!(
+        request.headers["authorization"],
+        "Bearer fixture-bearer-token"
+    );
+    assert_eq!(request.body["model"], model);
+    assert_eq!(request.body["store"], false);
+    assert_eq!(request.body["stream"], true);
+    assert!(request.body.get("previous_response_id").is_none());
+    assert!(
+        request.body.get("type").is_none(),
+        "HTTP is not a WebSocket envelope"
+    );
+}
+
+#[tokio::test]
+async fn gateway_response_ids_follow_provider_disclosure_for_each_call() {
+    let provider = Provider::start([
+        Reply::Text("known response"),
+        Reply::TextWithoutCreated("ID disclosed on completion"),
+        Reply::CompletedText("completion-only message"),
+    ])
+    .await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "OPENROUTER_API_KEY", "openai"),
+        )
+        .await;
+    for number in 1..=3 {
+        helper.events.clear();
+        helper
+            .call(number + 1, "prompt", prompt("inspect response attribution"))
+            .await;
+        let mut text_events = 0;
+        let mut message_key = None;
+        let mut reasoning_key = None;
+        for event in &helper.events {
+            let kind = event["event"].as_str().expect("event kind");
+            if !matches!(
+                kind,
+                "assistant_delta" | "reasoning_delta" | "assistant_message"
+            ) {
+                continue;
+            }
+            text_events += 1;
+            let data = &event["data"];
+            if number == 2 && kind != "assistant_message" {
+                assert!(
+                    data.get("responseId").is_none(),
+                    "early chunks must not inherit the previous response ID"
+                );
+            } else {
+                assert_eq!(data["responseId"], format!("resp_{number}"));
+            }
+            let key = data["itemKey"].as_str().expect("required presentation key");
+            assert!(!key.is_empty());
+            if kind == "reasoning_delta" {
+                reasoning_key = Some(key.to_owned());
+            } else if let Some(previous) = &message_key {
+                assert_eq!(
+                    key, previous,
+                    "streamed and completed item keys stay stable"
+                );
+            } else {
+                message_key = Some(key.to_owned());
+            }
+        }
+        assert_eq!(text_events, if number == 3 { 1 } else { 3 });
+        let message_key = message_key.expect("message key");
+        assert_ne!(Some(&message_key), reasoning_key.as_ref());
+    }
+    helper.shutdown(5).await;
+}
+
+#[tokio::test]
+async fn idless_messages_keep_distinct_keys_across_calls_and_output_items() {
+    let provider = Provider::start([
+        Reply::IdlessShell,
+        Reply::IdlessText { streamed: false },
+        Reply::IdlessText { streamed: true },
+    ])
+    .await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "OPENROUTER_API_KEY", "openai"),
+        )
+        .await;
+    helper
+        .call(2, "prompt", prompt("check and then report"))
+        .await;
+    let messages = helper
+        .events
+        .iter()
+        .filter(|event| event["event"] == "assistant_message")
+        .collect::<Vec<_>>();
+    let first_message = helper
+        .events
+        .iter()
+        .position(|event| event["event"] == "assistant_message")
+        .unwrap();
+    let first_tool = helper
+        .events
+        .iter()
+        .position(|event| event["data"]["type"] == "tool.call")
+        .unwrap();
+    assert!(
+        first_message < first_tool,
+        "model text must precede its tool call"
+    );
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["data"]["text"], "Checking");
+    assert_eq!(messages[1]["data"]["text"], "Checking complete");
+    assert_eq!(messages[2]["data"]["text"], "Checking complete");
+    let keys = messages
+        .iter()
+        .map(|event| event["data"]["itemKey"].as_str().expect("item key"))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        keys.len(),
+        3,
+        "identical idless text still belongs to distinct items"
+    );
+    helper.events.clear();
+    helper.call(3, "prompt", prompt("stream the report")).await;
+    let delta = helper
+        .events
+        .iter()
+        .find(|event| event["event"] == "assistant_delta")
+        .expect("live delta");
+    let messages = helper
+        .events
+        .iter()
+        .filter(|event| event["event"] == "assistant_message")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages.len(),
+        2,
+        "item-done and response completion must not duplicate one item"
+    );
+    assert_eq!(delta["data"]["itemKey"], messages[0]["data"]["itemKey"]);
+    assert_ne!(
+        messages[0]["data"]["itemKey"],
+        messages[1]["data"]["itemKey"]
+    );
+    assert!(delta["data"].get("responseId").is_none());
+    assert_eq!(messages[1]["data"]["responseId"], "resp_3");
+    helper.shutdown(4).await;
+}
+
+#[tokio::test]
+async fn gateway_shell_tool_and_restored_rollout_continue_the_same_conversation() {
+    let provider = Provider::start([
+        Reply::Shell,
+        Reply::Text("file created"),
+        Reply::Text("history retained"),
+    ])
+    .await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut helper = Helper::start(
+        workspace.path(),
+        native_home.path(),
+        "OMP_AUTH_GATEWAY_TOKEN",
+    );
+    let config = initialize(&provider, "OMP_AUTH_GATEWAY_TOKEN", "openai-codex");
+    let initialized = helper.call(1, "initialize", config.clone()).await;
+    let completed = helper
+        .call(2, "prompt", prompt("create a file then report completion"))
+        .await;
+    assert_eq!(completed["stopReason"], "end_turn");
+    assert_eq!(completed["finalMessage"], "file created");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("provider-tool.txt"))
+            .expect("tool created file"),
+        "fixture-file-value"
+    );
+    assert_eq!(
+        helper.events.first().expect("accepted event")["event"],
+        "accepted"
+    );
+    assert!(
+        helper
+            .events
+            .iter()
+            .any(|event| event["data"]["type"] == "tool.call")
+    );
+    assert!(
+        helper
+            .events
+            .iter()
+            .any(|event| event["data"]["type"] == "tool.result")
+    );
+    assert!(
+        helper
+            .events
+            .iter()
+            .any(|event| event["event"] == "assistant_delta")
+    );
+    assert!(helper.events.iter().all(|event| event["requestId"] == 2));
+    let rollout = Path::new(completed["rolloutPath"].as_str().expect("rollout path")).to_owned();
+    let committed = completed["committedBytes"]
+        .as_u64()
+        .expect("committed bytes") as usize;
+    let saved = std::fs::read(&rollout).expect("durable rollout")[..committed].to_vec();
+    helper.shutdown(3).await;
+
+    // Only the caller's committed mirror survives this simulated native-state loss.
+    std::fs::remove_dir_all(native_home.path()).expect("remove native fixture state");
+    std::fs::create_dir_all(rollout.parent().expect("rollout parent"))
+        .expect("restore rollout parent");
+    std::fs::write(&rollout, saved).expect("restore mirrored rollout");
+    let mut helper = Helper::start(
+        workspace.path(),
+        native_home.path(),
+        "OMP_AUTH_GATEWAY_TOKEN",
+    );
+    let mut resume = config;
+    resume["resumeSessionId"] = initialized["nativeSessionId"].clone();
+    let resumed = helper.call(1, "initialize", resume).await;
+    assert_eq!(resumed["nativeSessionId"], initialized["nativeSessionId"]);
+    let next = helper
+        .call(2, "prompt", prompt("what did you just create?"))
+        .await;
+    assert_eq!(next["finalMessage"], "history retained");
+    helper.shutdown(3).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert_stateless(request, "openai-codex/gpt-6.1-sol");
+    }
+    let continuation = requests[1].body.to_string();
+    assert!(
+        continuation.contains("fixture-tool-output"),
+        "native tool output reaches provider"
+    );
+    let resumed = requests[2].body.to_string();
+    for retained in [
+        "create a file then report completion",
+        "fixture-tool-output",
+        "file created",
+        "what did you just create?",
+    ] {
+        assert!(
+            resumed.contains(retained),
+            "restored provider history lost {retained}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn openrouter_uses_selected_key_namespace_and_full_history_on_followup() {
+    let provider = Provider::start([
+        Reply::Text("first response"),
+        Reply::Text("second response"),
+    ])
+    .await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "OPENROUTER_API_KEY", "openai"),
+        )
+        .await;
+    helper
+        .call(2, "prompt", prompt("remember the first question"))
+        .await;
+    let response = helper
+        .call(3, "prompt", prompt("answer the next question"))
+        .await;
+    assert_eq!(response["usage"]["inputTokens"], 12);
+    assert_eq!(response["usage"]["cachedInputTokens"], 4);
+    for event in &helper.events {
+        if event["data"]["type"] == "model.call.completed" {
+            assert!(
+                event["data"]["payload"]["usage"]["input_tokens_details"]
+                    .get("cache_write_tokens")
+                    .is_none()
+            );
+        }
+    }
+    assert_eq!(response["usage"]["outputTokens"], 3);
+    helper.shutdown(4).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_stateless(request, "openai/gpt-6.1-sol");
+    }
+    let replay = requests[1].body.to_string();
+    assert!(replay.contains("remember the first question"));
+    assert!(replay.contains("first response"));
+    assert!(replay.contains("answer the next question"));
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_an_open_stream_after_delivering_live_text() {
+    let provider = Provider::start([Reply::Hang, Reply::Text("resumed after cancel")]).await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    let config = initialize(&provider, "OPENROUTER_API_KEY", "openai");
+    let initialized = helper.call(1, "initialize", config.clone()).await;
+    helper.send(2, "prompt", prompt("start a long turn")).await;
+    loop {
+        let frame = helper.next().await;
+        assert!(
+            frame.get("event").is_some(),
+            "prompt completed before cancellation: {frame}"
+        );
+        if frame["event"] == "assistant_delta" {
+            break;
+        }
+    }
+    helper.send(3, "cancel", json!({})).await;
+    let mut cancelled = false;
+    let mut completed = false;
+    while !cancelled || !completed {
+        let frame = helper.next().await;
+        if frame.get("event").is_some() {
+            continue;
+        }
+        assert!(frame.get("error").is_none(), "cancellation failed: {frame}");
+        match frame["id"].as_u64() {
+            Some(2) => {
+                assert_eq!(frame["result"]["stopReason"], "cancelled");
+                assert!(
+                    frame["result"]["committedBytes"]
+                        .as_u64()
+                        .expect("flush size")
+                        > 0
+                );
+                completed = true;
+            }
+            Some(3) => {
+                assert_eq!(frame["result"]["cancelled"], true);
+                cancelled = true;
+            }
+            _ => panic!("unexpected cancellation reply: {frame}"),
+        }
+    }
+    helper.shutdown(4).await;
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    let mut resume = config;
+    resume["resumeSessionId"] = initialized["nativeSessionId"].clone();
+    let resumed = helper.call(1, "initialize", resume).await;
+    assert_eq!(resumed["nativeSessionId"], initialized["nativeSessionId"]);
+    let completed = helper
+        .call(2, "prompt", prompt("continue after cancellation"))
+        .await;
+    assert_eq!(completed["finalMessage"], "resumed after cancel");
+    helper.shutdown(3).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].body.to_string().contains("start a long turn"));
+    assert!(
+        requests[1]
+            .body
+            .to_string()
+            .contains("continue after cancellation")
+    );
+}
+
+#[tokio::test]
+async fn failed_provider_reply_does_not_expose_the_response_body_in_rpc_error() {
+    let provider = Provider::start([Reply::Rejected]).await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "OPENROUTER_API_KEY", "openai"),
+        )
+        .await;
+    helper.send(2, "prompt", prompt("rejected prompt")).await;
+    let reply = helper.reply(2).await;
+    assert_eq!(reply["error"]["code"], "native_error");
+    assert_eq!(reply["error"]["statusCode"], 400);
+    assert_eq!(reply["error"]["message"], "provider rejected the request");
+    assert!(!reply.to_string().contains("fixture-bearer-token"));
+    assert!(
+        !serde_json::to_string(&helper.events)
+            .unwrap()
+            .contains("fixture-bearer-token")
+    );
+    helper.shutdown(3).await;
+}
+
+#[tokio::test]
+async fn untouched_session_can_be_restored_without_a_native_conversation_yet() {
+    let provider = Provider::start([Reply::Text("first real turn")]).await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    let mut config = initialize(&provider, "OPENROUTER_API_KEY", "openai");
+    let initialized = helper.call(1, "initialize", config.clone()).await;
+    let rollout = Path::new(initialized["rolloutPath"].as_str().expect("rollout path")).to_owned();
+    let committed = initialized["committedBytes"]
+        .as_u64()
+        .expect("committed bytes") as usize;
+    let saved = std::fs::read(&rollout).expect("empty rollout")[..committed].to_vec();
+    helper.shutdown(2).await;
+    std::fs::remove_dir_all(native_home.path()).expect("remove native fixture state");
+    std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("restore directory");
+    std::fs::write(&rollout, &saved).expect("restore empty rollout");
+
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+    helper.send(1, "initialize", config.clone()).await;
+    let reused = helper.reply(1).await;
+    assert_eq!(reused["error"]["code"], "invalid_config");
+    assert_eq!(reused["error"]["field"], "sessionId");
+    config["sessionId"] = json!(uuid::Uuid::now_v7().to_string());
+    let resumed = helper.call(2, "initialize", config).await;
+    assert_eq!(
+        resumed["replacedNativeSessionId"],
+        initialized["nativeSessionId"]
+    );
+    assert_ne!(resumed["nativeSessionId"], initialized["nativeSessionId"]);
+    assert_eq!(resumed["model"], initialized["model"]);
+    assert_eq!(resumed["thinking"], initialized["thinking"]);
+    assert_eq!(std::fs::read(&rollout).expect("old rollout remains"), saved);
+    let response = helper
+        .call(3, "prompt", prompt("begin after empty restore"))
+        .await;
+    assert_eq!(response["finalMessage"], "first real turn");
+    helper.shutdown(4).await;
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn corrupt_rollout_is_rejected_without_replacing_the_session() {
+    let provider = Provider::start([]).await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    let mut config = initialize(&provider, "OPENROUTER_API_KEY", "openai");
+    let initialized = helper.call(1, "initialize", config.clone()).await;
+    let rollout = Path::new(initialized["rolloutPath"].as_str().expect("rollout path")).to_owned();
+    helper.shutdown(2).await;
+    let corrupt = b"this is not a rollout\n";
+    std::fs::write(&rollout, corrupt).expect("corrupt fixture state");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+    helper.send(1, "initialize", config).await;
+    let rejected = helper.reply(1).await;
+    assert_eq!(rejected["error"]["code"], "restore_failed");
+    assert_eq!(
+        std::fs::read(&rollout).expect("corrupt state remains"),
+        corrupt
+    );
+    helper.shutdown(2).await;
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn incomplete_provider_stream_cannot_execute_an_uncommitted_tool_call() {
+    let provider = Provider::start([Reply::PartialShell]).await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "OPENROUTER_API_KEY", "openai"),
+        )
+        .await;
+    helper
+        .send(2, "prompt", prompt("must not execute partial response"))
+        .await;
+    let failed = helper.reply(2).await;
+    assert_eq!(failed["error"]["code"], "transport_error");
+    assert!(!workspace.path().join("must-not-run").exists());
+    assert!(
+        !helper
+            .events
+            .iter()
+            .any(|event| event["data"]["type"] == "tool.call")
+    );
+    helper.shutdown(3).await;
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn custom_endpoints_require_api_keys_and_remote_tls() {
+    let provider = Provider::start([]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    std::fs::write(
+        native_home.path().join("auth.json"),
+        br#"{"personal_access_token":"at-fixture-token"}"#,
+    )
+    .unwrap();
+    for (field, url) in [
+        ("apiBaseUrl", "https://example.com/v1"),
+        ("websocketUrl", "wss://example.com/responses"),
+    ] {
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "UNUSED_FIXTURE_KEY");
+        let mut config = json!({"sessionId":uuid::Uuid::now_v7().to_string()});
+        config[field] = json!(url);
+        helper.send(1, "initialize", config).await;
+        let rejected = helper.reply(1).await;
+        assert_eq!(rejected["error"]["code"], "invalid_config");
+        assert_eq!(rejected["error"]["field"], field);
+        helper.shutdown(2).await;
+    }
+    let mut helper = Helper::start_with_env(
+        workspace.path(),
+        native_home.path(),
+        "UNUSED_FIXTURE_KEY",
+        &[("OPENAI_BASE_URL", provider.base_url.as_str())],
+    );
+    helper
+        .send(
+            1,
+            "initialize",
+            json!({"sessionId":uuid::Uuid::now_v7().to_string()}),
+        )
+        .await;
+    let rejected = helper.reply(1).await;
+    assert_eq!(rejected["error"]["code"], "invalid_config");
+    assert_eq!(rejected["error"]["field"], "apiBaseUrl");
+    assert_eq!(
+        rejected["error"]["message"],
+        "ChatGPT authentication refuses custom API endpoints; remove apiBaseUrl and OPENAI_BASE_URL or configure an API key"
+    );
+    assert!(!rejected.to_string().contains(provider.base_url.as_str()));
+    assert!(!rejected.to_string().contains("at-fixture-token"));
+    helper.shutdown(2).await;
+    for (field, url) in [
+        ("apiBaseUrl", "http://example.com/v1"),
+        ("websocketUrl", "ws://example.com/responses"),
+    ] {
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        let mut config = initialize(&provider, "FIXTURE_API_KEY", "openai");
+        config[field] = json!(url);
+        helper.send(1, "initialize", config).await;
+        let rejected = helper.reply(1).await;
+        assert_eq!(rejected["error"]["field"], field);
+        helper.shutdown(2).await;
+    }
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn configured_native_models_outside_the_picker_can_complete_turns() {
+    for model in ["kimi-k3", "mimo-v2.6-pro", "@cf/zai-org/glm-5.3"] {
+        let provider = Provider::start([Reply::Text("selected model completed")]).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        let mut config = initialize(&provider, "FIXTURE_API_KEY", "provider");
+        config["model"] = json!(model);
+        let state = helper.call(1, "initialize", config).await;
+        assert_eq!(state["model"], model);
+        let catalog = state["models"].as_array().unwrap();
+        assert_eq!(catalog.len(), 4);
+        let selected = catalog.last().unwrap();
+        assert_eq!(selected["id"], model);
+        assert!(selected["contextWindow"].as_u64().unwrap() > 0);
+        assert!(
+            selected["thinking"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("low"))
+        );
+        assert_eq!(state["helperVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            state["helperFingerprint"],
+            env!("NANOCODEX_HELPER_FINGERPRINT")
+        );
+        let result = helper.call(2, "prompt", prompt("hello")).await;
+        assert_eq!(result["finalMessage"], "selected model completed");
+        helper.shutdown(3).await;
+        assert_stateless(&provider.requests()[0], &format!("provider/{model}"));
+    }
+}
+
+#[tokio::test]
+async fn oversized_gateway_event_fails_without_retaining_the_unbounded_stream() {
+    let provider = Provider::start([Reply::Oversized]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    helper.send(2, "prompt", prompt("huge stream")).await;
+    let result = helper.reply(2).await;
+    assert_eq!(result["error"]["code"], "transport_error");
+    assert_eq!(result["error"]["message"], "invalid gateway event stream");
+    helper.shutdown(3).await;
+}
+
+#[tokio::test]
+async fn native_transport_failures_redact_response_bodies_from_events_and_errors() {
+    let provider = Provider::start([]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    let mut config = initialize(&provider, "FIXTURE_API_KEY", "openai");
+    config["transport"] = json!("websocket");
+    config.as_object_mut().unwrap().remove("modelIdPrefix");
+    config["websocketUrl"] = json!(format!(
+        "{}/responses",
+        provider.base_url.replace("http://", "ws://")
+    ));
+    helper.call(1, "initialize", config).await;
+    helper.send(2, "prompt", prompt("rejected handshake")).await;
+    let result = helper.reply(2).await;
+    assert_eq!(result["error"]["code"], "native_error");
+    assert_eq!(result["error"]["statusCode"], 400);
+    assert!(!result.to_string().contains("fixture-bearer-token"));
+    assert!(
+        !serde_json::to_string(&helper.events)
+            .unwrap()
+            .contains("fixture-bearer-token")
+    );
+    helper.shutdown(3).await;
+}
+
+#[tokio::test]
+async fn gateway_sse_accepts_cr_lf_crlf_and_fragmented_line_endings() {
+    for newline in ["\r\n", "\r", "\n"] {
+        for fragmented in [false, true] {
+            let provider = Provider::start([Reply::LineEndings {
+                newline,
+                fragmented,
+            }])
+            .await;
+            let workspace = TempDir::new().unwrap();
+            let native_home = TempDir::new().unwrap();
+            let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+            helper
+                .call(
+                    1,
+                    "initialize",
+                    initialize(&provider, "FIXTURE_API_KEY", "openai"),
+                )
+                .await;
+            let result = helper.call(2, "prompt", prompt("line endings")).await;
+            assert_eq!(result["finalMessage"], "line endings accepted");
+            helper.shutdown(3).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_sse_errors_preserve_safe_codes_without_response_bodies_or_invented_status() {
+    for (code, nested, expected_code, message) in [
+        (
+            "rate_limit_exceeded".to_owned(),
+            false,
+            Some("rate_limit_exceeded"),
+            "provider rate limit reached",
+        ),
+        (
+            "insufficient_quota".to_owned(),
+            true,
+            Some("insufficient_quota"),
+            "provider quota exhausted",
+        ),
+        (
+            "vendor.failure-1".to_owned(),
+            false,
+            Some("vendor.failure-1"),
+            "provider response did not complete",
+        ),
+        (
+            "token: fixture-bearer-token".to_owned(),
+            false,
+            None,
+            "provider response did not complete",
+        ),
+        (
+            "x".repeat(129),
+            true,
+            None,
+            "provider response did not complete",
+        ),
+    ] {
+        let provider = Provider::start([Reply::ErrorEvent { code, nested }]).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        helper
+            .call(
+                1,
+                "initialize",
+                initialize(&provider, "FIXTURE_API_KEY", "openai"),
+            )
+            .await;
+        helper
+            .send(2, "prompt", prompt("classify provider error"))
+            .await;
+        let reply = helper.reply(2).await;
+        assert_eq!(reply["error"]["code"], "native_error");
+        assert_eq!(reply["error"]["providerCode"].as_str(), expected_code);
+        assert_eq!(reply["error"]["message"], message);
+        assert!(reply["error"].get("statusCode").is_none());
+        assert!(!reply.to_string().contains("fixture-bearer-token"));
+        assert!(
+            !serde_json::to_string(&helper.events)
+                .unwrap()
+                .contains("fixture-bearer-token")
+        );
+        helper.shutdown(3).await;
+    }
+}
+
+#[tokio::test]
+async fn restored_workspace_mismatch_is_distinct_from_startup_failure() {
+    let provider = Provider::start([Reply::Text("saved")]).await;
+    let workspace = TempDir::new().unwrap();
+    let another_workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let config = initialize(&provider, "FIXTURE_API_KEY", "openai");
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    let state = helper.call(1, "initialize", config.clone()).await;
+    helper
+        .call(2, "prompt", prompt("save a conversation"))
+        .await;
+    helper.shutdown(3).await;
+    let mut helper = Helper::start(
+        another_workspace.path(),
+        native_home.path(),
+        "FIXTURE_API_KEY",
+    );
+    let mut restore = config;
+    restore["resumeSessionId"] = state["nativeSessionId"].clone();
+    helper.send(1, "initialize", restore).await;
+    let refused = helper.reply(1).await;
+    assert_eq!(refused["error"]["code"], "restore_failed");
+    assert_eq!(
+        refused["error"]["message"],
+        "restored native workspace does not match requested workspace"
+    );
+    helper.shutdown(2).await;
+    assert_eq!(provider.requests().len(), 1);
+}
