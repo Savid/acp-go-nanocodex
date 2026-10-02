@@ -135,18 +135,17 @@ impl SessionError {
                     |event| Self::provider_event(&event),
                 ),
                 ResponsesError::HandshakeTimeout { .. } | ResponsesError::SendTimeout { .. } => {
-                    Self::new("transport_error", "provider connection timed out")
+                    Self::connection("provider connection timed out")
                 }
                 ResponsesError::HttpRequest { timeout: true, .. } => {
-                    Self::new("transport_error", "provider request timed out")
+                    Self::connection("provider request timed out")
                 }
                 ResponsesError::Handshake { .. } | ResponsesError::HttpRequest { .. } => {
-                    Self::new("transport_error", "provider connection failed")
+                    Self::connection("provider connection failed")
                 }
-                ResponsesError::UnexpectedEnd | ResponsesError::Closed { .. } => Self::new(
-                    "transport_error",
-                    "provider connection ended before completion",
-                ),
+                ResponsesError::UnexpectedEnd | ResponsesError::Closed { .. } => {
+                    Self::connection("provider connection ended before completion")
+                }
                 _ => Self::new(
                     "transport_error",
                     "provider transport returned invalid data",
@@ -169,6 +168,11 @@ impl SessionError {
             ),
             _ => Self::new("native_error", "native agent could not complete the turn"),
         }
+    }
+    /// A provider or gateway connection failed, timed out, or ended before
+    /// the response completed.
+    pub const fn connection(message: &'static str) -> Self {
+        Self::new("connection_error", message)
     }
     pub const fn restore(message: &'static str) -> Self {
         Self::new("restore_failed", message)

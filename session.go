@@ -463,8 +463,11 @@ func (s *session) processFailure(rt *runtime, err error) error {
 	}
 
 	if nativeErr, ok := errors.AsType[*nanocodex.Error](err); ok {
+		// Provider rejections and failed provider connections are provider
+		// failures; other native codes report invalid provider data or helper
+		// failures.
 		cause := wire.CauseTransport
-		if nativeErr.Code == "native_error" {
+		if nativeErr.Code == "native_error" || nativeErr.Code == "connection_error" {
 			cause = wire.CauseProvider
 		}
 

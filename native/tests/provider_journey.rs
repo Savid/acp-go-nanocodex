@@ -142,6 +142,7 @@ enum Reply {
         nested: bool,
     },
     PartialShell,
+    Dropped,
     Oversized,
     LineEndings {
         newline: &'static str,
@@ -291,6 +292,24 @@ async fn respond(
     let id = format!("resp_{number}");
     let created =
         sse(json!({"type":"response.created", "response":{"id":id,"status":"in_progress"}}));
+    if matches!(reply, Reply::Dropped) {
+        // The pause lets the status line and first event reach the client.
+        let chunks = stream::iter([
+            Ok(created),
+            Err(std::io::Error::other("connection dropped")),
+        ])
+        .then(|chunk| async move {
+            if chunk.is_err() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            chunk
+        });
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(chunks),
+        )
+            .into_response();
+    }
     if let Reply::LineEndings {
         newline,
         fragmented,
@@ -387,6 +406,7 @@ async fn respond(
         ],
         Reply::Rejected
         | Reply::ErrorEvent { .. }
+        | Reply::Dropped
         | Reply::Oversized
         | Reply::LineEndings { .. } => unreachable!(),
     };
@@ -896,7 +916,11 @@ async fn incomplete_provider_stream_cannot_execute_an_uncommitted_tool_call() {
         .send(2, "prompt", prompt("must not execute partial response"))
         .await;
     let failed = helper.reply(2).await;
-    assert_eq!(failed["error"]["code"], "transport_error");
+    assert_eq!(failed["error"]["code"], "connection_error");
+    assert_eq!(
+        failed["error"]["message"],
+        "gateway stream ended before completion"
+    );
     assert!(!workspace.path().join("must-not-run").exists());
     assert!(
         !helper
@@ -1001,6 +1025,29 @@ async fn configured_native_models_outside_the_picker_can_complete_turns() {
         helper.shutdown(3).await;
         assert_stateless(&provider.requests()[0], &format!("provider/{model}"));
     }
+}
+
+#[tokio::test]
+async fn dropped_gateway_connection_is_a_connection_error() {
+    let provider = Provider::start([Reply::Dropped]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    helper.send(2, "prompt", prompt("dropped stream")).await;
+    let result = helper.reply(2).await;
+    assert_eq!(result["error"]["code"], "connection_error");
+    assert_eq!(
+        result["error"]["message"],
+        "gateway connection ended before completion"
+    );
+    helper.shutdown(3).await;
 }
 
 #[tokio::test]

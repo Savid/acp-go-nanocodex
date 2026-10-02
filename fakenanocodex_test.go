@@ -279,6 +279,12 @@ func (f *fakeNative) prompt(req fakeRequest) error {
 	if command == "rate-limit" {
 		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "native_error", "message": "provider rate limit exceeded", "providerCode": "rate_limit_exceeded"}})
 	}
+	if command == "connection-lost" {
+		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "connection_error", "message": "gateway connection ended before completion"}})
+	}
+	if command == "invalid-stream" {
+		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "transport_error", "message": "invalid gateway event stream"}})
+	}
 	if command == "http-rate-limit" {
 		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "native_error", "message": "provider rate limit exceeded", "statusCode": 429, "providerCode": "rate_limit_exceeded"}})
 	}

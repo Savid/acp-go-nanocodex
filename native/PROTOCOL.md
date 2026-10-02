@@ -117,8 +117,11 @@ Decoded envelopes with zero or reused IDs or nonobject params return
 `invalid_request` using the supplied ID. Unsupported methods return
 `method_not_found`. Other codes are `not_initialized`, `already_initialized`,
 `busy`, `invalid_config`, `authentication`, `restore_failed`, `persistence`,
-`native_error`, and `transport_error`. `restore_failed` identifies unreadable
-or invalid restored native state and a mismatched restored workspace.
+`native_error`, `connection_error`, and `transport_error`. `restore_failed`
+identifies unreadable or invalid restored native state and a mismatched
+restored workspace. `connection_error` means the provider or gateway
+connection failed, timed out, or ended before the response completed;
+`transport_error` covers invalid provider data and helper failures.
 Authentication, configuration, and process-start failures remain distinct.
 
 The Go adapter holds an advisory lock per native UUID from before hydration

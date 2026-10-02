@@ -1,5 +1,5 @@
 use crate::session::SessionError;
-use eventsource_stream::Eventsource;
+use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use nanocodex::oai::{
     ResponseError,
@@ -126,6 +126,10 @@ where
 
 fn failure(message: &'static str) -> ResponseError {
     ResponseError::service(SessionError::new("transport_error", message))
+}
+
+fn connection_failure(message: &'static str) -> ResponseError {
+    ResponseError::service(SessionError::connection(message))
 }
 
 fn output_index(event: &Value) -> Result<usize, ResponseError> {
@@ -255,7 +259,7 @@ impl GatewayRoute {
         let response = request
             .send()
             .await
-            .map_err(|_| failure("gateway connection failed"))?;
+            .map_err(|_| connection_failure("gateway connection failed"))?;
         if !response.status().is_success() {
             return Err(ResponseError::service(SessionError::http(
                 response.status().as_u16(),
@@ -269,13 +273,18 @@ impl GatewayRoute {
                         return if bound.buffered.is_empty() {
                             Ok(None)
                         } else {
-                            Err(std::io::Error::other(
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
                                 "gateway stream ended inside an event",
                             ))
                         };
                     };
-                    let chunk =
-                        chunk.map_err(|_| std::io::Error::other("gateway stream read failed"))?;
+                    let chunk = chunk.map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "gateway stream read failed",
+                        )
+                    })?;
                     if let Some(event) = bound.accept(&chunk)? {
                         return Ok(Some((event, (input, bound))));
                     }
@@ -290,7 +299,17 @@ impl GatewayRoute {
         let mut first_output = None;
         let mut pipeline = ResponsePipelineStats::default();
         while let Some(frame) = stream.next().await {
-            let frame = frame.map_err(|_| failure("invalid gateway event stream"))?;
+            let frame = frame.map_err(|error| match error {
+                EventStreamError::Transport(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    connection_failure("gateway connection ended before completion")
+                }
+                _ => failure("invalid gateway event stream"),
+            })?;
             if frame.data == "[DONE]" {
                 break;
             }
@@ -391,7 +410,7 @@ impl GatewayRoute {
                 _ => {}
             }
         }
-        Err(failure("gateway stream ended before completion"))
+        Err(connection_failure("gateway stream ended before completion"))
     }
 
     async fn emit_message(

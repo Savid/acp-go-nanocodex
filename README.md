@@ -191,8 +191,13 @@ An unexpected native session or rollout identity change returns
 The session refuses further work with the same cause until explicitly closed
 or deleted. After closing, load or resume can attempt store-backed restoration.
 
-A failed prompt mirror commit returns `nanocodex_turn_failed` with cause
-`transport` and message `session mirror commit failed`. Store failures outside
+A native turn failure returns `nanocodex_turn_failed`. Provider rejections
+and failed provider or gateway connections, including a stream that ends
+before the response completes, have cause `provider`; invalid provider data
+and helper protocol failures have cause `transport`, and a helper exit has
+cause `process_exit`. A failed prompt mirror commit returns
+`nanocodex_turn_failed` with cause `transport` and message
+`session mirror commit failed`. Store failures outside
 a prompt return `nanocodex_internal_failure` without a class. Failed restoration returns
 `nanocodex_restore_failed` and leaves the store entry intact. Other internal
 failures may carry one of these `class` values:

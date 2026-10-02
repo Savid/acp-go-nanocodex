@@ -65,7 +65,7 @@ func TestConformancePromptStreamsToolsUsageAndDeduplicatedMessages(t *testing.T)
 
 func TestConformanceCancellationAndNativeFailureRemainRestorable(t *testing.T) {
 	t.Parallel()
-	for _, command := range []string{"wait", "fail", "rate-limit"} {
+	for _, command := range []string{"wait", "fail", "rate-limit", "connection-lost", "invalid-stream"} {
 		t.Run(command, func(t *testing.T) {
 			t.Parallel()
 			a, client, _, workspace := fixtureAgent(t)
@@ -94,7 +94,17 @@ func TestConformanceCancellationAndNativeFailureRemainRestorable(t *testing.T) {
 					data, ok := requestErr.Data.(map[string]any)
 					require.True(t, ok)
 					require.Equal(t, "nanocodex_turn_failed", data["error"])
-					require.Equal(t, "provider", data["cause"])
+					switch command {
+					case "connection-lost":
+						require.Equal(t, "gateway connection ended before completion", data["message"])
+					case "invalid-stream":
+						require.Equal(t, "invalid gateway event stream", data["message"])
+					}
+					if command == "invalid-stream" {
+						require.Equal(t, "transport", data["cause"])
+					} else {
+						require.Equal(t, "provider", data["cause"])
+					}
 					if command == "rate-limit" {
 						require.Equal(t, "rate_limit_exceeded", data["providerCode"])
 						require.Equal(t, "provider rate limit exceeded", data["message"])
