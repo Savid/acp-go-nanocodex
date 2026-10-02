@@ -31,6 +31,10 @@ from the checkout:
 bin/acp-go-nanocodex -path "$PWD/bin/acp-go-nanocodex-native"
 ```
 
+The helper loads the host's trusted CA certificates during initialization,
+even when every endpoint uses `http://`. On Linux, install the system CA bundle
+(`ca-certificates`); without it, initialization fails with `invalid_config`.
+
 The command speaks ACP JSON-RPC on stdin/stdout. Diagnostics go to stderr.
 Configure authentication through `OPENAI_API_KEY` or native `auth.json` in
 `CODEX_HOME` (default `$HOME/.codex`). Rollouts therefore use the caller's real
@@ -67,7 +71,8 @@ func main() {
 }
 ```
 
-`Serve` closes its agent when the connection or context ends. It accepts
+`HelperRelease` returns the helper release and fingerprint that this module
+version requires. `Serve` closes its agent when the connection or context ends. It accepts
 caller-supplied streams and does not take ownership of their underlying files.
 `NewAgent` exposes the ACP methods for direct integration.
 
@@ -104,6 +109,7 @@ adapter. Invalid construction options fail before native launch.
 | `-seed-file` | Repeatable `relative/path=/host/file` seed. |
 | `-debug` | Enable diagnostic logging to stderr. |
 | `-version` | Print the adapter version and exit. |
+| `-nanocodex-helper-release` | Print the required helper release and fingerprint as JSON and exit. |
 
 The command configures telemetry through `OTEL_*` environment variables.
 Library use does not change global telemetry providers.
@@ -218,6 +224,64 @@ history. Native default and WebSocket routes retain upstream transport behavior.
 Shell sessions and other in-memory tool state last for one prompt; subsequent
 prompts resume the saved conversation in a new helper.
 Image tool outputs are not projected as ACP images.
+
+## Releases
+
+A tag `vX.Y.Z` releases the commit whose `HelperVersion` and
+`native/Cargo.toml` version are both `X.Y.Z`; pre-release tags such as
+`vX.Y.Z-rc.1` follow the same rule. The tagged commit must be on the default
+branch, and the fingerprint computed from source, the one the Go command
+requires, and the one the built helper reports at initialization must agree.
+After audit and integration smoke pass for the tagged commit, CI builds every
+archive, smoke-tests each on its own platform, attests the assets, uploads them
+to a draft release, and publishes it. Fix a faulty release with a new version.
+
+| Asset | Contents |
+|---|---|
+| `<command>_<tag>_linux_amd64.tar.gz`, `<command>_<tag>_linux_arm64.tar.gz` | Go command, helper, and `LICENSE`; requires glibc 2.28 or newer. |
+| `<command>_<tag>_darwin_arm64.tar.gz` | Go command, helper, and `LICENSE`; unsigned and not notarized. |
+| `release-manifest.json` | Version, commit, helper and protocol versions, helper fingerprint, toolchains, and per-target archive, helper, and command SHA-256 digests. |
+| `SHA256SUMS` | SHA-256 digests of the archives and the manifest. |
+| `provenance.sigstore.json` | Sigstore bundle of the SLSA build provenance for the archives, the manifest, and every executable. |
+
+`<command>` is the Go command name. Release builds are reproducible: the
+toolchains are pinned, Cargo runs with `--locked`, paths are remapped, and
+archives use the commit time and fixed ownership. To verify a Linux amd64
+archive with `gh` and `jq`:
+
+```sh
+tag=vX.Y.Z
+name=acp-go-nanocodex
+repo=Savid/acp-go-nanocodex
+archive=${name}_${tag}_linux_amd64.tar.gz
+gh release download "$tag" --repo "$repo" --pattern "$archive" \
+  --pattern SHA256SUMS --pattern release-manifest.json --pattern provenance.sigstore.json
+sha256sum --check --ignore-missing SHA256SUMS
+commit=$(curl -fsS "https://proxy.golang.org/github.com/savid/acp-go-nanocodex/@v/$tag.info" | jq -r .Origin.Hash)
+for subject in "$archive" release-manifest.json; do
+  gh attestation verify "$subject" --repo "$repo" --bundle provenance.sigstore.json \
+    --signer-workflow "$repo/.github/workflows/check.yml" \
+    --source-ref "refs/tags/$tag" --source-digest "$commit" --deny-self-hosted-runners
+done
+jq -e --arg tag "$tag" --arg commit "$commit" \
+  '.version == $tag and .commit == $commit' release-manifest.json
+jq -r .helperFingerprint release-manifest.json
+```
+
+The commit comes from the Go module proxy, so the attestation binds the
+archive to the same source a host's `go.mod` resolves. Compare the manifest
+`helperFingerprint` with `HelperRelease` from the module version the host
+requires, or with `-nanocodex-helper-release` from the extracted command. Drop
+`--bundle` to fetch the attestation from GitHub instead.
+
+To cut a release, set `HelperVersion` and the native package version, refresh
+`native/Cargo.lock`, merge, run `make release-check TAG=vX.Y.Z` on the merged
+commit, then push the tag. `make release-build TAG=vX.Y.Z` builds the host's
+release archives under `dist/` with the same pinned zig and cargo-zigbuild as
+CI, and `make release-smoke TAG=vX.Y.Z RELEASE_TARGET=linux_amd64` verifies
+one archive and runs integration smoke against its executables;
+`RELEASE_IMAGE` additionally probes the helper inside a container image.
+`make release-manifest` writes the manifest and checksums for built targets.
 
 ## Development
 

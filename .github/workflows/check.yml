@@ -33,3 +33,166 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component clippy --component rustfmt
       - run: make audit
       - run: make test-integration-smoke
+
+  release-build:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: audit
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            targets: linux_amd64 linux_arm64
+          - runner: macos-latest
+            targets: darwin_arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install Rust toolchain
+        run: |
+          toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' native/rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal
+      - name: Build release archives
+        env:
+          TAG: ${{ github.ref_name }}
+          RELEASE_BRANCH: origin/${{ github.event.repository.default_branch }}
+          RELEASE_TARGETS: ${{ matrix.targets }}
+        run: make release-build TAG="$TAG" RELEASE_BRANCH="$RELEASE_BRANCH" RELEASE_TARGETS="$RELEASE_TARGETS"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.runner }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  release-smoke:
+    needs: release-build
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: linux_amd64
+            image: almalinux:8@sha256:9f355ae942d6a6c0561f0771dc053a2cfae9580fc45fa4252756db7c7e80c09f
+          - runner: ubuntu-24.04-arm
+            target: linux_arm64
+            image: almalinux:8@sha256:9f355ae942d6a6c0561f0771dc053a2cfae9580fc45fa4252756db7c7e80c09f
+          - runner: macos-latest
+            target: darwin_arm64
+            image: ""
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify archive and run integration smoke
+        env:
+          TAG: ${{ github.ref_name }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_IMAGE: ${{ matrix.image }}
+        run: make release-smoke TAG="$TAG" RELEASE_TARGET="$RELEASE_TARGET" RELEASE_IMAGE="$RELEASE_IMAGE"
+
+  release-publish:
+    needs: release-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write # create and publish the release
+      id-token: write # sign the attestation with the workflow identity
+      attestations: write # store the attestation for the repository
+    env:
+      TAG: ${{ github.ref_name }}
+      RELEASE_TARGETS: linux_amd64 linux_arm64 darwin_arm64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Write manifest and checksums
+        run: make release-manifest TAG="$TAG" RELEASE_TARGETS="$RELEASE_TARGETS"
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        id: attest
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/release-manifest.json
+            dist/*/acp-go-nanocodex
+            dist/*/acp-go-nanocodex-native
+      - name: Verify attestation before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE" dist/provenance.sigstore.json
+          commit=$(jq -r .commit dist/release-manifest.json)
+          test "$commit" = "$(git rev-parse HEAD)"
+          for subject in dist/*.tar.gz dist/release-manifest.json dist/*/acp-go-nanocodex dist/*/acp-go-nanocodex-native; do
+            gh attestation verify "$subject" \
+              --repo "$GITHUB_REPOSITORY" \
+              --bundle dist/provenance.sigstore.json \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/check.yml" \
+              --source-ref "refs/tags/$TAG" \
+              --source-digest "$commit" \
+              --deny-self-hosted-runners
+          done
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case $TAG in *-*) prerelease=(--prerelease) ;; esac
+          fingerprint=$(jq -r .helperFingerprint dist/release-manifest.json)
+          commit=$(jq -r .commit dist/release-manifest.json)
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag "${prerelease[@]}" \
+            --title "$TAG" \
+            --notes "Adapter command and helper ${TAG#v} built from $commit. Helper fingerprint: $fingerprint. Verify assets as described in the README Releases section." \
+            dist/*.tar.gz dist/release-manifest.json dist/SHA256SUMS dist/provenance.sigstore.json
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+      - name: Verify published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .tmp/published
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir .tmp/published
+          cd .tmp/published
+          sha256sum --check --strict SHA256SUMS
+          cmp SHA256SUMS ../../dist/SHA256SUMS
+          cmp provenance.sigstore.json ../../dist/provenance.sigstore.json
+      - name: Check Go module proxy resolution
+        run: |
+          module=$(sed -n 's/^module //p' go.mod)
+          commit=$(git rev-parse HEAD)
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if info=$(curl -fsS "https://proxy.golang.org/$module/@v/$TAG.info"); then
+              break
+            fi
+            echo "attempt $attempt: proxy has not resolved $TAG yet"
+            sleep 30
+          done
+          jq -e --arg commit "$commit" --arg ref "refs/tags/$TAG" \
+            '.Origin.Hash == $commit and .Origin.Ref == $ref' <<<"$info"

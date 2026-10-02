@@ -22,6 +22,7 @@ import (
 	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
 	"github.com/savid/acp-go-core/wire"
+	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
 )
 
 const (
@@ -36,6 +37,12 @@ const (
 var nativeSources embed.FS
 
 var nativeHelperFingerprint = helperFingerprint()
+
+// HelperRelease returns the helper release and build-input fingerprint that
+// initialization requires from the helper executable.
+func HelperRelease() (version, fingerprint string) {
+	return nanocodex.HelperVersion, nativeHelperFingerprint
+}
 
 func helperFingerprint() string {
 	hash := sha256.New()

@@ -8,7 +8,26 @@ CARGO_AUDIT := $(CARGO_AUDIT_ROOT)/bin/cargo-audit
 GOLANGCI_LINT_VERSION ?= v2.14.0
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
-.PHONY: audit build clean coverage-check fmt fmt-check help lint modernize-check native-build native-fmt native-fmt-check native-lint native-test native-vuln test test-integration-live test-integration-smoke tidy vuln
+ZIG_VERSION := 0.16.0
+ZIG_SHA256 := \
+	x86_64-linux=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 \
+	aarch64-linux=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 \
+	aarch64-macos=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489
+ZIG_ROOT := $(CURDIR)/.tmp/zig/$(ZIG_VERSION)
+ZIG := $(ZIG_ROOT)/zig
+CARGO_ZIGBUILD_VERSION := 0.23.4
+CARGO_ZIGBUILD_ROOT := $(CURDIR)/.tmp/cargo-zigbuild/$(CARGO_ZIGBUILD_VERSION)
+CARGO_ZIGBUILD := $(CARGO_ZIGBUILD_ROOT)/bin/cargo-zigbuild
+RELEASE_GLIBC_FLOOR := 2.28
+RELEASE_TARGETS ?= $(if $(filter Darwin,$(shell uname -s)),darwin_arm64,linux_amd64 linux_arm64)
+RELEASE_LINUX_TARGETS = $(filter linux_%,$(RELEASE_TARGETS))
+RELEASE := python3 scripts/release.py
+TAG ?=
+RELEASE_BRANCH ?=
+RELEASE_TARGET ?=
+RELEASE_IMAGE ?=
+
+.PHONY: audit build clean coverage-check fmt fmt-check help lint modernize-check native-build native-fmt native-fmt-check native-lint native-test native-vuln release-build release-check release-manifest release-smoke release-tools test test-integration-live test-integration-smoke tidy vuln
 
 ## build: build all packages and the command binary
 build: native-build
@@ -73,7 +92,7 @@ audit:
 
 ## clean: remove build artifacts
 clean:
-	rm -rf .tmp bin coverage.out
+	rm -rf .tmp bin dist coverage.out
 
 ## help: show this help
 help:
@@ -107,3 +126,28 @@ native-fmt:
 ## native-fmt-check: require formatted Rust sources
 native-fmt-check:
 	cd native && cargo fmt --all -- --check
+
+$(ZIG):
+	$(RELEASE) zig --version "$(ZIG_VERSION)" --root "$(ZIG_ROOT)" $(addprefix --sha256 ,$(ZIG_SHA256))
+
+$(CARGO_ZIGBUILD):
+	cd native && cargo install --locked --version "$(CARGO_ZIGBUILD_VERSION)" --root "$(CARGO_ZIGBUILD_ROOT)" --target-dir "$(CARGO_ZIGBUILD_ROOT)/target" cargo-zigbuild
+
+## release-tools: install pinned zig and cargo-zigbuild under .tmp/
+release-tools: $(ZIG) $(CARGO_ZIGBUILD)
+
+## release-check: refuse TAG unless it names this clean commit's helper release on the default branch
+release-check:
+	$(RELEASE) check --tag "$(TAG)" --branch "$(RELEASE_BRANCH)"
+
+## release-build: build reproducible archives for RELEASE_TARGETS under dist/
+release-build: release-check $(if $(RELEASE_LINUX_TARGETS),release-tools)
+	$(RELEASE) build --tag "$(TAG)" --targets "$(RELEASE_TARGETS)" --glibc-floor "$(RELEASE_GLIBC_FLOOR)" $(if $(RELEASE_LINUX_TARGETS),--zig-dir "$(ZIG_ROOT)" --cargo-zigbuild "$(CARGO_ZIGBUILD)")
+
+## release-smoke: verify the RELEASE_TARGET archive and run integration smoke against its executables
+release-smoke:
+	$(RELEASE) smoke --tag "$(TAG)" --target "$(RELEASE_TARGET)" --image "$(RELEASE_IMAGE)"
+
+## release-manifest: write dist/release-manifest.json and dist/SHA256SUMS for RELEASE_TARGETS
+release-manifest:
+	$(RELEASE) manifest --tag "$(TAG)" --targets "$(RELEASE_TARGETS)"
