@@ -72,8 +72,9 @@ func main() {
 ```
 
 `HelperRelease` returns the helper release and fingerprint that this module
-version requires. `Serve` closes its agent when the connection or context ends. It accepts
-caller-supplied streams and does not take ownership of their underlying files.
+version requires. `Serve` closes its agent when the connection or context
+ends. It accepts caller-supplied streams and does not take ownership of their
+underlying files.
 `NewAgent` exposes the ACP methods for direct integration.
 
 ### Process options
@@ -230,26 +231,32 @@ Image tool outputs are not projected as ACP images.
 A tag `vX.Y.Z` releases the commit whose `HelperVersion` and
 `native/Cargo.toml` version are both `X.Y.Z`; pre-release tags such as
 `vX.Y.Z-rc.1` follow the same rule. The tagged commit must be on the default
-branch, and the fingerprint computed from source, the one the Go command
-requires, and the one the built helper reports at initialization must agree.
-After audit and integration smoke pass for the tagged commit, CI builds every
-archive, smoke-tests each on its own platform, attests the assets, uploads them
-to a draft release, and publishes it. Fix a faulty release with a new version.
+branch, and the built helper must report the fingerprint the Go command
+requires at initialization. After audit and integration smoke pass for the
+tagged commit, CI builds every archive and smoke-tests each on its own
+platform. It then requires the Go module proxy to resolve the tag to that
+commit, attests the archives and manifest, verifies the assets of a draft
+release, and publishes it. Fix a faulty release with a new version.
 
 | Asset | Contents |
 |---|---|
 | `<command>_<tag>_linux_amd64.tar.gz`, `<command>_<tag>_linux_arm64.tar.gz` | Go command, helper, and `LICENSE`; requires glibc 2.28 or newer. |
-| `<command>_<tag>_darwin_arm64.tar.gz` | Go command, helper, and `LICENSE`; unsigned and not notarized. |
-| `release-manifest.json` | Version, commit, helper and protocol versions, helper fingerprint, toolchains, and per-target archive, helper, and command SHA-256 digests. |
+| `<command>_<tag>_darwin_arm64.tar.gz` | Go command, helper, and `LICENSE`; requires macOS 13 or newer; unsigned and not notarized. |
+| `release-manifest.json` | Version, commit, helper release and fingerprint, Go and Rust toolchains, and per target the platform floor, native C toolchain, and archive, helper, and command SHA-256 digests. |
 | `SHA256SUMS` | SHA-256 digests of the archives and the manifest. |
-| `provenance.sigstore.json` | Sigstore bundle of the SLSA build provenance for the archives, the manifest, and every executable. |
+| `provenance.sigstore.json` | Sigstore bundle of the SLSA build provenance for the archives and the manifest. |
 
-`<command>` is the Go command name. Release builds are reproducible: the
-toolchains are pinned, Cargo runs with `--locked`, paths are remapped, and
-archives use the commit time and fixed ownership. To verify a Linux amd64
+`<command>` is the Go command name. Release executables are reproducible from
+the tagged commit: Go, Rust, zig, and cargo-zigbuild are pinned, Cargo runs
+with `--locked`, and paths are remapped. Darwin helpers also depend on the
+build host's Apple clang and SDK, which the manifest records. Compare rebuilt
+executables with the manifest's `helperSha256` and `commandSha256`; archive
+bytes also depend on the host's zlib. This script verifies a Linux amd64
 archive with `gh` and `jq`:
 
 ```sh
+#!/usr/bin/env bash
+set -euo pipefail
 tag=vX.Y.Z
 name=acp-go-nanocodex
 repo=Savid/acp-go-nanocodex
@@ -257,7 +264,7 @@ archive=${name}_${tag}_linux_amd64.tar.gz
 gh release download "$tag" --repo "$repo" --pattern "$archive" \
   --pattern SHA256SUMS --pattern release-manifest.json --pattern provenance.sigstore.json
 sha256sum --check --ignore-missing SHA256SUMS
-commit=$(curl -fsS "https://proxy.golang.org/github.com/savid/acp-go-nanocodex/@v/$tag.info" | jq -r .Origin.Hash)
+commit=$(curl -fsS "https://proxy.golang.org/github.com/savid/acp-go-nanocodex/@v/$tag.info" | jq -er .Origin.Hash)
 for subject in "$archive" release-manifest.json; do
   gh attestation verify "$subject" --repo "$repo" --bundle provenance.sigstore.json \
     --signer-workflow "$repo/.github/workflows/check.yml" \
@@ -281,7 +288,8 @@ release archives under `dist/` with the same pinned zig and cargo-zigbuild as
 CI, and `make release-smoke TAG=vX.Y.Z RELEASE_TARGET=linux_amd64` verifies
 one archive and runs integration smoke against its executables;
 `RELEASE_IMAGE` additionally probes the helper inside a container image.
-`make release-manifest` writes the manifest and checksums for built targets.
+`make release-manifest` writes the manifest and checksums for the targets
+built under `dist/`.
 
 ## Development
 

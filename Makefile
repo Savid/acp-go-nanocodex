@@ -19,6 +19,7 @@ CARGO_ZIGBUILD_VERSION := 0.23.4
 CARGO_ZIGBUILD_ROOT := $(CURDIR)/.tmp/cargo-zigbuild/$(CARGO_ZIGBUILD_VERSION)
 CARGO_ZIGBUILD := $(CARGO_ZIGBUILD_ROOT)/bin/cargo-zigbuild
 RELEASE_GLIBC_FLOOR := 2.28
+RELEASE_MACOS_FLOOR := 13.0
 RELEASE_TARGETS ?= $(if $(filter Darwin,$(shell uname -s)),darwin_arm64,linux_amd64 linux_arm64)
 RELEASE_LINUX_TARGETS = $(filter linux_%,$(RELEASE_TARGETS))
 RELEASE := python3 scripts/release.py
@@ -142,12 +143,12 @@ release-check:
 
 ## release-build: build reproducible archives for RELEASE_TARGETS under dist/
 release-build: release-check $(if $(RELEASE_LINUX_TARGETS),release-tools)
-	$(RELEASE) build --tag "$(TAG)" --targets "$(RELEASE_TARGETS)" --glibc-floor "$(RELEASE_GLIBC_FLOOR)" $(if $(RELEASE_LINUX_TARGETS),--zig-dir "$(ZIG_ROOT)" --cargo-zigbuild "$(CARGO_ZIGBUILD)")
+	$(RELEASE) build --tag "$(TAG)" --targets "$(RELEASE_TARGETS)" --glibc-floor "$(RELEASE_GLIBC_FLOOR)" --macos-floor "$(RELEASE_MACOS_FLOOR)" $(if $(RELEASE_LINUX_TARGETS),--zig-dir "$(ZIG_ROOT)" --cargo-zigbuild "$(CARGO_ZIGBUILD)")
 
 ## release-smoke: verify the RELEASE_TARGET archive and run integration smoke against its executables
 release-smoke:
 	$(RELEASE) smoke --tag "$(TAG)" --target "$(RELEASE_TARGET)" --image "$(RELEASE_IMAGE)"
 
-## release-manifest: write dist/release-manifest.json and dist/SHA256SUMS for RELEASE_TARGETS
+## release-manifest: write dist/release-manifest.json and dist/SHA256SUMS for the targets built under dist/
 release-manifest:
-	$(RELEASE) manifest --tag "$(TAG)" --targets "$(RELEASE_TARGETS)"
+	$(RELEASE) manifest --tag "$(TAG)"

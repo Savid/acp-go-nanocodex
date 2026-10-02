@@ -123,66 +123,10 @@ jobs:
       attestations: write # store the attestation for the repository
     env:
       TAG: ${{ github.ref_name }}
-      RELEASE_TARGETS: linux_amd64 linux_arm64 darwin_arm64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: release-*
-          merge-multiple: true
-          path: dist
-      - name: Write manifest and checksums
-        run: make release-manifest TAG="$TAG" RELEASE_TARGETS="$RELEASE_TARGETS"
-      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        id: attest
-        with:
-          subject-path: |
-            dist/*.tar.gz
-            dist/release-manifest.json
-            dist/*/acp-go-nanocodex
-            dist/*/acp-go-nanocodex-native
-      - name: Verify attestation before publishing
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
-        run: |
-          cp "$BUNDLE" dist/provenance.sigstore.json
-          commit=$(jq -r .commit dist/release-manifest.json)
-          test "$commit" = "$(git rev-parse HEAD)"
-          for subject in dist/*.tar.gz dist/release-manifest.json dist/*/acp-go-nanocodex dist/*/acp-go-nanocodex-native; do
-            gh attestation verify "$subject" \
-              --repo "$GITHUB_REPOSITORY" \
-              --bundle dist/provenance.sigstore.json \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/check.yml" \
-              --source-ref "refs/tags/$TAG" \
-              --source-digest "$commit" \
-              --deny-self-hosted-runners
-          done
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          prerelease=()
-          case $TAG in *-*) prerelease=(--prerelease) ;; esac
-          fingerprint=$(jq -r .helperFingerprint dist/release-manifest.json)
-          commit=$(jq -r .commit dist/release-manifest.json)
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag "${prerelease[@]}" \
-            --title "$TAG" \
-            --notes "Adapter command and helper ${TAG#v} built from $commit. Helper fingerprint: $fingerprint. Verify assets as described in the README Releases section." \
-            dist/*.tar.gz dist/release-manifest.json dist/SHA256SUMS dist/provenance.sigstore.json
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-      - name: Verify published assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p .tmp/published
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir .tmp/published
-          cd .tmp/published
-          sha256sum --check --strict SHA256SUMS
-          cmp SHA256SUMS ../../dist/SHA256SUMS
-          cmp provenance.sigstore.json ../../dist/provenance.sigstore.json
       - name: Check Go module proxy resolution
         run: |
           module=$(sed -n 's/^module //p' go.mod)
@@ -196,3 +140,66 @@ jobs:
           done
           jq -e --arg commit "$commit" --arg ref "refs/tags/$TAG" \
             '.Origin.Hash == $commit and .Origin.Ref == $ref' <<<"$info"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Write manifest and checksums
+        run: make release-manifest TAG="$TAG"
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        id: attest
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/release-manifest.json
+      - name: Verify attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE" dist/provenance.sigstore.json
+          commit=$(jq -r .commit dist/release-manifest.json)
+          test "$commit" = "$(git rev-parse HEAD)"
+          for subject in dist/*.tar.gz dist/release-manifest.json; do
+            gh attestation verify "$subject" \
+              --repo "$GITHUB_REPOSITORY" \
+              --bundle dist/provenance.sigstore.json \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/check.yml" \
+              --source-ref "refs/tags/$TAG" \
+              --source-digest "$commit" \
+              --deny-self-hosted-runners
+          done
+      - name: Upload draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft); then
+            if [ "$draft" != true ]; then
+              echo "release $TAG is already published" >&2
+              exit 1
+            fi
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          prerelease=()
+          case $TAG in *-*) prerelease=(--prerelease) ;; esac
+          fingerprint=$(jq -r .helperFingerprint dist/release-manifest.json)
+          commit=$(jq -r .commit dist/release-manifest.json)
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag "${prerelease[@]}" \
+            --title "$TAG" \
+            --notes "Adapter command and helper ${TAG#v} built from $commit. Helper fingerprint: $fingerprint. Verify assets as described in the README Releases section." \
+            dist/*.tar.gz dist/release-manifest.json dist/SHA256SUMS dist/provenance.sigstore.json
+      - name: Verify draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .tmp/draft
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir .tmp/draft
+          cd .tmp/draft
+          sha256sum --check --strict SHA256SUMS
+          cmp SHA256SUMS ../../dist/SHA256SUMS
+          cmp provenance.sigstore.json ../../dist/provenance.sigstore.json
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

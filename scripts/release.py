@@ -8,12 +8,15 @@ cargo-zigbuild and zig supplied by the Makefile.
 import argparse
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
 import platform
+import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -29,22 +32,17 @@ WORK = ROOT / ".tmp" / "release"
 MODULE = "github.com/savid/acp-go-nanocodex"
 COMMAND = "acp-go-nanocodex"
 HELPER = "acp-go-nanocodex-native"
-PROTOCOL_VERSION = 1
 TAG_PATTERN = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z.-]+)?")
-FINGERPRINT_FILES = (
-    "native/Cargo.toml",
-    "native/Cargo.lock",
-    "native/rust-toolchain.toml",
-    "native/build.rs",
-    "internal/nanocodex/protocol.go",
-    "internal/nanocodex/client.go",
-)
 TARGETS = {
     "linux_amd64": {"rust": "x86_64-unknown-linux-gnu", "goos": "linux", "goarch": "amd64", "host": ("Linux", "x86_64")},
     "linux_arm64": {"rust": "aarch64-unknown-linux-gnu", "goos": "linux", "goarch": "arm64", "host": ("Linux", "aarch64")},
     "darwin_arm64": {"rust": "aarch64-apple-darwin", "goos": "darwin", "goarch": "arm64", "host": ("Darwin", "arm64")},
 }
+SHARED = ("version", "commit", "helperVersion", "helperFingerprint", "rustc", "go")
 PROBE_TIMEOUT = 60
+ZIG_MIRRORS = "https://ziglang.org/download/community-mirrors.txt"
+ZIG_SOURCE = "acp-go-nanocodex-release"
+LC_BUILD_VERSION = 0x32
 
 
 class ReleaseError(Exception):
@@ -71,13 +69,6 @@ def read_text(relative):
     return (ROOT / relative).read_text()
 
 
-def helper_version():
-    match = re.search(r'^const HelperVersion = "([^"]+)"$', read_text("internal/nanocodex/protocol.go"), re.MULTILINE)
-    if match is None:
-        raise ReleaseError("internal/nanocodex/protocol.go declares no HelperVersion")
-    return match[1]
-
-
 def cargo_version():
     match = re.search(r'^\[package\]\n(?:[^\[]*\n)*?version = "([^"]+)"$', read_text("native/Cargo.toml"), re.MULTILINE)
     if match is None:
@@ -90,15 +81,6 @@ def lock_version():
     if match is None:
         raise ReleaseError(f"native/Cargo.lock has no {HELPER} entry")
     return match[1]
-
-
-def source_fingerprint():
-    """Hash the helper build inputs exactly as native/build.rs does."""
-    sources = [f"native/src/{path.name}" for path in (ROOT / "native/src").iterdir() if path.is_file() and path.suffix == ".rs"]
-    digest = hashlib.sha256()
-    for relative in sorted([*FINGERPRINT_FILES, *sources]):
-        digest.update(relative.encode() + b"\0" + (ROOT / relative).read_bytes() + b"\0")
-    return digest.hexdigest()
 
 
 def go_environment(**overrides):
@@ -120,6 +102,14 @@ def require_tag(tag):
     return tag[1:]
 
 
+def required_helper(tag):
+    """Return the helper release and fingerprint the adapter at HEAD requires, refusing a release other than tag."""
+    required = json.loads(run(["go", "run", f"./cmd/{COMMAND}", "-nanocodex-helper-release"], env=go_environment()))
+    if required.get("helperVersion") != require_tag(tag):
+        raise ReleaseError(f"HelperVersion is {required.get('helperVersion')}; tag {tag} requires {require_tag(tag)}")
+    return required
+
+
 def default_branch():
     try:
         return run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
@@ -130,8 +120,7 @@ def default_branch():
 def check(tag, branch):
     """Refuse a tag that does not name this clean commit's helper release."""
     release = require_tag(tag)
-    versions = {"HelperVersion": helper_version(), "native/Cargo.toml": cargo_version(), "native/Cargo.lock": lock_version()}
-    for source, version in versions.items():
+    for source, version in (("native/Cargo.toml", cargo_version()), ("native/Cargo.lock", lock_version())):
         if version != release:
             raise ReleaseError(f"{source} is {version}; tag {tag} requires {release}")
     if run(["git", "status", "--porcelain"]):
@@ -144,11 +133,8 @@ def check(tag, branch):
     if subprocess.run(["git", "merge-base", "--is-ancestor", head, branch], cwd=ROOT, check=False).returncode != 0:
         raise ReleaseError(f"HEAD {head} is not on {branch}")
     run(["go", "mod", "verify"], env=go_environment())
-    fingerprint = source_fingerprint()
-    adapter = json.loads(run(["go", "run", "./cmd/acp-go-nanocodex", "-nanocodex-helper-release"], env=go_environment()))
-    if adapter != {"helperVersion": release, "helperFingerprint": fingerprint}:
-        raise ReleaseError(f"Go adapter reports {adapter}; source requires {release} {fingerprint}")
-    print(f"release {tag} commit {head} helper {release} fingerprint {fingerprint}", flush=True)
+    required = required_helper(tag)
+    print(f"release {tag} commit {head} helper {release} fingerprint {required['helperFingerprint']}", flush=True)
 
 
 def uuid7():
@@ -229,30 +215,30 @@ def probe_image(helper, image):
     return probe_helper(command)
 
 
-def require_identity(state, release, fingerprint, where):
-    reported = {key: state.get(key) for key in ("protocolVersion", "helperVersion", "helperFingerprint")}
-    expected = {"protocolVersion": PROTOCOL_VERSION, "helperVersion": release, "helperFingerprint": fingerprint}
-    if reported != expected:
-        raise ReleaseError(f"{where} reports {reported}; expected {expected}")
+def require_identity(state, required, where):
+    reported = {key: state.get(key) for key in required}
+    if reported != required:
+        raise ReleaseError(f"{where} reports {reported}; the adapter requires {required}")
 
 
-def verify_executables(directory, tag, fingerprint):
+def verify_executables(directory, tag, required):
     """Require the command and helper in directory to identify this release."""
-    release = tag[1:]
     command, helper = directory / COMMAND, directory / HELPER
     reported_version = run([str(command), "-version"])
     if reported_version != tag:
         raise ReleaseError(f"{command} -version reports {reported_version!r}, not {tag}")
-    adapter = json.loads(run([str(command), "-nanocodex-helper-release"]))
-    if adapter != {"helperVersion": release, "helperFingerprint": fingerprint}:
-        raise ReleaseError(f"{command} requires {adapter}; source is {release} {fingerprint}")
-    require_identity(probe_local(helper), release, fingerprint, str(helper))
-    print(f"{directory.name}: command {tag}, helper {release}, fingerprint {fingerprint}", flush=True)
+    require_identity(json.loads(run([str(command), "-nanocodex-helper-release"])), required, str(command))
+    require_identity(probe_local(helper), required, str(helper))
+    print(f"{directory.name}: command {tag}, helper {required['helperVersion']}, fingerprint {required['helperFingerprint']}", flush=True)
 
 
 def host_target():
-    machine = {"amd64": "x86_64", "arm64": "aarch64" if platform.system() == "Linux" else "arm64"}.get(platform.machine().lower(), platform.machine())
-    return next((name for name, spec in TARGETS.items() if spec["host"] == (platform.system(), machine)), None)
+    host = (platform.system(), platform.machine())
+    return next((name for name, spec in TARGETS.items() if spec["host"] == host), None)
+
+
+def version_tuple(text):
+    return (tuple(map(int, text.split("."))) + (0, 0))[:3]
 
 
 def glibc_requirement(path):
@@ -260,15 +246,29 @@ def glibc_requirement(path):
     return max(versions, default=(0, 0, 0))
 
 
-def extract(bundle, directory):
-    """Extract a tar archive, refusing unsafe members where Python supports it."""
-    if hasattr(tarfile, "data_filter"):
-        bundle.extractall(directory, filter="data")
-        return
-    for member in bundle.getmembers():
-        if not (member.isfile() or member.isdir()) or member.name.startswith("/") or ".." in Path(member.name).parts:
-            raise ReleaseError(f"refusing archive member {member.name}")
-    bundle.extractall(directory)
+def macos_requirement(path):
+    """Return the minimum macOS version recorded in a 64-bit Mach-O executable."""
+    data = path.read_bytes()
+    magic, _, _, _, commands, _, _, _ = struct.unpack_from("<8I", data)
+    if magic != 0xFEEDFACF:
+        raise ReleaseError(f"{path} is not a 64-bit little-endian Mach-O executable")
+    offset = 32
+    for _ in range(commands):
+        command, size = struct.unpack_from("<2I", data, offset)
+        if command == LC_BUILD_VERSION:
+            minimum = struct.unpack_from("<I", data, offset + 12)[0]
+            return (minimum >> 16, (minimum >> 8) & 0xFF, minimum & 0xFF)
+        offset += size
+    raise ReleaseError(f"{path} has no LC_BUILD_VERSION load command")
+
+
+def native_toolchain(goos, zig_dir, cargo_zigbuild):
+    """Describe the C toolchain and linker that build a target's helper."""
+    if goos == "linux":
+        if not (zig_dir and cargo_zigbuild):
+            raise ReleaseError("Linux targets require zig and cargo-zigbuild")
+        return {"zig": run([str(Path(zig_dir) / "zig"), "version"]), "cargoZigbuild": run([cargo_zigbuild, "--version"])}
+    return {"clang": run(["xcrun", "clang", "--version"]).splitlines()[0], "macosSdk": run(["xcrun", "--show-sdk-version"])}
 
 
 def archive_name(tag, target):
@@ -290,36 +290,36 @@ def write_archive(path, members, epoch):
         compressed.write(buffer.getvalue())
 
 
-def build(tag, targets, glibc_floor, zig_dir, cargo_zigbuild):
+def build(tag, targets, glibc_floor, macos_floor, zig_dir, cargo_zigbuild):
     """Build reproducible archives for each target under dist/."""
-    release = require_tag(tag)
     unknown = [target for target in targets if target not in TARGETS]
     if unknown or not targets:
         raise ReleaseError(f"unknown release targets {unknown or targets}; choose from {sorted(TARGETS)}")
-    head, fingerprint = commit(), source_fingerprint()
+    head, required = commit(), required_helper(tag)
     epoch = int(run(["git", "log", "-1", "--format=%ct", head]))
-    cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")).resolve()
-    remaps = {ROOT: "/src", cargo_home: "/cargo"}
+    cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")).absolute()
+    remaps = {ROOT: "/src", cargo_home: "/cargo", cargo_home.resolve(): "/cargo"}
     rust_env = dict(
         os.environ,
         SOURCE_DATE_EPOCH=str(epoch),
         CARGO_TARGET_DIR=str(WORK / "cargo"),
         CARGO_PROFILE_RELEASE_STRIP="symbols",
         CARGO_INCREMENTAL="0",
+        MACOSX_DEPLOYMENT_TARGET=macos_floor,
         RUSTFLAGS=" ".join(f"--remap-path-prefix={source}={target}" for source, target in remaps.items()),
         CFLAGS=" ".join(f"-ffile-prefix-map={source}={target}" for source, target in remaps.items()),
     )
     if zig_dir:
         rust_env["PATH"] = f"{zig_dir}{os.pathsep}{rust_env['PATH']}"
+    floors = {"linux": ("glibcFloor", glibc_floor, glibc_requirement), "darwin": ("macosFloor", macos_floor, macos_requirement)}
     rustc = run(["rustc", "-V"], cwd=ROOT / "native")
     go_version = run(["go", "env", "GOVERSION"], env=go_environment())
     for target in targets:
         spec = TARGETS[target]
         triple = spec["rust"]
+        toolchain = native_toolchain(spec["goos"], zig_dir, cargo_zigbuild)
         run(["rustup", "target", "add", triple], cwd=ROOT / "native")
         if spec["goos"] == "linux":
-            if not cargo_zigbuild:
-                raise ReleaseError("Linux targets require cargo-zigbuild")
             cargo = [cargo_zigbuild, "zigbuild", "--target", f"{triple}.{glibc_floor}"]
         else:
             cargo = ["cargo", "build", "--target", triple]
@@ -334,34 +334,32 @@ def build(tag, targets, glibc_floor, zig_dir, cargo_zigbuild):
         print(f"building {target} command", flush=True)
         command = out / COMMAND
         run(
-            ["go", "build", "-trimpath", "-ldflags", f"-s -w -X main.buildVersion={tag}", "-o", str(command), "./cmd/acp-go-nanocodex"],
+            ["go", "build", "-trimpath", "-ldflags", f"-s -w -X main.buildVersion={tag}", "-o", str(command), f"./cmd/{COMMAND}"],
             env=go_environment(CGO_ENABLED="0", GOOS=spec["goos"], GOARCH=spec["goarch"]),
         )
         command.chmod(0o755)
-        record = {}
-        if spec["goos"] == "linux":
-            floor = tuple(map(int, glibc_floor.split("."))) + (0,)
-            required = glibc_requirement(helper)
-            if required > floor[:3]:
-                raise ReleaseError(f"{helper} requires GLIBC_{'.'.join(map(str, required))}, above the {glibc_floor} floor")
-            record["glibcFloor"] = glibc_floor
+        floor_key, floor, requirement = floors[spec["goos"]]
+        for executable in (helper, command):
+            needed = requirement(executable)
+            if needed > version_tuple(floor):
+                raise ReleaseError(f"{executable} requires {spec['goos']} {'.'.join(map(str, needed))}, above the {floor} floor")
         if target == host_target():
-            verify_executables(out, tag, fingerprint)
+            verify_executables(out, tag, required)
         archive = DIST / archive_name(tag, target)
         write_archive(archive, [(COMMAND, command, 0o755), (HELPER, helper, 0o755), ("LICENSE", ROOT / "LICENSE", 0o644)], epoch)
-        record.update(
-            target=target,
-            version=tag,
-            commit=head,
-            helperVersion=release,
-            helperFingerprint=fingerprint,
-            rustc=rustc,
-            go=go_version,
-            archive=archive.name,
-            archiveSha256=sha256_file(archive),
-            helperSha256=sha256_file(helper),
-            commandSha256=sha256_file(command),
-        )
+        record = {
+            "version": tag,
+            "commit": head,
+            **required,
+            "rustc": rustc,
+            "go": go_version,
+            floor_key: floor,
+            **toolchain,
+            "archive": archive.name,
+            "archiveSha256": sha256_file(archive),
+            "helperSha256": sha256_file(helper),
+            "commandSha256": sha256_file(command),
+        }
         (out / "build.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
         print(f"{archive.relative_to(ROOT)} {record['archiveSha256']}", flush=True)
 
@@ -375,10 +373,9 @@ def load_record(target):
 
 def smoke(tag, target, image):
     """Verify a built archive from its own contents, then run integration smoke."""
-    release = require_tag(tag)
     record = load_record(target)
-    fingerprint = source_fingerprint()
-    expected = {"version": tag, "commit": commit(), "helperVersion": release, "helperFingerprint": fingerprint}
+    required = required_helper(tag)
+    expected = {"version": tag, "commit": commit(), **required}
     mismatched = {key: record.get(key) for key, value in expected.items() if record.get(key) != value}
     if mismatched:
         raise ReleaseError(f"{target} build record differs from this checkout: {mismatched}")
@@ -392,13 +389,13 @@ def smoke(tag, target, image):
         names = sorted(bundle.getnames())
         if names != sorted([COMMAND, HELPER, "LICENSE"]):
             raise ReleaseError(f"{archive.name} contains {names}")
-        extract(bundle, directory)
+        bundle.extractall(directory, filter="data")
     for name, key in ((COMMAND, "commandSha256"), (HELPER, "helperSha256")):
         if sha256_file(directory / name) != record[key]:
             raise ReleaseError(f"{archive.name}:{name} digest differs from its build record")
-    verify_executables(directory, tag, fingerprint)
+    verify_executables(directory, tag, required)
     if image:
-        require_identity(probe_image(directory / HELPER, image), release, fingerprint, f"{HELPER} in {image}")
+        require_identity(probe_image(directory / HELPER, image), required, f"{HELPER} in {image}")
         print(f"{target}: helper initializes in {image}", flush=True)
     env = go_environment(
         ACP_GO_NANOCODEX_RUN_INTEGRATION="1",
@@ -409,33 +406,28 @@ def smoke(tag, target, image):
     run(["go", "test", "-race", "-count=1", "-tags=integration", "-timeout=300s", "-v", "./integration/..."], env=env, capture=False)
 
 
-def manifest(tag, targets):
-    """Write release-manifest.json and SHA256SUMS from the built targets."""
-    release = require_tag(tag)
-    records = {target: load_record(target) for target in targets}
-    shared = ("version", "commit", "helperVersion", "helperFingerprint", "rustc", "go")
-    expected = {"version": tag, "commit": commit(), "helperVersion": release, "helperFingerprint": source_fingerprint()}
+def manifest(tag):
+    """Write release-manifest.json and SHA256SUMS for every target built under dist/."""
+    expected = {"version": tag, "commit": commit(), "helperVersion": require_tag(tag)}
+    records = {path.parent.name: json.loads(path.read_text()) for path in sorted(DIST.glob("*/build.json"))}
+    unknown = sorted(set(records) - set(TARGETS))
+    if unknown or not records:
+        raise ReleaseError(f"dist/ holds build records for {sorted(records)}; targets are {sorted(TARGETS)}")
+    first = next(iter(records.values()))
+    mismatched = {key: first[key] for key, value in expected.items() if first[key] != value}
+    if mismatched:
+        raise ReleaseError(f"build records differ from this checkout: {mismatched}")
     for target, record in records.items():
-        for key in shared:
-            if record[key] != records[targets[0]][key] or (key in expected and record[key] != expected[key]):
-                raise ReleaseError(f"{target} {key} {record[key]!r} disagrees with the release")
+        disagreeing = [key for key in SHARED if record[key] != first[key]]
+        if disagreeing:
+            raise ReleaseError(f"{target} build record disagrees on {disagreeing}")
         for key, path in (("archiveSha256", DIST / record["archive"]), ("helperSha256", DIST / target / HELPER), ("commandSha256", DIST / target / COMMAND)):
             if sha256_file(path) != record[key]:
                 raise ReleaseError(f"{path.relative_to(ROOT)} digest differs from its build record")
-    first = records[targets[0]]
     document = {
         "module": MODULE,
-        "version": tag,
-        "commit": first["commit"],
-        "helperVersion": release,
-        "protocolVersion": PROTOCOL_VERSION,
-        "helperFingerprint": first["helperFingerprint"],
-        "rustc": first["rustc"],
-        "go": first["go"],
-        "targets": {
-            target: {key: record[key] for key in ("archive", "archiveSha256", "helperSha256", "commandSha256", "glibcFloor") if key in record}
-            for target, record in sorted(records.items())
-        },
+        **{key: first[key] for key in SHARED},
+        "targets": {target: {key: value for key, value in record.items() if key not in SHARED} for target, record in records.items()},
     }
     (DIST / "release-manifest.json").write_text(json.dumps(document, indent=2) + "\n")
     sums = sorted([record["archive"] for record in records.values()] + ["release-manifest.json"])
@@ -443,10 +435,27 @@ def manifest(tag, targets):
     print((DIST / "SHA256SUMS").read_text(), end="")
 
 
+def zig_sources(version, filename):
+    """Yield zig tarball URLs: community mirrors in random order, then ziglang.org."""
+    try:
+        with urllib.request.urlopen(ZIG_MIRRORS, timeout=30) as response:
+            mirrors = [mirror for mirror in response.read().decode().split() if mirror.startswith("https://")]
+    except (OSError, http.client.HTTPException) as error:
+        print(f"zig mirror list unavailable: {error}", file=sys.stderr)
+        mirrors = []
+    random.shuffle(mirrors)
+    yield from (f"{mirror}/{filename}?source={ZIG_SOURCE}" for mirror in mirrors)
+    yield f"https://ziglang.org/download/{version}/{filename}"
+
+
 def install_zig(version, root, sums):
-    """Install the pinned zig release for this host after checking its digest."""
-    machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(platform.machine().lower(), platform.machine().lower())
-    system = "macos" if platform.system() == "Darwin" else platform.system().lower()
+    """Install the pinned zig release for this host.
+
+    The pinned digest fixes the tarball bytes, so any mirror is as trustworthy
+    as ziglang.org.
+    """
+    machine = {"arm64": "aarch64"}.get(platform.machine(), platform.machine())
+    system = {"Darwin": "macos"}.get(platform.system(), platform.system().lower())
     host = f"{machine}-{system}"
     pinned = dict(entry.split("=", 1) for entry in sums)
     if host not in pinned:
@@ -454,12 +463,20 @@ def install_zig(version, root, sums):
     name = f"zig-{host}-{version}"
     with tempfile.TemporaryDirectory(prefix="zig-") as scratch:
         tarball = Path(scratch) / f"{name}.tar.xz"
-        with urllib.request.urlopen(f"https://ziglang.org/download/{version}/{name}.tar.xz", timeout=300) as response, open(tarball, "wb") as file:
-            shutil.copyfileobj(response, file)
-        if sha256_file(tarball) != pinned[host]:
-            raise ReleaseError(f"{tarball.name} digest differs from the pinned {pinned[host]}")
+        for url in zig_sources(version, tarball.name):
+            try:
+                with urllib.request.urlopen(url, timeout=300) as response, open(tarball, "wb") as file:
+                    shutil.copyfileobj(response, file)
+            except (OSError, http.client.HTTPException) as error:
+                print(f"zig download from {url} failed: {error}", file=sys.stderr)
+                continue
+            if sha256_file(tarball) == pinned[host]:
+                break
+            print(f"zig download from {url} differs from the pinned digest", file=sys.stderr)
+        else:
+            raise ReleaseError(f"no source served {tarball.name} with digest {pinned[host]}")
         with tarfile.open(tarball) as bundle:
-            extract(bundle, scratch)
+            bundle.extractall(scratch, filter="data")
         shutil.rmtree(root, ignore_errors=True)
         Path(root).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(Path(scratch) / name, root)
@@ -475,11 +492,11 @@ def main():
     commands.choices["check"].add_argument("--branch", default="")
     commands.choices["build"].add_argument("--targets", required=True)
     commands.choices["build"].add_argument("--glibc-floor", required=True)
+    commands.choices["build"].add_argument("--macos-floor", required=True)
     commands.choices["build"].add_argument("--zig-dir", default="")
     commands.choices["build"].add_argument("--cargo-zigbuild", default="")
     commands.choices["smoke"].add_argument("--target", required=True)
     commands.choices["smoke"].add_argument("--image", default="")
-    commands.choices["manifest"].add_argument("--targets", required=True)
     zig = commands.add_parser("zig")
     zig.add_argument("--version", required=True)
     zig.add_argument("--root", required=True)
@@ -489,11 +506,11 @@ def main():
         if args.command == "check":
             check(args.tag, args.branch)
         elif args.command == "build":
-            build(args.tag, args.targets.split(), args.glibc_floor, args.zig_dir, args.cargo_zigbuild)
+            build(args.tag, args.targets.split(), args.glibc_floor, args.macos_floor, args.zig_dir, args.cargo_zigbuild)
         elif args.command == "smoke":
             smoke(args.tag, args.target, args.image)
         elif args.command == "manifest":
-            manifest(args.tag, args.targets.split())
+            manifest(args.tag)
         else:
             install_zig(args.version, args.root, args.sha256)
     except ReleaseError as error:

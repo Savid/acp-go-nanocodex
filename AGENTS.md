@@ -51,8 +51,8 @@ and it requires explicit operator intent.
 Release targets require a clean commit whose `HelperVersion` and native
 package version equal the tag. `make release-build` installs pinned zig and
 cargo-zigbuild under `.tmp/` for Linux targets, builds with a glibc 2.28
-floor, and writes reproducible archives under `dist/`. CI runs the release
-jobs only for `v*` tags, after audit passes.
+floor on Linux and a macOS 13 floor on darwin, and writes archives under
+`dist/`. CI runs the release jobs only for `v*` tags, after audit passes.
 
 `make native-vuln` installs pinned `cargo-audit` under `.tmp/` on first use and
 checks `native/Cargo.lock` against the RustSec advisory database. `make audit`
@@ -81,8 +81,8 @@ Run `make test` and `make lint` for Go or Rust changes. Run `make audit` once
 changes settle. Run the integration smoke target after changing the native
 protocol, persistence, or executable packaging. After changing release
 packaging, run `make release-build` and `make release-smoke` for the host
-target. Tests must verify externally
-visible behavior and concrete failure boundaries.
+target. Tests must verify externally visible behavior and concrete failure
+boundaries.
 
 ## Boundaries
 
