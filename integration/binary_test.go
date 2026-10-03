@@ -538,8 +538,11 @@ func TestSmokeCheckpointStoreRestoreAndCompactedReplay(t *testing.T) {
 	}
 	requests := provider.history(t)
 	require.Len(t, requests, 3)
-	require.Contains(t, string(mustJSON(t, requests[1])), `"type":"compaction_trigger"`)
-	require.Contains(t, string(mustJSON(t, requests[2])), "opaque-compaction")
+	require.Equal(t, "none", requests[1]["tool_choice"])
+	require.NotContains(t, string(mustJSON(t, requests[1])), "compaction_trigger")
+	compacted := string(mustJSON(t, requests[2]))
+	require.Contains(t, compacted, "fixture-summary")
+	require.NotContains(t, compacted, `"type":"compaction"`)
 	restored.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
 	restored.notices = nil
 	restored.call(t, "session/load", wire.LoadSessionRequest(id, workspace))
@@ -547,7 +550,7 @@ func TestSmokeCheckpointStoreRestoreAndCompactedReplay(t *testing.T) {
 	replay := string(mustJSON(t, restored.notices))
 	require.Contains(t, replay, "first user input")
 	require.Contains(t, replay, "second user input")
-	require.NotContains(t, replay, "opaque-compaction")
+	require.NotContains(t, replay, "fixture-summary")
 	restored.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
 	restored.stop()
 }

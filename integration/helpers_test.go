@@ -312,10 +312,10 @@ func newProviderWithResponseMode(t *testing.T, shell bool, mode string) *provide
 			writeEvent(map[string]any{"type": "response.created", "response": map[string]any{"id": id, "status": "in_progress"}})
 		}
 
-		compacting := mode == "compaction" && strings.Contains(string(mustJSON(t, body["input"])), `"type":"compaction_trigger"`)
+		compacting := mode == "compaction" && body["tool_choice"] == "none"
 		switch {
 		case compacting:
-			output = []map[string]any{{"type": "compaction", "id": "fixture-compaction", "encrypted_content": "opaque-compaction"}}
+			output = []map[string]any{providerMessage("fixture-summary")}
 		case mode == "view-image" && number == 1:
 			output = []map[string]any{{"type": "function_call", "call_id": "image-fixture", "name": "view_image", "arguments": `{"path":"fixture.png"}`}}
 		case mode == "idless-calls" && number == 1:
