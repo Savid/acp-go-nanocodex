@@ -13,10 +13,15 @@ Requests have `id` (positive integer), `method`, and optional `params` (object,
 default `{}`). Replies have the same `id` and either `result` or
 `error: {code, message, field?, statusCode?, providerCode?}`. `field` identifies
 an invalid initialization option; `statusCode` preserves a provider HTTP rejection code.
-`providerCode` preserves an error-event code containing at most 128 ASCII
-letters, digits, dots, underscores, or hyphens. Known rate-limit, quota,
-authorization, model, context-window, and service errors receive specific
-safe messages. An SSE error over HTTP 200 does not invent an HTTP status.
+`providerCode` preserves the provider's classification. Its candidates, in
+order, are the canonical `error_type` on the response or event, the error
+object's `code` (a string, or an integer in decimal), the error object's `type`,
+and `incomplete_details.reason`; a candidate longer than 128 bytes or containing
+anything other than ASCII letters, digits, dots, underscores, or hyphens is
+dropped. The first terminal candidate is reported, else the first candidate, so
+the code matches the retry decision. Known rate-limit, quota, authorization, model, context-window, and service
+errors receive specific safe messages; other codes keep the generic message.
+An SSE error over HTTP 200 does not invent an HTTP status.
 IDs must not be reused during a process lifetime. Error messages are fixed
 summaries; provider response bodies and credentials are never returned as errors.
 
@@ -77,14 +82,21 @@ cancelled compaction leaves committed history intact. Routes without a gateway
 keep native remote compaction and send `compaction` items unchanged, including
 marked ones.
 
-Gateway generation and compaction retry transient connection failures, HTTP
-408/409/429/5xx responses, and transient provider error events up to five total
-attempts. Backoff is exponential with jitter. Valid `Retry-After` delays up to
+Gateway generation and compaction retry connection failures, HTTP 408, 409,
+429, and 5xx responses without `x-should-retry: false`, and `response.failed`
+and error events up to five total attempts; generation also retries
+`response.incomplete`. A failure retries unless its `providerCode` is terminal,
+so a missing or unrecognized code retries. A three-digit code is an HTTP status
+under the same status rule. Other terminal codes cover authorization, quota and
+billing, model access, invalid requests, context windows, image input, and
+content policy, plus the `max_output_tokens` and `content_filter` incomplete
+reasons. Malformed provider data fails immediately. Backoff is exponential with
+random jitter. Valid `Retry-After` delays and event `retry_after` values up to
 60 seconds are honored, as are `retry-after-ms` values. Backoff remains the
 minimum delay, including for zero server delays. Overflowing decimal values and
-delays over 60 seconds end the operation without retrying early. Retry attempts,
-delays, and exhausted/refused retries produce redacted stderr diagnostics.
-Authorization, quota, invalid input, and malformed provider data fail immediately.
+delays over 60 seconds end the operation without retrying early. Each failed
+attempt writes one redacted stderr line with its attempt number, HTTP status or
+event type, `providerCode`, and whether it retries or why it stops.
 Generation never retries after delivering assistant or reasoning output. A retry
 cannot execute tools from an incomplete response. Cancellation interrupts both
 requests and retry delays.

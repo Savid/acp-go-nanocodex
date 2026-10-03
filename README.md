@@ -244,12 +244,19 @@ must stay on a gateway route. Provider-reported context overflow retains its
 native error type, but the native forced-compaction flag is not retained across
 helper restarts.
 
-Gateway requests retry transient connection failures, rate limits, and service
-errors up to five total attempts with exponential backoff and jitter. Retries
-stop after assistant or reasoning output is delivered. Valid `Retry-After`
+Gateway requests retry connection failures, HTTP 408, 409, 429, and 5xx
+responses, and provider failure events whose code is missing, unrecognized, or
+a transient HTTP status, up to five total attempts with exponential backoff and
+jitter. Authorization, quota, model, invalid-request, context-window, image,
+and policy codes fail immediately, as do incomplete responses stopped by
+`max_output_tokens` or `content_filter`. Retries stop after assistant or
+reasoning output is delivered. Valid `Retry-After`
 and `retry-after-ms` delays up to 60 seconds are respected with the normal
-backoff as a minimum; longer delays fail without retrying early. Redacted retry
-attempts and delays go to helper stderr. Cancellation interrupts requests and
+backoff as a minimum; longer delays fail without retrying early. Each failed
+attempt writes one redacted line to helper stderr. Turn errors carry the
+provider's sanitized classification as `providerCode`, even when unrecognized:
+a terminal candidate when one is present, else the canonical error type, error
+code, error object type, or incomplete reason, in that order. Cancellation interrupts requests and
 retry delays. Native default and WebSocket routes retain upstream transport
 behavior.
 Shell sessions and other in-memory tool state last for one prompt; subsequent

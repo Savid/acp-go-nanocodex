@@ -69,25 +69,25 @@ impl SessionError {
             ..Self::new("native_error", "provider rejected the request")
         }
     }
+    /// Reports the first terminal classification candidate, else the first
+    /// one, so the reported code matches the retry decision.
     pub fn provider_event(event: &Value) -> Self {
-        let error = event
-            .get("error")
-            .filter(|error| error.is_object())
-            .or_else(|| {
-                event
-                    .get("response")
-                    .and_then(|response| response.get("error"))
-                    .filter(|error| error.is_object())
+        let codes = crate::retry::provider_codes(event)
+            .into_iter()
+            .filter(|code| {
+                !code.is_empty()
+                    && code.len() <= 128
+                    && code.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
             })
-            .unwrap_or(event);
-        let provider_code = error.get("code").and_then(Value::as_str).filter(|code| {
-            !code.is_empty()
-                && code.len() <= 128
-                && code
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        });
-        let message = match provider_code {
+            .collect::<Vec<_>>();
+        let provider_code = codes
+            .iter()
+            .find(|code| crate::retry::is_terminal(code))
+            .or(codes.first())
+            .cloned();
+        let message = match provider_code.as_deref() {
             Some("rate_limit_exceeded" | "too_many_requests" | "rate_limit_error") => {
                 "provider rate limit reached"
             }
@@ -106,7 +106,7 @@ impl SessionError {
             _ => "provider response did not complete",
         };
         Self {
-            provider_code: provider_code.map(str::to_owned),
+            provider_code,
             ..Self::new("native_error", message)
         }
     }

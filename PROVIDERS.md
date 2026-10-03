@@ -126,7 +126,8 @@ account.
 - Gateways cache the shared request prefix without `prompt_cache_key`. A
   `thought_level` change starts a separate provider cache, so the next call is
   uncached.
-- Transient gateway failures retry up to five attempts before output is delivered.
+- Gateway failures without a terminal code retry up to five attempts before
+  output is delivered.
   See [retry and persistence behavior](README.md#scope).
 - Code Mode is disabled on every route. The freeform `apply_patch` tool is
   excluded on gateways; provider web search and image generation are disabled.

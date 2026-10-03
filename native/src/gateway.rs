@@ -325,7 +325,7 @@ impl GatewayRoute {
         if compacting {
             body["max_output_tokens"] = json!(SUMMARY_MAX_OUTPUT_TOKENS);
         }
-        let mut retry = Retry::new(&self.config.session_id, Some(model_call_index));
+        let mut retry = Retry::new();
         loop {
             let mut emitted_output = false;
             match self
@@ -345,7 +345,7 @@ impl GatewayRoute {
                     return Ok(ResponsesServiceResponse::new(output));
                 }
                 Err(error) => {
-                    if emitted_output || !retry.wait(&error).await {
+                    if !retry.wait(&error, emitted_output).await {
                         return Err(error.error);
                     }
                 }

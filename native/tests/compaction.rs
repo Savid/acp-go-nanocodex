@@ -118,6 +118,7 @@ enum Reply {
     Tool,
     Summary { text: &'static str, streamed: bool },
     InvalidSummary(&'static str),
+    FailedEvent(Value),
     Reject,
     ServerError,
     RetryDelay,
@@ -257,6 +258,16 @@ async fn respond(
         )
             .into_response();
     }
+    if let Reply::FailedEvent(error) = &reply {
+        let failed = sse(
+            json!({"type":"response.failed","response":{"id":id,"status":"failed","error":error}}),
+        );
+        return (
+            [("content-type", "text/event-stream")],
+            [created, failed].concat(),
+        )
+            .into_response();
+    }
     let mut events = vec![created];
     let mut status = "completed";
     let summary_items = |text: &str| {
@@ -325,7 +336,11 @@ async fn respond(
             }
             (output, 15)
         }
-        Reply::Reject | Reply::ServerError | Reply::RetryDelay | Reply::Hang => unreachable!(),
+        Reply::Reject
+        | Reply::ServerError
+        | Reply::RetryDelay
+        | Reply::Hang
+        | Reply::FailedEvent(_) => unreachable!(),
     };
     events.push(sse(json!({
         "type":"response.completed","response":{
@@ -1185,4 +1200,35 @@ async fn cancel_and_shutdown_interrupt_compaction_retry_delay() {
         }
         assert_eq!(provider.requests().len(), 2);
     }
+}
+
+#[tokio::test]
+async fn codeless_failed_summary_event_is_retried_before_history_changes() {
+    let provider = Provider::start([
+        Reply::Text("old assistant details", HIGH_USAGE),
+        Reply::FailedEvent(json!({"message":"summary upstream failed"})),
+        Reply::Summary {
+            text: SUMMARY,
+            streamed: false,
+        },
+        Reply::Text("continued after summary retry", 15),
+    ])
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path());
+    helper.call(1, "initialize", config(&provider)).await;
+    helper
+        .call(2, "prompt", prompt("retain original user input"))
+        .await;
+    let completed = helper
+        .call(3, "prompt", prompt("continue after summary retry"))
+        .await;
+    assert_eq!(completed["finalMessage"], "continued after summary retry");
+    helper.shutdown(4).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert_summary_request(&requests[1], &requests[0]);
+    assert_eq!(requests[1], requests[2], "summary retry changed history");
+    assert_compacted_request(&requests[3], SUMMARY);
 }
