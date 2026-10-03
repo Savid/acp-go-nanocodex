@@ -2,6 +2,7 @@ package nanocodexacp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -156,4 +157,17 @@ func TestNativeViewImageCompletesWithoutPublishingBinaryPayloads(t *testing.T) {
 	defer client.mu.Unlock()
 	require.Len(t, client.extensions, 1)
 	require.NotContains(t, string(client.extensions[0]), "secret-image-bytes")
+}
+
+func TestOversizedPromptIsRejectedBeforeAdmissionAndSessionRemainsUsable(t *testing.T) {
+	t.Parallel()
+	a, client, _, workspace := fixtureAgent(t)
+	created := fixtureSession(t, a, workspace)
+	client.reset()
+	_, err := a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, strings.Repeat("x", nanocodex.MaxPromptBytes)))
+	require.Error(t, err)
+	notices, _ := client.snapshot()
+	require.Empty(t, notices)
+	fixturePrompt(t, a, created.SessionId, "small valid prompt")
+	require.NotEmpty(t, client.text())
 }

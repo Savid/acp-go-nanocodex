@@ -177,3 +177,13 @@ func TestWriteRowsPublishesAtomicallyAndCleansOwnStaging(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "preserved", string(actual))
 }
+
+func TestCompactedHistoryCanExceedProtocolFrameLimit(t *testing.T) {
+	t.Parallel()
+	home, path := rolloutFixture(t)
+	row := []byte(`{"type":"compacted","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + strings.Repeat("x", MaxFrameBytes) + `"}]}]}}`)
+	require.NoError(t, WriteRows(home, path, [][]byte{row}))
+	rows, err := ReadRows(home, path, -1)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{row}, rows)
+}

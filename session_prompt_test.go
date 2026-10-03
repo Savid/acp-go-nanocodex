@@ -65,7 +65,7 @@ func TestConformancePromptStreamsToolsUsageAndDeduplicatedMessages(t *testing.T)
 
 func TestConformanceCancellationAndNativeFailureRemainRestorable(t *testing.T) {
 	t.Parallel()
-	for _, command := range []string{"wait", "fail", "rate-limit", "connection-lost", "invalid-stream"} {
+	for _, command := range []string{"wait", "fail", "rate-limit", "provider-failed", "connection-lost", "invalid-stream"} {
 		t.Run(command, func(t *testing.T) {
 			t.Parallel()
 			a, client, _, workspace := fixtureAgent(t)
@@ -108,6 +108,11 @@ func TestConformanceCancellationAndNativeFailureRemainRestorable(t *testing.T) {
 					if command == "rate-limit" {
 						require.Equal(t, "rate_limit_exceeded", data["providerCode"])
 						require.Equal(t, "provider rate limit exceeded", data["message"])
+						require.NotContains(t, data, "statusCode")
+					}
+					if command == "provider-failed" {
+						require.Equal(t, "upstream_error", data["providerCode"])
+						require.Equal(t, "provider response did not complete", data["message"])
 						require.NotContains(t, data, "statusCode")
 					}
 				}

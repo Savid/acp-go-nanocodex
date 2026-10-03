@@ -1,4 +1,6 @@
+mod checkpoint;
 mod gateway;
+mod retry;
 mod session;
 
 use futures_util::StreamExt;
@@ -10,6 +12,8 @@ use tokio::io::{AsyncWriteExt, BufWriter, Stdout};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 use session::{Session, SessionError};
+
+const MAX_PROMPT_BYTES: usize = 12 * 1024 * 1024;
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
@@ -168,7 +172,7 @@ impl Server {
                     value["finalMessage"] = json!("");
                     Ok(value)
                 }
-                Err(error) => Err(SessionError::native(error)),
+                Err(error) => Err(session.turn_failed(error)),
             },
         };
         self.reply(active.id, response).await
@@ -181,11 +185,7 @@ impl Server {
             self.finish(result).await?;
         }
         let result = if let Some(session) = &self.session {
-            session
-                .agent
-                .shutdown()
-                .await
-                .map_err(|_| SessionError::persistence())
+            session.shutdown().await
         } else {
             Ok(())
         };

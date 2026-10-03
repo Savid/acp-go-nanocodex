@@ -310,6 +310,22 @@ func validateNativeOptions(o NanocodexOptions) error {
 	return nil
 }
 
+// pinRoute refuses moving a started session between a gateway route (a custom
+// endpoint) and the native route. Native routes cannot read gateway summaries,
+// and gateways cannot create native compaction items.
+func pinRoute(stored, requested NanocodexOptions) error {
+	gateway := func(o NanocodexOptions) bool { return o.APIBaseURL != "" || o.WebsocketURL != "" }
+	if gateway(stored) == gateway(requested) {
+		return nil
+	}
+
+	if (stored.APIBaseURL == "") != (requested.APIBaseURL == "") {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaAPIBaseURL))
+	}
+
+	return wire.Unsupported(wire.MetaOptionPath(vendor, metaWebsocketURL))
+}
+
 func (m sessionMeta) inherit(options NanocodexOptions) NanocodexOptions {
 	base := options.values()
 	maps.Copy(base, m.options.values())

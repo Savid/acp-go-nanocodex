@@ -82,56 +82,53 @@ func ReadRows(home, path string, limit int64) ([][]byte, error) {
 		reader = io.LimitReader(file, limit)
 	}
 
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64<<10), MaxFrameBytes+1)
-	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
-		if limit < 0 && atEOF && bytes.IndexByte(data, '\n') < 0 && len(data) <= MaxFrameBytes {
-			if len(data) > 0 && json.Valid(data) {
-				return len(data), data, nil
-			}
-
-			return len(data), nil, nil
-		}
-
-		return splitRollout(data, atEOF)
-	})
+	buffered := bufio.NewReader(reader)
 
 	var rows [][]byte
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 || !json.Valid(line) {
+	for {
+		line, readErr := buffered.ReadBytes('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, readErr
+		}
+
+		if len(line) == 0 {
+			break
+		}
+
+		complete := line[len(line)-1] == '\n'
+		if complete {
+			line = line[:len(line)-1]
+		}
+
+		valid := len(line) > 0 && json.Valid(line)
+
+		if !complete {
+			if limit >= 0 {
+				return nil, errors.New("incomplete native rollout record")
+			}
+
+			if !valid {
+				if len(line) > MaxFrameBytes {
+					return nil, errors.New("native rollout row exceeds limit")
+				}
+
+				break
+			}
+		}
+
+		if !valid {
 			return nil, errors.New("malformed native rollout record")
 		}
 
-		rows = append(rows, bytes.Clone(line))
-	}
+		rows = append(rows, line)
 
-	if err := scanner.Err(); err != nil {
-		if errors.Is(err, bufio.ErrTooLong) {
-			return nil, errors.New("native rollout row exceeds limit")
+		if readErr != nil {
+			break
 		}
-
-		return nil, err
 	}
 
 	return rows, nil
-}
-
-func splitRollout(data []byte, atEOF bool) (int, []byte, error) {
-	if newline := bytes.IndexByte(data, '\n'); newline >= 0 {
-		return newline + 1, data[:newline], nil
-	}
-
-	if len(data) > MaxFrameBytes {
-		return 0, nil, errors.New("native rollout row exceeds limit")
-	}
-
-	if atEOF && len(data) > 0 {
-		return 0, nil, errors.New("incomplete native rollout record")
-	}
-
-	return 0, nil, nil
 }
 
 // ValidSessionID requires the canonical UUID spelling used by native rollouts.
@@ -219,7 +216,7 @@ func WriteRows(home, path string, rows [][]byte) error {
 	defer func() { _ = root.Remove(tmp) }()
 
 	for _, row := range rows {
-		if len(row) > MaxFrameBytes || bytes.ContainsRune(row, '\n') || !json.Valid(row) {
+		if bytes.ContainsRune(row, '\n') || !json.Valid(row) {
 			_ = file.Close()
 
 			return errors.New("invalid native row")

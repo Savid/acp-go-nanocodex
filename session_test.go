@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/process"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
@@ -17,6 +18,25 @@ import (
 )
 
 const stopHelperMode = "ACP_GO_NANOCODEX_INTERNAL_STOP_TEST"
+
+func TestLaunchRefusesRolloutPathDriftBeforePrompt(t *testing.T) {
+	t.Parallel()
+	a, client, _, workspace := fixtureAgent(t)
+	options := NewNanocodexOptions(WithNanocodexEnv(map[string]string{"NANOCODEX_TEST_RESUME_PATH_DRIFT": "1"}))
+	created := fixtureSession(t, a, workspace, WithSessionNanocodexOptions(options))
+	fixturePrompt(t, a, created.SessionId, "retain original conversation")
+	s, err := a.lookup(created.SessionId)
+	require.NoError(t, err)
+	original := s.state.RolloutPath
+	client.reset()
+	for range 2 {
+		_, err = a.Prompt(t.Context(), wire.PromptRequest(created.SessionId, acp.TextBlock("must not be submitted")))
+		require.Equal(t, wire.SessionPoisoned(vendor, "native_session_identity_drift"), err)
+	}
+	require.Equal(t, original, s.state.RolloutPath)
+	notifications, _ := client.snapshot()
+	require.Empty(t, notifications)
+}
 
 func TestHelperIdentityMismatchFailsBeforeSessionBinding(t *testing.T) {
 	t.Parallel()

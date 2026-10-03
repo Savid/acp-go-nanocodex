@@ -48,14 +48,15 @@ export NANOCODEX_TRANSPORT=https
 
 ./bin/acp-go-nanocodex \
   -path ./bin/acp-go-nanocodex-native \
-  -model gpt-6.1-sol
+  -model gpt-6-astra
 ```
 
 Use the URL and token supplied by the gateway operator for a remote gateway.
 The prefix must match the provider namespace returned by its authenticated
 `GET /v1/models` endpoint. The example selects
-`openai-codex/gpt-6.1-sol`; a different gateway account may expose a different
-namespace or model roster.
+`openai-codex/gpt-6-astra`, a ChatGPT-subscription model; a different gateway
+account may expose a different namespace or model roster. OMP serves API-key
+OpenAI models under `openai/` and OpenRouter models under `openrouter/openai/`.
 
 For a gateway exposing `openrouter/openai/gpt-6-luna`, use
 `NANOCODEX_MODEL_ID_PREFIX=openrouter/openai` and `-model gpt-6-luna`.
@@ -117,9 +118,21 @@ account.
 - Custom API-key HTTP endpoints receive standard Responses requests with
   direct `exec_command`, `write_stdin`, `update_plan`, and `view_image`
   function tools. Shell commands can read and edit workspace files.
-- Code Mode, the freeform `apply_patch` tool, provider web search, image
-  generation, gateway remote compaction, and automatic gateway retries are
-  unavailable. Unsupported gateway input or output fails the turn.
+- Gateway compaction is a local summary requested through an ordinary
+  `/responses` call with the conversation's own prefix and `tool_choice:"none"`,
+  so it needs no provider compaction support. It works through OpenRouter and
+  the OMP auth-gateway, neither of which forwards OpenAI's `compaction_trigger`.
+  A started session cannot move between a custom endpoint and the native
+  route; see [route pinning](README.md#scope).
+- Gateways cache the shared request prefix without `prompt_cache_key`. A
+  `thought_level` change starts a separate provider cache, so the next call is
+  uncached.
+- Gateway failures without a terminal code retry up to five attempts before
+  output is delivered.
+  See [retry and persistence behavior](README.md#scope).
+- Code Mode is disabled on every route. The freeform `apply_patch` tool is
+  excluded on gateways; provider web search and image generation are disabled.
+  Unsupported gateway input or output fails the turn.
 - Native OpenAI/ChatGPT routes retain Nanocodex's own transport. Custom gateway
   routing requires API-key authentication and HTTPS mode. Plain HTTP and
   WebSocket endpoints are accepted only on `localhost` or loopback IPs.

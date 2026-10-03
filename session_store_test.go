@@ -393,3 +393,92 @@ func TestLoadOwnsForegroundUntilReplayCompletes(t *testing.T) {
 		})
 	}
 }
+
+func TestRestoreRefusesAnActiveNativeWriterBeforeHydration(t *testing.T) {
+	t.Parallel()
+	a, _, home, workspace := fixtureAgent(t)
+	created := fixtureSession(t, a, workspace)
+	completed := fixturePrompt(t, a, created.SessionId, "committed history")
+	_, err := a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	id := nativeID(t, completed.Meta)
+	path := rolloutPath(home, id)
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	lock, err := process.LockFile(filepath.Join(home, "nanocodex", "acp-locks", id+".writer.lock"))
+	require.NoError(t, err)
+	defer lock.Close()
+	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.Equal(t, wire.RestoreFailed(vendor), err)
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	require.NoError(t, lock.Close())
+	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.NoError(t, err)
+}
+
+func TestCheckpointMetadataMirrorsAndRehydratesWithoutAddingNativeRows(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a, _, home, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, a, workspace)
+	completed := fixturePrompt(t, a, created.SessionId, "saved history")
+	path := rolloutPath(home, nativeID(t, completed.Meta))
+	checkpoint := json.RawMessage(`{"preceding_bytes":123,"history_items":2,"head":{},"prefix":[]}`)
+	require.NoError(t, nanocodex.WriteCheckpoint(home, path, checkpoint))
+	_, err := a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.JSONEq(t, string(checkpoint), string(record.Checkpoint))
+	for _, row := range rows {
+		require.NotContains(t, string(row), "preceding_bytes")
+	}
+	require.NoError(t, os.Remove(path+".acp-checkpoint.json"))
+	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.NoError(t, err)
+	hydrated, err := nanocodex.ReadCheckpoint(home, path)
+	require.NoError(t, err)
+	require.JSONEq(t, string(checkpoint), string(hydrated))
+}
+
+func TestStartedSessionsKeepTheirRouteClass(t *testing.T) {
+	t.Parallel()
+
+	gateway := func(endpoint, prefix, keyEnv string) NanocodexOptions {
+		return NewNanocodexOptions(WithNanocodexAPIBaseURL(endpoint), WithNanocodexModelIDPrefix(prefix), WithNanocodexAPIKeyEnv(keyEnv))
+	}
+	websocket := NewNanocodexOptions(WithNanocodexWebsocketURL("wss://gateway.example/v1/responses"))
+	for _, test := range []struct {
+		name              string
+		created, restored NanocodexOptions
+		started           bool
+		want              error
+	}{
+		{name: "native to gateway after a turn", restored: gateway("https://one.example/v1", "one", "ONE_KEY"), started: true, want: wire.Unsupported("_meta.nanocodex.options.apiBaseUrl")},
+		{name: "native to websocket endpoint after a turn", restored: websocket, started: true, want: wire.Unsupported("_meta.nanocodex.options.websocketUrl")},
+		{name: "native to gateway before a turn", restored: gateway("https://one.example/v1", "one", "ONE_KEY")},
+		{name: "gateway to gateway after a turn", created: gateway("https://one.example/v1", "one", "ONE_KEY"), restored: gateway("https://two.example/v1", "two", "TWO_KEY"), started: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			a, _, _, workspace := fixtureAgent(t)
+			created := fixtureSession(t, a, workspace, WithSessionNanocodexOptions(test.created))
+			if test.started {
+				fixturePrompt(t, a, created.SessionId, "commit a turn")
+			}
+			_, err := a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+			require.NoError(t, err)
+			_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace, WithSessionNanocodexOptions(test.restored)))
+			require.Equal(t, test.want, err)
+		})
+	}
+
+	// Restore metadata cannot clear a stored endpoint, so the pin is checked directly for this direction.
+	require.Equal(t, wire.Unsupported("_meta.nanocodex.options.apiBaseUrl"), pinRoute(gateway("https://one.example/v1", "one", "ONE_KEY"), NanocodexOptions{}))
+	require.Equal(t, wire.Unsupported("_meta.nanocodex.options.websocketUrl"), pinRoute(websocket, NanocodexOptions{}))
+}

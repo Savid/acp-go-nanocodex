@@ -1,4 +1,7 @@
-use crate::gateway::{GatewayConfig, GatewayEvent, GatewayLayer};
+use crate::{
+    checkpoint,
+    gateway::{GatewayConfig, GatewayEvent, GatewayLayer},
+};
 use nanocodex::{
     AgentEvents, Model, Nanocodex, NanocodexError, OpenAi, Thinking, Turn,
     agent::rollout::RolloutConfig,
@@ -27,6 +30,8 @@ use std::{
 pub struct SessionError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
+    #[serde(skip)]
+    source: Option<std::sync::Arc<nanocodex::oai::transport::ResponsesError>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,6 +46,7 @@ impl SessionError {
             code,
             message,
             status_code: None,
+            source: None,
             provider_code: None,
             field: None,
         }
@@ -63,25 +69,25 @@ impl SessionError {
             ..Self::new("native_error", "provider rejected the request")
         }
     }
+    /// Reports the first terminal classification candidate, else the first
+    /// one, so the reported code matches the retry decision.
     pub fn provider_event(event: &Value) -> Self {
-        let error = event
-            .get("error")
-            .filter(|error| error.is_object())
-            .or_else(|| {
-                event
-                    .get("response")
-                    .and_then(|response| response.get("error"))
-                    .filter(|error| error.is_object())
+        let codes = crate::retry::provider_codes(event)
+            .into_iter()
+            .filter(|code| {
+                !code.is_empty()
+                    && code.len() <= 128
+                    && code.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
             })
-            .unwrap_or(event);
-        let provider_code = error.get("code").and_then(Value::as_str).filter(|code| {
-            !code.is_empty()
-                && code.len() <= 128
-                && code
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        });
-        let message = match provider_code {
+            .collect::<Vec<_>>();
+        let provider_code = codes
+            .iter()
+            .find(|code| crate::retry::is_terminal(code))
+            .or(codes.first())
+            .cloned();
+        let message = match provider_code.as_deref() {
             Some("rate_limit_exceeded" | "too_many_requests" | "rate_limit_error") => {
                 "provider rate limit reached"
             }
@@ -100,7 +106,7 @@ impl SessionError {
             _ => "provider response did not complete",
         };
         Self {
-            provider_code: provider_code.map(str::to_owned),
+            provider_code,
             ..Self::new("native_error", message)
         }
     }
@@ -193,7 +199,38 @@ impl fmt::Display for SessionError {
         f.write_str(self.message)
     }
 }
-impl Error for SessionError {}
+impl Error for SessionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|error| error as &(dyn Error + 'static))
+    }
+}
+
+impl SessionError {
+    pub fn with_provider_source(mut self) -> Self {
+        use nanocodex::oai::transport::ResponsesError;
+        let event = json!({"error":{"code":self.provider_code}}).to_string();
+        self.source = match self.provider_code.as_deref() {
+            Some("context_length_exceeded" | "context_window_exceeded") => {
+                Some(std::sync::Arc::new(ResponsesError::ContextWindowExceeded {
+                    event,
+                }))
+            }
+            Some(
+                "invalid_image"
+                | "image_too_large"
+                | "image_too_small"
+                | "unsupported_image_format"
+                | "image_not_found",
+            ) => Some(std::sync::Arc::new(ResponsesError::InvalidImageRequest {
+                event,
+            })),
+            _ => None,
+        };
+        self
+    }
+}
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -224,6 +261,9 @@ pub struct Session {
     thinking: Thinking,
     text_events: bool,
     replaced_native_session_id: Option<String>,
+    prompted: bool,
+    compact_next: bool,
+    _writer_locks: Vec<File>,
 }
 
 fn context_window(model: Model) -> u64 {
@@ -326,6 +366,36 @@ fn endpoint(value: &str, websocket: bool, field: &'static str) -> Result<(), Ses
     Ok(())
 }
 
+fn writer_locks(home: &Path, config: &Config) -> Result<Vec<File>, SessionError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = home.join("nanocodex/acp-locks");
+    std::fs::create_dir_all(&directory).map_err(|_| SessionError::persistence())?;
+    let mut locks = Vec::new();
+    let mut identities = vec![config.session_id.as_str()];
+    if let Some(id) = config.resume_session_id.as_deref()
+        && id != config.session_id
+    {
+        identities.push(id);
+    }
+    for id in identities {
+        if !uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id) {
+            return Err(SessionError::invalid_config());
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(directory.join(format!("{id}.writer.lock")))
+            .map_err(|_| SessionError::persistence())?;
+        file.try_lock()
+            .map_err(|_| SessionError::restore("native rollout writer is active"))?;
+        locks.push(file);
+    }
+    Ok(locks)
+}
+
 impl Session {
     pub async fn open(params: Value) -> Result<Self, SessionError> {
         let mut config: Config =
@@ -342,6 +412,7 @@ impl Session {
             .or_else(|| env_value("NANOCODEX_API_KEY_ENV"));
         let workspace = env::current_dir().map_err(|_| SessionError::invalid_config())?;
         let home = native_home(&workspace)?;
+        let writer_locks = writer_locks(&home, &config)?;
         let mut model = config
             .model
             .as_deref()
@@ -511,8 +582,13 @@ impl Session {
             .workspace(&workspace)
             .codex_home(&home)
             .tools(tools);
+        let mut compact_next = false;
         if let Some(resume) = resume {
+            let path = resume.rollout_path().to_owned();
             let (_, snapshot, rollout) = resume.into_parts();
+            let (snapshot, overflowed) = checkpoint::restore(&path, snapshot)
+                .map_err(|_| SessionError::restore("native checkpoint could not be restored"))?;
+            compact_next = overflowed;
             builder = builder.resume(snapshot).rollout(rollout);
         } else {
             builder = builder.rollout(RolloutConfig::new(&home));
@@ -530,6 +606,9 @@ impl Session {
             thinking,
             text_events,
             replaced_native_session_id,
+            prompted: false,
+            compact_next,
+            _writer_locks: writer_locks,
         })
     }
 
@@ -562,6 +641,16 @@ impl Session {
     }
 
     pub async fn prompt(&mut self, params: Value) -> Result<Turn, SessionError> {
+        if serde_json::to_vec(&params)
+            .map_err(|_| SessionError::invalid_request())?
+            .len()
+            > crate::MAX_PROMPT_BYTES
+        {
+            return Err(SessionError::new(
+                "invalid_request",
+                "prompt content exceeds 12 MiB",
+            ));
+        }
         let params: PromptParams =
             serde_json::from_value(params).map_err(|_| SessionError::invalid_request())?;
         if params
@@ -575,12 +664,38 @@ impl Session {
         prompt
             .validate()
             .map_err(|_| SessionError::invalid_request())?;
+        if self.compact_next {
+            // Compaction changes native state, so shutdown refreshes the checkpoint.
+            self.prompted = true;
+            if let Err(error) = self.agent.compact().await {
+                // These events precede acceptance, so no prompt can carry them.
+                while self.events.try_recv_timed().is_some() {}
+                return Err(SessionError::native(error));
+            }
+            self.compact_next = false;
+        }
         let turn = self
             .agent
             .prompt(prompt)
             .await
             .map_err(SessionError::native)?;
+        self.prompted = true;
         Ok(turn)
+    }
+
+    /// Classifies a failed turn. A context-window overflow makes the next
+    /// prompt compact first, including in a later helper.
+    pub fn turn_failed(&mut self, error: NanocodexError) -> SessionError {
+        let overflow = error
+            .responses_error()
+            .is_some_and(nanocodex::oai::transport::ResponsesError::is_context_window_exceeded);
+        let error = SessionError::native(error);
+        self.compact_next |= overflow
+            || matches!(
+                error.provider_code.as_deref(),
+                Some("context_length_exceeded" | "context_window_exceeded")
+            );
+        error
     }
 
     pub async fn flush_state(&self) -> Result<Value, SessionError> {
@@ -589,5 +704,40 @@ impl Session {
             .await
             .map_err(|_| SessionError::persistence())?;
         Ok(self.state())
+    }
+
+    pub async fn shutdown(&self) -> Result<(), SessionError> {
+        let snapshot = if self.prompted {
+            Some(self.agent.snapshot().await)
+        } else {
+            None
+        };
+        self.agent
+            .shutdown()
+            .await
+            .map_err(|_| SessionError::persistence())?;
+        match snapshot {
+            Some(Ok(snapshot)) => {
+                if checkpoint::save(
+                    self.agent
+                        .rollout()
+                        .expect("rollout recording enabled")
+                        .path(),
+                    snapshot,
+                    self.compact_next,
+                )
+                .is_err()
+                {
+                    eprintln!(
+                        "native checkpoint could not be saved; native history remains committed"
+                    );
+                }
+            }
+            None | Some(Err(NanocodexError::ForkBeforeCompletedTurn)) => {}
+            Some(Err(_)) => {
+                eprintln!("native checkpoint unavailable; native history remains committed")
+            }
+        }
+        Ok(())
     }
 }

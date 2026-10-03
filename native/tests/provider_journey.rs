@@ -45,6 +45,16 @@ impl Helper {
         key_env: &str,
         extra: &[(&str, &str)],
     ) -> Self {
+        Self::spawn(workspace, native_home, key_env, extra, Stdio::inherit())
+    }
+
+    fn spawn(
+        workspace: &Path,
+        native_home: &Path,
+        key_env: &str,
+        extra: &[(&str, &str)],
+        stderr: Stdio,
+    ) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_acp-go-nanocodex-native"))
             .current_dir(workspace)
             .env("CODEX_HOME", native_home)
@@ -57,7 +67,7 @@ impl Helper {
             .envs(extra.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .kill_on_drop(true)
             .spawn()
             .expect("start helper");
@@ -137,6 +147,14 @@ enum Reply {
     Shell,
     Hang,
     Rejected,
+    HttpError {
+        status: StatusCode,
+        retry_after: &'static str,
+        error: Value,
+    },
+    HttpBody(Value),
+    NonSse(&'static str, &'static str),
+    RawSse(Bytes),
     ErrorEvent {
         code: String,
         nested: bool,
@@ -261,13 +279,42 @@ async fn respond(
     let Some(reply) = reply else {
         return (StatusCode::BAD_REQUEST, "unexpected model request").into_response();
     };
+    if let Reply::HttpError {
+        status,
+        retry_after,
+        error,
+    } = &reply
+    {
+        return (
+            *status,
+            [("retry-after", *retry_after)],
+            Json(json!({
+                "error": error
+            })),
+        )
+            .into_response();
+    }
+    if let Reply::NonSse(content_type, body) = &reply {
+        return ([("content-type", *content_type)], *body).into_response();
+    }
+    if let Reply::HttpBody(body) = &reply {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "0")],
+            Json(body.clone()),
+        )
+            .into_response();
+    }
+    if let Reply::RawSse(body) = &reply {
+        return ([("content-type", "text/event-stream")], body.clone()).into_response();
+    }
     if matches!(reply, Reply::Rejected) {
         return (StatusCode::BAD_REQUEST, Json(json!({
             "error": {"message":"provider body includes fixture-bearer-token", "type":"invalid_request_error"}
         }))).into_response();
     }
     if let Reply::ErrorEvent { code, nested } = &reply {
-        let error = json!({"type":"too_many_requests", "code":code, "message":"provider body includes fixture-bearer-token"});
+        let error = json!({"code":code, "message":"provider body includes fixture-bearer-token"});
         let event = if *nested {
             json!({"type":"response.failed", "response":{"error":error}})
         } else {
@@ -405,6 +452,10 @@ async fn respond(
             })),
         ],
         Reply::Rejected
+        | Reply::HttpError { .. }
+        | Reply::HttpBody(_)
+        | Reply::NonSse(_, _)
+        | Reply::RawSse(_)
         | Reply::ErrorEvent { .. }
         | Reply::Dropped
         | Reply::Oversized
@@ -901,7 +952,7 @@ async fn corrupt_rollout_is_rejected_without_replacing_the_session() {
 
 #[tokio::test]
 async fn incomplete_provider_stream_cannot_execute_an_uncommitted_tool_call() {
-    let provider = Provider::start([Reply::PartialShell]).await;
+    let provider = Provider::start((0..5).map(|_| Reply::PartialShell)).await;
     let workspace = TempDir::new().expect("workspace");
     let native_home = TempDir::new().expect("native home");
     let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENROUTER_API_KEY");
@@ -929,7 +980,7 @@ async fn incomplete_provider_stream_cannot_execute_an_uncommitted_tool_call() {
             .any(|event| event["data"]["type"] == "tool.call")
     );
     helper.shutdown(3).await;
-    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(provider.requests().len(), 5);
 }
 
 #[tokio::test]
@@ -1029,7 +1080,7 @@ async fn configured_native_models_outside_the_picker_can_complete_turns() {
 
 #[tokio::test]
 async fn dropped_gateway_connection_is_a_connection_error() {
-    let provider = Provider::start([Reply::Dropped]).await;
+    let provider = Provider::start((0..5).map(|_| Reply::Dropped)).await;
     let workspace = TempDir::new().unwrap();
     let native_home = TempDir::new().unwrap();
     let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
@@ -1052,11 +1103,16 @@ async fn dropped_gateway_connection_is_a_connection_error() {
 
 #[tokio::test]
 async fn oversized_gateway_event_fails_without_retaining_the_unbounded_stream() {
-    let provider = Provider::start([Reply::Oversized]).await;
+    let provider = Provider::start([
+        Reply::Oversized,
+        Reply::Text("usable after rejected event"),
+        Reply::Text("usable after restart"),
+    ])
+    .await;
     let workspace = TempDir::new().unwrap();
     let native_home = TempDir::new().unwrap();
     let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
-    helper
+    let initialized = helper
         .call(
             1,
             "initialize",
@@ -1067,7 +1123,16 @@ async fn oversized_gateway_event_fails_without_retaining_the_unbounded_stream() 
     let result = helper.reply(2).await;
     assert_eq!(result["error"]["code"], "transport_error");
     assert_eq!(result["error"]["message"], "invalid gateway event stream");
+    helper.call(3, "prompt", prompt("small valid prompt")).await;
+    helper.shutdown(4).await;
+    let mut config = initialize(&provider, "FIXTURE_API_KEY", "openai");
+    config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+    config["sessionId"] = initialized["nativeSessionId"].clone();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper.call(1, "initialize", config).await;
+    helper.call(2, "prompt", prompt("continue safely")).await;
     helper.shutdown(3).await;
+    assert_eq!(provider.requests().len(), 3);
 }
 
 #[tokio::test]
@@ -1157,7 +1222,12 @@ async fn provider_sse_errors_preserve_safe_codes_without_response_bodies_or_inve
             "provider response did not complete",
         ),
     ] {
-        let provider = Provider::start([Reply::ErrorEvent { code, nested }]).await;
+        let attempts = if code == "insufficient_quota" { 1 } else { 5 };
+        let provider = Provider::start((0..attempts).map(|_| Reply::ErrorEvent {
+            code: code.clone(),
+            nested,
+        }))
+        .await;
         let workspace = TempDir::new().unwrap();
         let native_home = TempDir::new().unwrap();
         let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
@@ -1215,4 +1285,814 @@ async fn restored_workspace_mismatch_is_distinct_from_startup_failure() {
     );
     helper.shutdown(2).await;
     assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn gateway_retries_transient_failures_without_replaying_tools_or_history() {
+    let provider = Provider::start([
+        Reply::HttpError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: "0",
+            error: json!({"code":"server_error", "message":"provider body includes fixture-bearer-token"}),
+        },
+        Reply::ErrorEvent {
+            code: "rate_limit_exceeded".to_owned(),
+            nested: false,
+        },
+        Reply::Dropped,
+        Reply::RawSse(Bytes::new()),
+        Reply::Shell,
+        Reply::Text("recovered once"),
+        Reply::Text("continued"),
+    ])
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    let result = helper
+        .call(2, "prompt", prompt("recover then write the file"))
+        .await;
+    assert_eq!(result["finalMessage"], "recovered once");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("provider-tool.txt")).unwrap(),
+        "fixture-file-value"
+    );
+    assert_eq!(
+        helper
+            .events
+            .iter()
+            .filter(|event| event["data"]["type"] == "tool.call")
+            .count(),
+        1
+    );
+    assert_eq!(
+        helper
+            .events
+            .iter()
+            .filter(|event| event["event"] == "assistant_delta")
+            .count(),
+        1
+    );
+    helper
+        .call(3, "prompt", prompt("continue after recovery"))
+        .await;
+    helper.shutdown(4).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 7);
+    for request in &requests[1..5] {
+        assert_eq!(
+            request.body, requests[0].body,
+            "retry changed the request history"
+        );
+    }
+    assert!(requests[5].body.to_string().contains("fixture-tool-output"));
+    let continued = requests[6].body.to_string();
+    assert_eq!(continued.matches("recover then write the file").count(), 1);
+    assert_eq!(continued.matches("recovered once").count(), 1);
+}
+
+#[tokio::test]
+async fn gateway_discards_uncommitted_tools_when_retrying_a_truncated_stream() {
+    let provider =
+        Provider::start([Reply::PartialShell, Reply::Text("recovered without tool")]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    let result = helper
+        .call(2, "prompt", prompt("retry incomplete tool response"))
+        .await;
+    assert_eq!(result["finalMessage"], "recovered without tool");
+    assert!(!workspace.path().join("must-not-run").exists());
+    assert!(
+        helper
+            .events
+            .iter()
+            .all(|event| event["data"]["type"] != "tool.call")
+    );
+    helper.shutdown(3).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+    assert!(!requests[1].body.to_string().contains("call_partial"));
+}
+
+#[tokio::test]
+async fn gateway_does_not_retry_after_publishing_assistant_or_reasoning_output() {
+    for event in [
+        json!({"type":"response.output_text.delta", "output_index":0, "delta":"partial text"}),
+        json!({"type":"response.reasoning_summary_text.delta", "output_index":0, "delta":"partial reasoning"}),
+        json!({"type":"response.output_item.done", "output_index":0, "item":{
+            "type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"partial message"}]
+        }}),
+    ] {
+        let provider =
+            Provider::start([Reply::RawSse(sse(event)), Reply::Text("must not replay")]).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        helper
+            .call(
+                1,
+                "initialize",
+                initialize(&provider, "FIXTURE_API_KEY", "openai"),
+            )
+            .await;
+        helper
+            .send(2, "prompt", prompt("stop after visible output"))
+            .await;
+        let result = helper.reply(2).await;
+        assert_eq!(result["error"]["code"], "connection_error");
+        assert_eq!(
+            helper
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event["event"].as_str(),
+                    Some("assistant_delta" | "reasoning_delta" | "assistant_message")
+                ))
+                .count(),
+            1
+        );
+        helper.shutdown(3).await;
+        assert_eq!(provider.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn gateway_rejects_permanent_errors_and_invalid_streams_without_retrying() {
+    for reply in [
+        Reply::Rejected,
+        Reply::HttpError {
+            status: StatusCode::UNAUTHORIZED,
+            retry_after: "0",
+            error: json!({"code":"invalid_api_key", "message":"provider body includes fixture-bearer-token"}),
+        },
+        Reply::HttpError {
+            status: StatusCode::FORBIDDEN,
+            retry_after: "0",
+            error: json!({"code":"unauthorized"}),
+        },
+        Reply::HttpError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: "0",
+            error: json!({"type":"insufficient_quota", "code":null}),
+        },
+        Reply::HttpError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: "0",
+            error: json!({"type":"authentication_error"}),
+        },
+        Reply::HttpError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: "0",
+            error: json!({"code":"insufficient_quota", "message":"provider body includes fixture-bearer-token"}),
+        },
+        Reply::HttpError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: "120",
+            error: json!({"code":"rate_limit_exceeded", "message":"provider body includes fixture-bearer-token"}),
+        },
+        Reply::RawSse(Bytes::from_static(b"data: {invalid json}\n\n")),
+        Reply::RawSse(sse(
+            json!({"type":"response.incomplete", "response":{"incomplete_details":{"reason":"max_output_tokens"}}}),
+        )),
+    ] {
+        let provider = Provider::start([reply, Reply::Text("must not retry")]).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        helper
+            .call(
+                1,
+                "initialize",
+                initialize(&provider, "FIXTURE_API_KEY", "openai"),
+            )
+            .await;
+        helper.send(2, "prompt", prompt("permanent error")).await;
+        let result = timeout(Duration::from_secs(2), helper.reply(2))
+            .await
+            .expect("permanent failure must be immediate");
+        assert!(result.get("error").is_some());
+        assert!(!result.to_string().contains("fixture-bearer-token"));
+        helper.shutdown(3).await;
+        assert_eq!(provider.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_retry_after_and_leaves_the_session_usable() {
+    let provider = Provider::start([
+        Reply::HttpError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: "10",
+            error: json!({"code":"rate_limit_exceeded", "message":"provider body includes fixture-bearer-token"}),
+        },
+        Reply::Text("continued after cancelled backoff"),
+    ])
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    helper.send(2, "prompt", prompt("retry rate limit")).await;
+    timeout(DEADLINE, async {
+        while provider.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    helper.send(3, "cancel", json!({})).await;
+    timeout(Duration::from_secs(2), async {
+        let mut replies = 0;
+        while replies < 2 {
+            let frame = helper.next().await;
+            if frame.get("event").is_some() {
+                continue;
+            }
+            assert!(frame.get("error").is_none());
+            match frame["id"].as_u64() {
+                Some(2) => assert_eq!(frame["result"]["stopReason"], "cancelled"),
+                Some(3) => assert_eq!(frame["result"]["cancelled"], true),
+                _ => panic!("unexpected cancellation reply: {frame}"),
+            }
+            replies += 1;
+        }
+    })
+    .await
+    .expect("retry sleep must be cancellable");
+    let result = helper.call(4, "prompt", prompt("continue now")).await;
+    assert_eq!(result["finalMessage"], "continued after cancelled backoff");
+    helper.shutdown(5).await;
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn gateway_retries_http_timeouts_conflicts_rate_limits_and_server_errors_with_a_limit() {
+    for status in [
+        StatusCode::REQUEST_TIMEOUT,
+        StatusCode::CONFLICT,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let provider = Provider::start((0..5).map(|_| Reply::HttpError {
+            status,
+            retry_after: "0",
+            error: json!({"code":"server_error", "message":"provider body includes fixture-bearer-token"}),
+        })).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        helper
+            .call(
+                1,
+                "initialize",
+                initialize(&provider, "FIXTURE_API_KEY", "openai"),
+            )
+            .await;
+        helper.send(2, "prompt", prompt("exhaust retries")).await;
+        let result = helper.reply(2).await;
+        assert_eq!(result["error"]["statusCode"], status.as_u16());
+        assert_eq!(result["error"]["providerCode"], "server_error");
+        assert!(!result.to_string().contains("fixture-bearer-token"));
+        helper.shutdown(3).await;
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.body == requests[0].body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_retries_transient_error_types_even_with_specific_provider_codes() {
+    for http in [false, true] {
+        let response = json!({"id":"failed-response", "status":"failed", "error":{
+            "type":"server_error", "code":"internal_error", "message":"fixture-bearer-token", "retry_after":0
+        }});
+        let failure = if http {
+            Reply::HttpBody(response)
+        } else {
+            Reply::RawSse(sse(json!({"type":"response.failed", "response":response})))
+        };
+        let provider =
+            Provider::start([failure, Reply::Text("recovered from provider error")]).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        helper
+            .call(
+                1,
+                "initialize",
+                initialize(&provider, "FIXTURE_API_KEY", "openai"),
+            )
+            .await;
+        let result = helper
+            .call(2, "prompt", prompt("recover transient provider category"))
+            .await;
+        assert_eq!(result["finalMessage"], "recovered from provider error");
+        assert!(
+            !serde_json::to_string(&helper.events)
+                .unwrap()
+                .contains("fixture-bearer-token")
+        );
+        helper.shutdown(3).await;
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, requests[1].body);
+    }
+}
+
+#[tokio::test]
+async fn gateway_permanent_error_categories_override_transient_codes_and_statuses() {
+    for event_type in ["http", "response.failed", "response.error", "error"] {
+        for response in [
+            json!({"error_type":"authentication", "error":{"code":"server_error"}}),
+            json!({"error_type":"payment_required", "error":{"code":"server_error"}}),
+            json!({"error_type":"invalid_request", "error":{"code":"server_error"}}),
+            json!({"error":{"type":"invalid_request", "code":"server_error"}}),
+            json!({"error":{"type":"server_error", "code":"insufficient_quota"}}),
+        ] {
+            let failure = match event_type {
+                "http" => Reply::HttpBody(response),
+                "response.failed" => {
+                    Reply::RawSse(sse(json!({"type":event_type, "response":response})))
+                }
+                _ => {
+                    let mut event = response;
+                    event["type"] = json!(event_type);
+                    Reply::RawSse(sse(event))
+                }
+            };
+            let provider = Provider::start([failure, Reply::Text("must not retry")]).await;
+            let workspace = TempDir::new().unwrap();
+            let native_home = TempDir::new().unwrap();
+            let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+            helper
+                .call(
+                    1,
+                    "initialize",
+                    initialize(&provider, "FIXTURE_API_KEY", "openai"),
+                )
+                .await;
+            helper
+                .send(2, "prompt", prompt("fail permanent provider category"))
+                .await;
+            let result = helper.reply(2).await;
+            assert_eq!(result["error"]["code"], "native_error");
+            helper.shutdown(3).await;
+            assert_eq!(provider.requests().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_sse_success_is_never_retried() {
+    for (mime, body, code) in [
+        (
+            "application/json",
+            r#"{"id":"billed-generation","status":"completed","output":[]}"#,
+            "transport_error",
+        ),
+        ("text/html", "<html>proxy page</html>", "transport_error"),
+        (
+            "application/json",
+            r#"{"error":{"code":"invalid_api_key","message":"fixture-bearer-token"}}"#,
+            "native_error",
+        ),
+    ] {
+        let provider = Provider::start([Reply::NonSse(mime, body)]).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        helper
+            .call(
+                1,
+                "initialize",
+                initialize(&provider, "FIXTURE_API_KEY", "openai"),
+            )
+            .await;
+        helper.send(2, "prompt", prompt("one request only")).await;
+        let failed = helper.reply(2).await;
+        assert_eq!(failed["error"]["code"], code);
+        assert!(!failed.to_string().contains("fixture-bearer-token"));
+        helper.shutdown(3).await;
+        assert_eq!(provider.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn oversized_prompt_leaves_native_history_usable() {
+    let provider = Provider::start([Reply::Text("accepted after oversize")]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    let initialized = helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    helper
+        .send(2, "prompt", prompt(&"x".repeat(12 * 1024 * 1024)))
+        .await;
+    assert_eq!(helper.reply(2).await["error"]["code"], "invalid_request");
+    assert!(provider.requests().is_empty());
+    helper.call(3, "prompt", prompt("accepted input")).await;
+    helper.shutdown(4).await;
+    let rollout = std::fs::read_to_string(initialized["rolloutPath"].as_str().unwrap()).unwrap();
+    assert!(rollout.len() < 100_000);
+    assert!(rollout.contains("accepted after oversize"));
+}
+
+fn created_then(events: impl IntoIterator<Item = Value>) -> Reply {
+    let mut body = sse(
+        json!({"type":"response.created", "response":{"id":"resp_failed", "status":"in_progress"}}),
+    )
+    .to_vec();
+    for event in events {
+        body.extend_from_slice(&sse(event));
+    }
+    Reply::RawSse(Bytes::from(body))
+}
+
+fn response_failed(error: Value) -> Value {
+    json!({"type":"response.failed", "response":{
+        "id":"resp_failed", "status":"failed", "error":error, "incomplete_details":null
+    }})
+}
+
+async fn prompt_against(replies: Vec<Reply>) -> (Value, Vec<Value>, Vec<ObservedRequest>) {
+    let provider = Provider::start(replies).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    helper
+        .send(2, "prompt", prompt("survive a failed provider event"))
+        .await;
+    let reply = helper.reply(2).await;
+    let events = std::mem::take(&mut helper.events);
+    helper.shutdown(3).await;
+    (reply, events, provider.requests())
+}
+
+#[tokio::test]
+async fn gateway_retries_codeless_failure_events_before_output() {
+    for (name, failure) in [
+        (
+            "response.failed without code",
+            response_failed(json!({"message":"provider body includes fixture-bearer-token"})),
+        ),
+        (
+            "response.failed with null code",
+            response_failed(
+                json!({"code":null, "message":"provider body includes fixture-bearer-token"}),
+            ),
+        ),
+        (
+            "response.failed with null error",
+            response_failed(Value::Null),
+        ),
+        (
+            "error event without code",
+            json!({"type":"error", "message":"provider body includes fixture-bearer-token"}),
+        ),
+        (
+            "response.incomplete without reason",
+            json!({"type":"response.incomplete", "response":{"id":"resp_failed", "status":"incomplete", "incomplete_details":null}}),
+        ),
+    ] {
+        let (reply, events, requests) = prompt_against(vec![
+            created_then([failure]),
+            Reply::Text("recovered after codeless failure"),
+        ])
+        .await;
+        assert!(
+            reply.get("error").is_none(),
+            "{name} was not retried: {reply}"
+        );
+        assert_eq!(
+            reply["result"]["finalMessage"], "recovered after codeless failure",
+            "{name}"
+        );
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("fixture-bearer-token")
+        );
+        assert_eq!(requests.len(), 2, "{name}");
+        assert_eq!(requests[0].body, requests[1].body, "{name} changed history");
+    }
+}
+
+#[tokio::test]
+async fn gateway_retries_unrecognised_failure_codes_before_output() {
+    for (name, failure) in [
+        (
+            "unknown response.error.code",
+            response_failed(json!({"code":"server_error_xyz", "message":"fixture-bearer-token"})),
+        ),
+        (
+            "numeric response.error.code",
+            response_failed(json!({"code":502, "message":"fixture-bearer-token"})),
+        ),
+        (
+            "numeric rate-limit status string",
+            json!({"type":"error", "error":{"code":"429", "message":"fixture-bearer-token"}}),
+        ),
+        (
+            "unknown response.error.type",
+            response_failed(json!({"type":"api_error", "message":"fixture-bearer-token"})),
+        ),
+        (
+            "unknown top-level error code",
+            json!({"type":"error", "code":"ERR_SOMETHING", "message":"fixture-bearer-token", "param":null}),
+        ),
+        (
+            "unknown nested error type",
+            json!({"type":"error", "error":{"type":"upstream_error", "message":"fixture-bearer-token"}}),
+        ),
+        (
+            "unknown incomplete reason",
+            json!({"type":"response.incomplete", "response":{"id":"resp_failed", "status":"incomplete", "incomplete_details":{"reason":"upstream_timeout"}}}),
+        ),
+    ] {
+        let (reply, _, requests) = prompt_against(vec![
+            created_then([failure]),
+            Reply::Text("recovered after unknown failure"),
+        ])
+        .await;
+        assert!(
+            reply.get("error").is_none(),
+            "{name} was not retried: {reply}"
+        );
+        assert_eq!(requests.len(), 2, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn gateway_keeps_authorization_quota_and_request_failure_events_terminal() {
+    for (failure, provider_code) in [
+        (
+            response_failed(json!({"code":"invalid_api_key", "message":"fixture-bearer-token"})),
+            "invalid_api_key",
+        ),
+        (
+            response_failed(json!({"code":"insufficient_quota", "message":"fixture-bearer-token"})),
+            "insufficient_quota",
+        ),
+        (
+            response_failed(json!({"type":"invalid_request_error", "code":null})),
+            "invalid_request_error",
+        ),
+        (
+            response_failed(json!({"code":401, "message":"fixture-bearer-token"})),
+            "401",
+        ),
+        (
+            json!({"type":"error", "error":{"code":"403", "message":"fixture-bearer-token"}}),
+            "403",
+        ),
+        (
+            json!({"type":"error", "error":{"type":"authentication_error", "message":"fixture-bearer-token"}}),
+            "authentication_error",
+        ),
+        (
+            json!({"type":"response.incomplete", "response":{"id":"resp_failed", "status":"incomplete", "incomplete_details":{"reason":"max_output_tokens"}}}),
+            "max_output_tokens",
+        ),
+        (
+            json!({"type":"response.incomplete", "response":{"id":"resp_failed", "status":"incomplete", "incomplete_details":{"reason":"content_filter"}}}),
+            "content_filter",
+        ),
+    ] {
+        let (reply, _, requests) = prompt_against(vec![
+            created_then([failure.clone()]),
+            Reply::Text("must not retry"),
+        ])
+        .await;
+        assert_eq!(reply["error"]["code"], "native_error", "{failure}");
+        assert_eq!(
+            reply["error"]["providerCode"].as_str(),
+            Some(provider_code),
+            "{failure}"
+        );
+        assert!(!reply.to_string().contains("fixture-bearer-token"));
+        assert_eq!(requests.len(), 1, "terminal failure retried: {failure}");
+    }
+}
+
+#[tokio::test]
+async fn gateway_never_retries_failure_events_after_visible_output() {
+    for failure in [
+        response_failed(json!({"message":"fixture-bearer-token"})),
+        response_failed(json!({"code":"server_error_xyz"})),
+        response_failed(json!({"code":"server_error"})),
+        json!({"type":"error", "code":"rate_limit_exceeded", "message":"fixture-bearer-token"}),
+    ] {
+        let (reply, events, requests) = prompt_against(vec![
+            created_then([
+                json!({"type":"response.output_text.delta", "output_index":0, "delta":"partial text"}),
+                failure.clone(),
+            ]),
+            Reply::Text("must not replay"),
+        ])
+        .await;
+        assert_eq!(reply["error"]["code"], "native_error", "{failure}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "assistant_delta")
+                .count(),
+            1
+        );
+        assert_eq!(requests.len(), 1, "retried after output: {failure}");
+    }
+}
+
+#[tokio::test]
+async fn failure_event_provider_code_carries_unrecognised_codes_and_types() {
+    for (failure, provider_code) in [
+        (
+            response_failed(json!({"code":"server_error_xyz", "message":"fixture-bearer-token"})),
+            "server_error_xyz",
+        ),
+        (
+            response_failed(json!({"type":"api_error", "message":"fixture-bearer-token"})),
+            "api_error",
+        ),
+        (
+            response_failed(json!({"code":502, "message":"fixture-bearer-token"})),
+            "502",
+        ),
+        (
+            json!({"type":"error", "error":{"type":"overloaded_error", "message":"fixture-bearer-token"}}),
+            "overloaded_error",
+        ),
+        (
+            json!({"type":"response.incomplete", "response":{"id":"resp_failed", "status":"incomplete", "incomplete_details":{"reason":"max_output_tokens"}}}),
+            "max_output_tokens",
+        ),
+    ] {
+        let (reply, _, _) =
+            prompt_against((0..5).map(|_| created_then([failure.clone()])).collect()).await;
+        assert_eq!(reply["error"]["code"], "native_error", "{failure}");
+        assert_eq!(
+            reply["error"]["providerCode"].as_str(),
+            Some(provider_code),
+            "missing providerCode for {failure}: {reply}"
+        );
+        assert!(!reply.to_string().contains("fixture-bearer-token"));
+    }
+}
+
+#[tokio::test]
+async fn gateway_retries_streams_that_end_after_created_without_a_terminal_event() {
+    let (reply, _, requests) = prompt_against(vec![
+        created_then([]),
+        Reply::Text("recovered after truncated stream"),
+    ])
+    .await;
+    assert_eq!(
+        reply["result"]["finalMessage"],
+        "recovered after truncated stream"
+    );
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn exhausted_failure_event_retries_report_the_last_provider_code() {
+    let (reply, _, requests) = prompt_against(
+        [
+            "upstream_a",
+            "upstream_b",
+            "upstream_c",
+            "upstream_d",
+            "upstream_last",
+        ]
+        .into_iter()
+        .map(|code| {
+            created_then([response_failed(
+                json!({"code":code, "message":"fixture-bearer-token"}),
+            )])
+        })
+        .chain([Reply::Text("beyond the attempt limit")])
+        .collect(),
+    )
+    .await;
+    assert_eq!(requests.len(), 5);
+    assert_eq!(reply["error"]["code"], "native_error");
+    assert_eq!(reply["error"]["providerCode"], "upstream_last");
+    assert_eq!(
+        reply["error"]["message"],
+        "provider response did not complete"
+    );
+    assert!(reply["error"].get("statusCode").is_none());
+    assert!(!reply.to_string().contains("fixture-bearer-token"));
+}
+
+#[tokio::test]
+async fn canonical_error_type_decides_retry_and_is_reported() {
+    let response = json!({"error_type":"payment_required", "error":{"code":"server_error", "message":"fixture-bearer-token"}});
+    let mut event = response.clone();
+    event["type"] = json!("error");
+    for failure in [
+        Reply::HttpBody(response.clone()),
+        created_then([json!({"type":"response.failed", "response":response.clone()})]),
+        created_then([event]),
+    ] {
+        let (reply, _, requests) =
+            prompt_against(vec![failure, Reply::Text("must not retry")]).await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "canonical terminal type retried: {reply}"
+        );
+        assert_eq!(reply["error"]["code"], "native_error");
+        assert_eq!(reply["error"]["providerCode"], "payment_required");
+        assert!(!reply.to_string().contains("fixture-bearer-token"));
+    }
+}
+
+#[tokio::test]
+async fn exhausted_http_retries_report_the_status_on_each_stderr_line() {
+    let provider = Provider::start((0..5).map(|_| Reply::HttpError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        retry_after: "0",
+        error: json!({"code":"server_error", "message":"provider body includes fixture-bearer-token"}),
+    }))
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let log = workspace.path().join("helper-stderr.log");
+    let mut helper = Helper::spawn(
+        workspace.path(),
+        native_home.path(),
+        "FIXTURE_API_KEY",
+        &[],
+        Stdio::from(std::fs::File::create(&log).unwrap()),
+    );
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    helper
+        .send(2, "prompt", prompt("exhaust service retries"))
+        .await;
+    let reply = helper.reply(2).await;
+    helper.shutdown(3).await;
+    assert_eq!(reply["error"]["statusCode"], 503);
+    assert_eq!(provider.requests().len(), 5);
+    let stderr = std::fs::read_to_string(&log).unwrap();
+    let lines = stderr
+        .lines()
+        .filter(|line| line.starts_with("gateway attempt"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 5, "{stderr}");
+    for (index, line) in lines.iter().enumerate() {
+        assert!(
+            line.starts_with(&format!(
+                "gateway attempt {}/5 failed status=503 providerCode=server_error; ",
+                index + 1
+            )),
+            "{line}"
+        );
+    }
+    assert!(lines[0].contains("; retrying in "));
+    assert!(lines[4].ends_with("; not retrying: attempt limit reached"));
+    assert!(!stderr.contains("fixture-bearer-token"));
 }

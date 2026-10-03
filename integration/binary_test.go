@@ -496,3 +496,61 @@ func TestSmokeChatGPTEndpointRefusalLogsConfigurationReason(t *testing.T) {
 	require.NotContains(t, logs.String(), "at-fixture-token")
 	require.NotContains(t, logs.String(), endpoint)
 }
+
+func TestSmokeCheckpointStoreRestoreAndCompactedReplay(t *testing.T) {
+	requireIntegration(t)
+	provider := newProviderWithResponseMode(t, false, "compaction")
+	store := acpcore.NewInMemorySessionStore()
+	home, workspace := t.TempDir(), t.TempDir()
+	first := startEmbedded(t, home, store)
+	initializeACP(t, first)
+	options := nanocodexacp.NewNanocodexOptions(nanocodexacp.WithNanocodexAPIBaseURL(provider.server.URL + "/v1"))
+	created := first.call(t, "session/new", wire.NewSessionRequest(workspace, nanocodexacp.WithSessionNanocodexOptions(options)))
+	id := sessionID(t, created)
+	first.call(t, "session/prompt", wire.TextPromptRequest(id, "first user input"))
+	first.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	first.stop()
+	var config map[string]any
+	rows, found, err := sessionlog.Load(t.Context(), store, string(id), &config)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotNil(t, config["checkpoint"])
+	for _, row := range rows {
+		require.NotContains(t, string(row), "acp_checkpoint")
+	}
+	require.NoError(t, os.RemoveAll(home))
+	restored := startEmbedded(t, home, store)
+	initializeACP(t, restored)
+	restored.call(t, "session/load", wire.LoadSessionRequest(id, workspace))
+	require.Equal(t, "answer-1", restored.text(t))
+	restored.notices = nil
+	restored.call(t, "session/prompt", wire.TextPromptRequest(id, "second user input"))
+	require.Equal(t, "answer-3", restored.text(t))
+	for _, notice := range restored.notices {
+		if notice["method"] != "session/update" {
+			continue
+		}
+		var notification acp.SessionNotification
+		require.NoError(t, json.Unmarshal(mustJSON(t, notice["params"]), &notification))
+		if usage := notification.Update.UsageUpdate; usage != nil {
+			require.Equal(t, 15, usage.Used, "compaction must not restate old context usage")
+		}
+	}
+	requests := provider.history(t)
+	require.Len(t, requests, 3)
+	require.Equal(t, "none", requests[1]["tool_choice"])
+	require.NotContains(t, string(mustJSON(t, requests[1])), "compaction_trigger")
+	compacted := string(mustJSON(t, requests[2]))
+	require.Contains(t, compacted, "fixture-summary")
+	require.NotContains(t, compacted, `"type":"compaction"`)
+	restored.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	restored.notices = nil
+	restored.call(t, "session/load", wire.LoadSessionRequest(id, workspace))
+	require.Equal(t, "answer-1answer-3", restored.text(t))
+	replay := string(mustJSON(t, restored.notices))
+	require.Contains(t, replay, "first user input")
+	require.Contains(t, replay, "second user input")
+	require.NotContains(t, replay, "fixture-summary")
+	restored.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	restored.stop()
+}

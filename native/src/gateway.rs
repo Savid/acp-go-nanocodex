@@ -1,4 +1,7 @@
-use crate::session::SessionError;
+use crate::{
+    retry::{Failure, Retry},
+    session::SessionError,
+};
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use nanocodex::oai::{
@@ -6,8 +9,8 @@ use nanocodex::oai::{
     auth::OpenAiAuth,
     responses::{CompletedResponse, ResponseItem},
     tower::{
-        CodeCall, CodeCallKind, GenerationOutput, ResponsePipelineStats, ResponsesAttempt,
-        ResponsesAttemptKind, ResponsesOutput, ResponsesServiceResponse,
+        CodeCall, CodeCallKind, CompactionOutput, GenerationOutput, ResponsePipelineStats,
+        ResponsesAttempt, ResponsesAttemptKind, ResponsesOutput, ResponsesServiceResponse,
     },
 };
 use serde_json::{Value, json};
@@ -116,7 +119,7 @@ where
     fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
         if let Some(route) = self.route.clone() {
             let history = self.history.clone();
-            Box::pin(async move { route.generate(request, history).await })
+            Box::pin(async move { route.execute(request, history).await })
         } else {
             let future = self.inner.call(request);
             Box::pin(async move { future.await.map_err(Into::into) })
@@ -128,8 +131,99 @@ fn failure(message: &'static str) -> ResponseError {
     ResponseError::service(SessionError::new("transport_error", message))
 }
 
-fn connection_failure(message: &'static str) -> ResponseError {
-    ResponseError::service(SessionError::connection(message))
+/// Prefixes the summary text stored in a local `compaction` item. Provider
+/// ciphertext never starts with it, so only local summaries are translated.
+const SUMMARY_MARKER: &str = "acp-go-nanocodex:summary:v1\n";
+
+const SUMMARY_INSTRUCTION: &str = "Context checkpoint. The conversation above will be replaced by \
+your summary, and another instance of you will continue the task from it without the earlier \
+turns. Do not call tools. Reply with plain text only, using these sections:
+
+## Goal
+The user's objective, constraints, and stated preferences.
+
+## Progress
+Work completed, decisions made, and why.
+
+## State
+Files created or modified (exact paths), commands whose results matter, the current working \
+state, and unresolved errors.
+
+## Next
+The immediate next step and the remaining work.
+
+Preserve exact identifiers, paths, commands, and values. Be concise and stay under 2,000 words.";
+
+const SUMMARY_PREFIX: &str = "The earlier part of this conversation was compacted to save \
+context. The summary below records it. Treat it as background, not as a new request.
+
+<summary>
+";
+
+const SUMMARY_SUFFIX: &str = "\n</summary>";
+
+/// Bounds a runaway summary, including its reasoning. Gateways keep the cached
+/// prefix with this limit set.
+const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
+/// Bounds how many oldest turns an overflowing summary request drops.
+const MAX_SUMMARY_TRIMS: u32 = 3;
+
+/// Prefixes of the context messages that native history carries as user
+/// messages. Any other user message is input that starts a turn.
+const CONTEXT_PREFIXES: [&str; 4] = [
+    "<environment_context>",
+    "# AGENTS.md instructions",
+    "<turn_aborted>",
+    SUMMARY_PREFIX,
+];
+
+const SUMMARY_TOOL: &str = "gateway compaction summary requested a tool";
+const SUMMARY_EMPTY: &str = "gateway compaction summary was empty";
+const SUMMARY_TRUNCATED: &str = "gateway compaction summary was truncated";
+
+/// A summary reply that cannot become compacted context is a provider failure.
+fn summary_failure(message: &'static str) -> ResponseError {
+    ResponseError::service(SessionError::new("native_error", message))
+}
+
+fn user_text(text: &str) -> Value {
+    json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]})
+}
+
+fn user_input(item: &Value) -> bool {
+    item["type"] == "message"
+        && item["role"] == "user"
+        && !item["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part["text"].as_str())
+            .any(|text| {
+                CONTEXT_PREFIXES
+                    .iter()
+                    .any(|prefix| text.trim_start().starts_with(prefix))
+            })
+}
+
+/// Drops the oldest turn, from one user input up to the next, from a summary
+/// request. Developer and context messages, the latest turn, and the trailing
+/// instruction stay; dropping whole turns keeps tool calls with their outputs.
+fn drop_oldest_turn(input: &mut Vec<Value>) -> bool {
+    let history = input.len().saturating_sub(1);
+    let mut turns = (0..history).filter(|&index| user_input(&input[index]));
+    let (Some(first), Some(next)) = (turns.next(), turns.next()) else {
+        return false;
+    };
+    let mut index = 0;
+    input.retain(|item| {
+        let context = item["type"] == "message"
+            && (item["role"] == "developer" || (item["role"] == "user" && !user_input(item)));
+        let keep = !(first..next).contains(&index) || context;
+        index += 1;
+        keep
+    });
+    true
 }
 
 fn output_index(event: &Value) -> Result<usize, ResponseError> {
@@ -162,7 +256,25 @@ fn public_input(request: &ResponsesAttempt) -> Result<(Vec<Value>, Vec<Value>), 
                 );
             }
             Some("configuration_update") => {}
-            Some("message" | "reasoning" | "function_call" | "function_call_output") => {
+            Some("compaction")
+                if item["encrypted_content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with(SUMMARY_MARKER)) =>
+            {
+                let summary =
+                    &item["encrypted_content"].as_str().unwrap_or_default()[SUMMARY_MARKER.len()..];
+                input.push(user_text(&format!(
+                    "{SUMMARY_PREFIX}{summary}{SUMMARY_SUFFIX}"
+                )));
+            }
+            Some(
+                "message"
+                | "reasoning"
+                | "function_call"
+                | "function_call_output"
+                | "compaction"
+                | "compaction_trigger",
+            ) => {
                 if let Some(item) = item.as_object_mut() {
                     for private in [
                         "internal_chat_message_metadata_passthrough",
@@ -202,19 +314,18 @@ impl GatewayRoute {
             .map_err(|_| failure("provider event consumer closed"))
     }
 
-    async fn generate(
+    async fn execute(
         &self,
         request: ResponsesAttempt,
         history: Arc<tokio::sync::Mutex<GatewayHistory>>,
     ) -> Result<ResponsesServiceResponse, ResponseError> {
-        if !matches!(request.kind(), ResponsesAttemptKind::Generation) {
-            return Err(failure(
-                "gateway does not support native compaction or warmup",
-            ));
+        let kind = request.kind();
+        if matches!(kind, ResponsesAttemptKind::Warmup) {
+            return Err(failure("gateway does not support native warmup"));
         }
         let model_call_index = request
             .model_call_index()
-            .ok_or_else(|| failure("gateway generation requires a model call index"))?;
+            .ok_or_else(|| failure("gateway request requires a model call index"))?;
         let started = Instant::now();
         let (mut input, mut tools) = public_input(&request)?;
         let mut history = history.lock().await;
@@ -229,15 +340,80 @@ impl GatewayRoute {
             input = full;
             tools = history.tools.clone();
         }
+        // Gateways cannot create provider compaction items. A compaction attempt asks for a
+        // plain-text summary over the same prefix so the provider cache still applies.
+        let compacting = matches!(kind, ResponsesAttemptKind::Compaction);
+        if compacting {
+            match input.last_mut() {
+                Some(item) if item["type"] == "compaction_trigger" => {
+                    *item = user_text(SUMMARY_INSTRUCTION);
+                }
+                _ => return Err(failure("gateway compaction requires a trailing trigger")),
+            }
+        }
+        if input
+            .iter()
+            .any(|item| item["type"] == "compaction_trigger")
+        {
+            return Err(failure(
+                "native history contains an unsupported gateway item",
+            ));
+        }
         let model = match self.config.model_id_prefix.as_deref() {
             Some(prefix) => format!("{prefix}/{}", request.model().as_str()),
             None => request.model().as_str().to_owned(),
         };
-        let body = json!({
+        let mut body = json!({
             "model":model, "input":input, "tools":tools, "stream":true, "store":false,
             "reasoning":{"effort":request.thinking().as_str()},
-            "include":["reasoning.encrypted_content"], "tool_choice":"auto", "parallel_tool_calls":false,
+            "include":["reasoning.encrypted_content"],
+            "tool_choice":if compacting { "none" } else { "auto" }, "parallel_tool_calls":false,
         });
+        if compacting {
+            body["max_output_tokens"] = json!(SUMMARY_MAX_OUTPUT_TOKENS);
+        }
+        let mut retry = Retry::new();
+        let mut trims = 0;
+        loop {
+            let mut emitted_output = false;
+            match self
+                .stream_attempt(&body, kind, model_call_index, started, &mut emitted_output)
+                .await
+            {
+                Ok((output, committed_output)) => {
+                    if let ResponsesOutput::Generation(generation) = &output {
+                        history.input = input;
+                        history.input.extend(committed_output);
+                        history.tools = tools;
+                        history.response_id = Some(generation.id.clone());
+                    } else {
+                        // Native compaction installs retained context and forces a full replay.
+                        *history = GatewayHistory::default();
+                    }
+                    return Ok(ResponsesServiceResponse::new(output));
+                }
+                Err(error) => {
+                    // Only the summary request shrinks; native history keeps every turn.
+                    if compacting
+                        && trims < MAX_SUMMARY_TRIMS
+                        && error.error.is_context_window_exceeded()
+                        && body["input"].as_array_mut().is_some_and(drop_oldest_turn)
+                    {
+                        trims += 1;
+                        eprintln!(
+                            "gateway compaction summary exceeded the context window; retrying without the oldest turn ({trims}/{MAX_SUMMARY_TRIMS})"
+                        );
+                        continue;
+                    }
+                    if !retry.wait(&error, emitted_output).await {
+                        return Err(error.error);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn response(&self, body: &Value) -> Result<reqwest::Response, Failure> {
         let auth = self
             .config
             .auth
@@ -252,19 +428,40 @@ impl GatewayRoute {
             ))
             .bearer_auth(auth.bearer())
             .header("accept", "text/event-stream")
-            .json(&body);
+            .json(body);
         if sends_session_header(&self.config.base_url) {
             request = request.header("x-opencode-session", &self.config.session_id);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| connection_failure("gateway connection failed"))?;
+        let response = request.send().await.map_err(Failure::request)?;
         if !response.status().is_success() {
-            return Err(ResponseError::service(SessionError::http(
-                response.status().as_u16(),
-            )));
+            return Err(Failure::http(response).await);
         }
+        if !response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+            })
+        {
+            return Err(Failure::non_sse(response).await);
+        }
+        Ok(response)
+    }
+
+    async fn stream_attempt(
+        &self,
+        body: &Value,
+        kind: ResponsesAttemptKind,
+        model_call_index: u32,
+        started: Instant,
+        emitted_output: &mut bool,
+    ) -> Result<(ResponsesOutput, Vec<Value>), Failure> {
+        let compacting = matches!(kind, ResponsesAttemptKind::Compaction);
+        let response = self.response(body).await?;
         let chunks = futures_util::stream::try_unfold(
             (Box::pin(response.bytes_stream()), StreamBound::default()),
             |(mut input, mut bound)| async move {
@@ -306,9 +503,9 @@ impl GatewayRoute {
                         std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::UnexpectedEof
                     ) =>
                 {
-                    connection_failure("gateway connection ended before completion")
+                    Failure::connection("gateway connection ended before completion")
                 }
-                _ => failure("invalid gateway event stream"),
+                _ => failure("invalid gateway event stream").into(),
             })?;
             if frame.data == "[DONE]" {
                 break;
@@ -316,13 +513,16 @@ impl GatewayRoute {
             first_event.get_or_insert_with(|| elapsed(started));
             pipeline.event_count += 1;
             pipeline.event_bytes += frame.data.len() as u64;
+            if pipeline.event_bytes > MAX_RESPONSE_BYTES as u64 {
+                return Err(failure("gateway response exceeds 4 MiB").into());
+            }
             let event: Value = serde_json::from_str(&frame.data)
                 .map_err(|_| failure("invalid gateway event JSON"))?;
             if let Some(id) = event["response"]["id"].as_str().filter(|id| !id.is_empty()) {
                 response_id = Some(id.to_owned());
             }
             match event["type"].as_str() {
-                Some("response.output_text.delta") => {
+                Some("response.output_text.delta") if !compacting => {
                     first_output.get_or_insert_with(|| elapsed(started));
                     let text = event["delta"]
                         .as_str()
@@ -334,10 +534,11 @@ impl GatewayRoute {
                         response_id.as_deref(),
                     )
                     .await?;
+                    *emitted_output = true;
                 }
                 Some(
                     "response.reasoning_summary_text.delta" | "response.reasoning_summary.delta",
-                ) => {
+                ) if !compacting => {
                     first_output.get_or_insert_with(|| elapsed(started));
                     let text = event["delta"]
                         .as_str()
@@ -349,17 +550,22 @@ impl GatewayRoute {
                         response_id.as_deref(),
                     )
                     .await?;
+                    *emitted_output = true;
                 }
                 Some("response.output_item.done") => {
                     let index = output_index(&event)?;
                     let item = event["item"].clone();
-                    self.emit_message(
-                        &item,
-                        &mut emitted_messages,
-                        &item_key(model_call_index, index),
-                        response_id.as_deref(),
-                    )
-                    .await?;
+                    first_output.get_or_insert_with(|| elapsed(started));
+                    if !compacting {
+                        *emitted_output |= self
+                            .emit_message(
+                                &item,
+                                &mut emitted_messages,
+                                &item_key(model_call_index, index),
+                                response_id.as_deref(),
+                            )
+                            .await?;
+                    }
                     done_items.insert(index, item);
                 }
                 Some("response.completed") => {
@@ -368,27 +574,41 @@ impl GatewayRoute {
                         if done_items.keys().copied().ne(0..done_items.len()) {
                             return Err(failure(
                                 "gateway completion has incomplete output indexes",
-                            ));
+                            )
+                            .into());
                         }
                         response["output"] = json!(done_items.into_values().collect::<Vec<_>>());
                     }
-                    if let Some(items) = response["output"].as_array() {
+                    if !compacting && let Some(items) = response["output"].as_array() {
                         for (index, item) in items.iter().enumerate() {
-                            self.emit_message(
-                                item,
-                                &mut emitted_messages,
-                                &item_key(model_call_index, index),
-                                response_id.as_deref(),
-                            )
-                            .await?;
+                            *emitted_output |= self
+                                .emit_message(
+                                    item,
+                                    &mut emitted_messages,
+                                    &item_key(model_call_index, index),
+                                    response_id.as_deref(),
+                                )
+                                .await?;
                         }
                     }
                     let committed_output =
                         response["output"].as_array().cloned().unwrap_or_default();
                     let response: CompletedResponse = serde_json::from_value(response)
                         .map_err(|_| failure("invalid gateway completion"))?;
-                    if response.status != "completed" {
-                        return Err(failure("gateway response did not complete"));
+                    if compacting && response.status == "incomplete" {
+                        return Err(summary_failure(SUMMARY_TRUNCATED).into());
+                    }
+                    if response.status != "completed" || response.id.trim().is_empty() {
+                        return Err(failure("gateway response did not complete").into());
+                    }
+                    if compacting {
+                        let output = summary_output(
+                            response,
+                            first_event.unwrap_or_default(),
+                            first_output.or_else(|| Some(elapsed(started))),
+                            pipeline,
+                        )?;
+                        return Ok((ResponsesOutput::Compaction(output), Vec::new()));
                     }
                     let output = generation_output(
                         response,
@@ -396,21 +616,20 @@ impl GatewayRoute {
                         first_output,
                         pipeline,
                     )?;
-                    history.input = input;
-                    history.input.extend(committed_output);
-                    history.tools = tools;
-                    history.response_id = Some(output.id.clone());
-                    return Ok(ResponsesServiceResponse::new(ResponsesOutput::Generation(
-                        output,
-                    )));
+                    return Ok((ResponsesOutput::Generation(output), committed_output));
                 }
-                Some("response.failed" | "response.incomplete" | "error") => {
-                    return Err(ResponseError::service(SessionError::provider_event(&event)));
+                Some("response.incomplete") if compacting => {
+                    return Err(summary_failure(SUMMARY_TRUNCATED).into());
+                }
+                Some("response.failed" | "response.incomplete" | "response.error" | "error") => {
+                    return Err(Failure::event(&event));
                 }
                 _ => {}
             }
         }
-        Err(connection_failure("gateway stream ended before completion"))
+        Err(Failure::connection(
+            "gateway stream ended before completion",
+        ))
     }
 
     async fn emit_message(
@@ -419,12 +638,12 @@ impl GatewayRoute {
         emitted: &mut HashSet<String>,
         item_key: &str,
         response_id: Option<&str>,
-    ) -> Result<(), ResponseError> {
+    ) -> Result<bool, ResponseError> {
         if item["type"] != "message" || item["role"] != "assistant" {
-            return Ok(());
+            return Ok(false);
         }
         if !emitted.insert(item_key.to_owned()) {
-            return Ok(());
+            return Ok(false);
         }
         let text = item["content"]
             .as_array()
@@ -434,7 +653,8 @@ impl GatewayRoute {
             .filter_map(|part| part["text"].as_str())
             .collect::<String>();
         self.emit("assistant_message", &text, item_key, response_id)
-            .await
+            .await?;
+        Ok(true)
     }
 }
 
@@ -498,11 +718,59 @@ fn generation_output(
     })
 }
 
+fn summary_output(
+    response: CompletedResponse,
+    first_event: u64,
+    first_output: Option<u64>,
+    pipeline: ResponsePipelineStats,
+) -> Result<CompactionOutput, ResponseError> {
+    let mut messages = Vec::new();
+    for item in &response.output {
+        let item = serde_json::to_value(item).map_err(|_| failure("invalid gateway completion"))?;
+        match item["type"].as_str() {
+            Some("message") if item["role"] == "assistant" => {
+                let text = item["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| part["type"] == "output_text")
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<String>();
+                if !text.trim().is_empty() {
+                    messages.push(text.trim().to_owned());
+                }
+            }
+            Some("message" | "reasoning") => {}
+            Some(kind) if kind.ends_with("_call") => return Err(summary_failure(SUMMARY_TOOL)),
+            _ => return Err(failure("gateway returned an unsupported output item")),
+        }
+    }
+    if messages.is_empty() {
+        return Err(summary_failure(SUMMARY_EMPTY));
+    }
+    let summary = messages.join("\n\n");
+    let item = serde_json::from_value(json!({
+        "type":"compaction", "id":response.id, "encrypted_content":format!("{SUMMARY_MARKER}{summary}"),
+    }))
+    .map_err(|_| failure("invalid gateway compaction item"))?;
+    Ok(CompactionOutput {
+        id: response.id,
+        status: response.status,
+        item,
+        usage: response.usage,
+        time_to_first_event_ns: first_event,
+        time_to_first_output_ns: first_output,
+        pipeline_stats: pipeline,
+    })
+}
+
 fn sends_session_header(base_url: &str) -> bool {
     url::Url::parse(base_url).is_ok_and(|url| {
         url.host_str() == Some("opencode.ai") && url.path().trim_end_matches('/') == "/zen/go/v1"
     })
 }
+
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Default)]
 struct StreamBound {
@@ -521,8 +789,8 @@ impl StreamBound {
                 continue;
             }
             self.event_bytes += 1;
-            if self.event_bytes > crate::MAX_FRAME_BYTES {
-                return Err(std::io::Error::other("gateway event exceeds 32 MiB"));
+            if self.event_bytes > MAX_RESPONSE_BYTES {
+                return Err(std::io::Error::other("gateway event exceeds 4 MiB"));
             }
             self.previous_cr = byte == b'\r';
             if byte == b'\r' || byte == b'\n' {

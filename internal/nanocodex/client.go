@@ -17,6 +17,9 @@ import (
 // MaxFrameBytes bounds a single helper protocol frame, excluding its newline.
 const MaxFrameBytes = 32 << 20
 
+// MaxPromptBytes leaves room for native event and persistence envelopes.
+const MaxPromptBytes = 12 << 20
+
 // InvalidConfig identifies a refused initialization option.
 const InvalidConfig = "invalid_config"
 

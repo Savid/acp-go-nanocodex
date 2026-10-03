@@ -13,10 +13,15 @@ Requests have `id` (positive integer), `method`, and optional `params` (object,
 default `{}`). Replies have the same `id` and either `result` or
 `error: {code, message, field?, statusCode?, providerCode?}`. `field` identifies
 an invalid initialization option; `statusCode` preserves a provider HTTP rejection code.
-`providerCode` preserves an error-event code containing at most 128 ASCII
-letters, digits, dots, underscores, or hyphens. Known rate-limit, quota,
-authorization, model, context-window, and service errors receive specific
-safe messages. An SSE error over HTTP 200 does not invent an HTTP status.
+`providerCode` preserves the provider's classification. Its candidates, in
+order, are the canonical `error_type` on the response or event, the error
+object's `code` (a string, or an integer in decimal), the error object's `type`,
+and `incomplete_details.reason`; a candidate longer than 128 bytes or containing
+anything other than ASCII letters, digits, dots, underscores, or hyphens is
+dropped. The first terminal candidate is reported, else the first candidate, so
+the code matches the retry decision. Known rate-limit, quota, authorization, model, context-window, and service
+errors receive specific safe messages; other codes keep the generic message.
+An SSE error over HTTP 200 does not invent an HTTP status.
 IDs must not be reused during a process lifetime. Error messages are fixed
 summaries; provider response bodies and credentials are never returned as errors.
 
@@ -50,7 +55,55 @@ operations use native direct tools. Unsupported custom tools are excluded.
 Gateway requests omit `prompt_cache_key` and carry the adapter's `User-Agent`.
 Only requests to `https://opencode.ai/zen/go/v1` carry the native conversation ID as
 `x-opencode-session`, including after a helper restart. Each SSE event is
-limited to 32 MiB before parsing; incomplete events never reach native tools.
+limited to 4 MiB before parsing; accumulated event data for one response also
+has a 4 MiB bound. Successful HTTP responses require `text/event-stream`.
+Non-SSE success responses fail without retrying. Incomplete events never reach
+native tools.
+
+Gateway compaction uses the native automatic threshold and builds a local
+summary; gateway requests never carry `compaction_trigger`. The summary request
+repeats the generation request body and history with `tool_choice:"none"` and
+`max_output_tokens:16384`, and replaces the trigger with a user message asking
+for a plain-text checkpoint under Goal, Progress, State, and Next headings.
+Reasoning output is ignored; the trimmed assistant message text is the summary.
+The helper returns it to the native agent as a `compaction` item whose
+`encrypted_content` is `acp-go-nanocodex:summary:v1` and a newline followed by
+the summary, so the native rollout persists and replaces it like provider
+compaction. Gateway requests send each marked item as a user message: a fixed
+preface saying the earlier conversation was compacted and is background, not a
+new request, then the summary inside `<summary>` tags. Unmarked `compaction`
+items pass through unchanged. A summary reply that calls a tool, has no text,
+or is incomplete fails without retrying as `native_error` with the message
+`gateway compaction summary requested a tool`,
+`gateway compaction summary was empty`, or
+`gateway compaction summary was truncated`. Compaction produces native
+lifecycle events without assistant or reasoning presentation events. A summary
+request that fails with a `context_length_exceeded` or `context_window_exceeded`
+`providerCode` is sent again without its oldest turn, at most three times. A
+turn runs from one user input to the next; developer and context messages, the
+latest turn, and the trailing instruction stay, and native history is unchanged.
+Failed or cancelled compaction leaves committed history intact. Routes without a gateway
+keep native remote compaction and send `compaction` items unchanged, including
+marked ones.
+
+Gateway generation and compaction retry connection failures, HTTP 408, 409,
+429, and 5xx responses without `x-should-retry: false`, and `response.failed`
+and error events up to five total attempts; generation also retries
+`response.incomplete`. A failure retries unless its `providerCode` is terminal,
+so a missing or unrecognized code retries. A three-digit code is an HTTP status
+under the same status rule. Other terminal codes cover authorization, quota and
+billing, model access, invalid requests, context windows, image input, and
+content policy, plus the `max_output_tokens` and `content_filter` incomplete
+reasons. Malformed provider data fails immediately. Backoff is exponential with
+random jitter. Valid `Retry-After` delays and event `retry_after` values up to
+60 seconds are honored, as are `retry-after-ms` values. Backoff remains the
+minimum delay, including for zero server delays. Overflowing decimal values and
+delays over 60 seconds end the operation without retrying early. Each failed
+attempt writes one redacted stderr line with its attempt number, HTTP status or
+event type, `providerCode`, and whether it retries or why it stops.
+Generation never retries after delivering assistant or reasoning output. A retry
+cannot execute tools from an incomplete response. Cancellation interrupts both
+requests and retry delays.
 
 ## Methods
 
@@ -103,14 +156,20 @@ limited to 32 MiB before parsing; incomplete events never reach native tools.
   `{stopReason:"end_turn"|"cancelled", finalMessage, usage?, nativeSessionId,
   rolloutPath, committedBytes}`. Usage has `inputTokens`, `cachedInputTokens`,
   `outputTokens`, `reasoningOutputTokens`, and `totalTokens`. A failed turn
-  returns an error after flushing its native state.
+  returns an error after flushing its native state. A turn that fails with a
+  native `ContextWindowExceeded` source or a `context_length_exceeded` or
+  `context_window_exceeded` `providerCode` marks the session, and the next
+  prompt runs native compaction before `accepted`. A failed compaction returns
+  its error, does not submit the input, and keeps the mark.
 - `cancel`: `{}`. Cancels the active turn and waits for native cancellation
   cleanup. Returns `{cancelled:boolean}`. It remains usable while a prompt RPC
   is open. Cancelling while idle is a successful no-op.
 - `state`: `{}`. Flushes state while idle and returns the same session fields
   as initialization. A host can mirror only bytes below `committedBytes`.
 - `shutdown`: `{}`. Cancels an active turn, flushes and shuts down the agent,
-  then replies `{}` and exits. End of input also shuts down the agent.
+  saves an optional snapshot checkpoint if a prompt ran, then replies `{}`
+  and exits. End of input performs the same shutdown. A caller can mirror the
+  complete stopped file.
 
 Requests that fail envelope decoding return `invalid_request` with a null ID.
 Decoded envelopes with zero or reused IDs or nonobject params return
@@ -126,9 +185,30 @@ Authentication, configuration, and process-start failures remain distinct.
 
 The Go adapter holds an advisory lock per native UUID from before hydration
 until the helper exits and is reaped. Empty-session replacement also locks
-the candidate UUID. The helper is private to that adapter and requires its
-caller to own these locks. Unrelated native consumers must avoid writing
-the same rollout concurrently. Native rollout files and complete records
-are preserved, including a valid final JSON record without a newline.
+the candidate UUID. The helper holds `<uuid>.writer.lock` under
+`CODEX_HOME/nanocodex/acp-locks/` for every initialized and resumed UUID until
+shutdown. Hydration and stopped snapshots acquire that writer lock before
+accessing native files. Unrelated native consumers must honor writer exclusion.
+Native rollout files and complete records are preserved, including a valid final JSON record without a newline.
 Hydration may remove an invalid, unterminated trailing fragment after the
 helper exits.
+
+The helper atomically replaces `<rollout>.acp-checkpoint.json` after a prompted
+helper shuts down its native writer. This optional file retains the native
+snapshot head and request prefix, including context token accounting, without
+duplicating history. It carries `compact_next:true` while the compaction mark
+is set. Go mirrors the latest file in `config.checkpoint`, alongside
+the native rows in the same store generation. Its byte boundary, history length,
+identity, version, and supported prefix shape must match restoration. Missing,
+stale, unreadable, or undecodable checkpoints fall back to native history and
+produce a redacted stderr diagnostic when present but unusable. Failed checkpoint
+writes also produce a diagnostic without failing shutdown. Observations preserve
+the checkpoint; header-only sessions have none. The file is limited to 1 MiB.
+
+Prompt parameters are limited to 12 MiB of encoded JSON before native admission.
+Native rollout rows, including complete compacted histories, have no protocol
+frame-size bound. The 32 MiB bound applies to helper transport frames and invalid
+unterminated recovery tails.
+
+Gateway context-overflow and invalid-image failures carry sanitized native
+`ResponsesError` sources for native repair.
