@@ -1,4 +1,6 @@
+mod checkpoint;
 mod gateway;
+mod retry;
 mod session;
 
 use futures_util::StreamExt;
@@ -181,11 +183,7 @@ impl Server {
             self.finish(result).await?;
         }
         let result = if let Some(session) = &self.session {
-            session
-                .agent
-                .shutdown()
-                .await
-                .map_err(|_| SessionError::persistence())
+            session.shutdown().await
         } else {
             Ok(())
         };

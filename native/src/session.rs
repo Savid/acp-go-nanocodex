@@ -1,4 +1,7 @@
-use crate::gateway::{GatewayConfig, GatewayEvent, GatewayLayer};
+use crate::{
+    checkpoint,
+    gateway::{GatewayConfig, GatewayEvent, GatewayLayer},
+};
 use nanocodex::{
     AgentEvents, Model, Nanocodex, NanocodexError, OpenAi, Thinking, Turn,
     agent::rollout::RolloutConfig,
@@ -224,6 +227,7 @@ pub struct Session {
     thinking: Thinking,
     text_events: bool,
     replaced_native_session_id: Option<String>,
+    prompted: bool,
 }
 
 fn context_window(model: Model) -> u64 {
@@ -512,7 +516,10 @@ impl Session {
             .codex_home(&home)
             .tools(tools);
         if let Some(resume) = resume {
+            let path = resume.rollout_path().to_owned();
             let (_, snapshot, rollout) = resume.into_parts();
+            let snapshot = checkpoint::restore(&path, snapshot)
+                .map_err(|_| SessionError::restore("native checkpoint could not be restored"))?;
             builder = builder.resume(snapshot).rollout(rollout);
         } else {
             builder = builder.rollout(RolloutConfig::new(&home));
@@ -530,6 +537,7 @@ impl Session {
             thinking,
             text_events,
             replaced_native_session_id,
+            prompted: false,
         })
     }
 
@@ -580,6 +588,7 @@ impl Session {
             .prompt(prompt)
             .await
             .map_err(SessionError::native)?;
+        self.prompted = true;
         Ok(turn)
     }
 
@@ -589,5 +598,29 @@ impl Session {
             .await
             .map_err(|_| SessionError::persistence())?;
         Ok(self.state())
+    }
+
+    pub async fn shutdown(&self) -> Result<(), SessionError> {
+        let snapshot = if self.prompted {
+            Some(self.agent.snapshot().await)
+        } else {
+            None
+        };
+        self.agent
+            .shutdown()
+            .await
+            .map_err(|_| SessionError::persistence())?;
+        match snapshot {
+            Some(Ok(snapshot)) => checkpoint::append(
+                self.agent
+                    .rollout()
+                    .expect("rollout recording enabled")
+                    .path(),
+                snapshot,
+            )
+            .map_err(|_| SessionError::persistence()),
+            None | Some(Err(NanocodexError::ForkBeforeCompletedTurn)) => Ok(()),
+            Some(Err(_)) => Err(SessionError::persistence()),
+        }
     }
 }

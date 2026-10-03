@@ -18,6 +18,7 @@ uuid = "1"
 reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls-no-provider"] }
 tower = { version = "0.5", features = ["util"] }
 eventsource-stream = "0.2"
+httpdate = "1"
 
 [dev-dependencies]
 axum = "0.8"

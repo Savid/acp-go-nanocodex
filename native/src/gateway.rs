@@ -1,4 +1,7 @@
-use crate::session::SessionError;
+use crate::{
+    retry::{Failure, Retry},
+    session::SessionError,
+};
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use nanocodex::oai::{
@@ -6,8 +9,8 @@ use nanocodex::oai::{
     auth::OpenAiAuth,
     responses::{CompletedResponse, ResponseItem},
     tower::{
-        CodeCall, CodeCallKind, GenerationOutput, ResponsePipelineStats, ResponsesAttempt,
-        ResponsesAttemptKind, ResponsesOutput, ResponsesServiceResponse,
+        CodeCall, CodeCallKind, CompactionOutput, GenerationOutput, ResponsePipelineStats,
+        ResponsesAttempt, ResponsesAttemptKind, ResponsesOutput, ResponsesServiceResponse,
     },
 };
 use serde_json::{Value, json};
@@ -116,7 +119,7 @@ where
     fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
         if let Some(route) = self.route.clone() {
             let history = self.history.clone();
-            Box::pin(async move { route.generate(request, history).await })
+            Box::pin(async move { route.execute(request, history).await })
         } else {
             let future = self.inner.call(request);
             Box::pin(async move { future.await.map_err(Into::into) })
@@ -126,10 +129,6 @@ where
 
 fn failure(message: &'static str) -> ResponseError {
     ResponseError::service(SessionError::new("transport_error", message))
-}
-
-fn connection_failure(message: &'static str) -> ResponseError {
-    ResponseError::service(SessionError::connection(message))
 }
 
 fn output_index(event: &Value) -> Result<usize, ResponseError> {
@@ -162,7 +161,14 @@ fn public_input(request: &ResponsesAttempt) -> Result<(Vec<Value>, Vec<Value>), 
                 );
             }
             Some("configuration_update") => {}
-            Some("message" | "reasoning" | "function_call" | "function_call_output") => {
+            Some(
+                "message"
+                | "reasoning"
+                | "function_call"
+                | "function_call_output"
+                | "compaction"
+                | "compaction_trigger",
+            ) => {
                 if let Some(item) = item.as_object_mut() {
                     for private in [
                         "internal_chat_message_metadata_passthrough",
@@ -202,19 +208,18 @@ impl GatewayRoute {
             .map_err(|_| failure("provider event consumer closed"))
     }
 
-    async fn generate(
+    async fn execute(
         &self,
         request: ResponsesAttempt,
         history: Arc<tokio::sync::Mutex<GatewayHistory>>,
     ) -> Result<ResponsesServiceResponse, ResponseError> {
-        if !matches!(request.kind(), ResponsesAttemptKind::Generation) {
-            return Err(failure(
-                "gateway does not support native compaction or warmup",
-            ));
+        let kind = request.kind();
+        if matches!(kind, ResponsesAttemptKind::Warmup) {
+            return Err(failure("gateway does not support native warmup"));
         }
         let model_call_index = request
             .model_call_index()
-            .ok_or_else(|| failure("gateway generation requires a model call index"))?;
+            .ok_or_else(|| failure("gateway request requires a model call index"))?;
         let started = Instant::now();
         let (mut input, mut tools) = public_input(&request)?;
         let mut history = history.lock().await;
@@ -238,6 +243,35 @@ impl GatewayRoute {
             "reasoning":{"effort":request.thinking().as_str()},
             "include":["reasoning.encrypted_content"], "tool_choice":"auto", "parallel_tool_calls":false,
         });
+        let mut retry = Retry::new(&self.config.session_id, Some(model_call_index));
+        loop {
+            let mut emitted_output = false;
+            match self
+                .stream_attempt(&body, kind, model_call_index, started, &mut emitted_output)
+                .await
+            {
+                Ok((output, committed_output)) => {
+                    if let ResponsesOutput::Generation(generation) = &output {
+                        history.input = input;
+                        history.input.extend(committed_output);
+                        history.tools = tools;
+                        history.response_id = Some(generation.id.clone());
+                    } else {
+                        // Native compaction installs retained context and forces a full replay.
+                        *history = GatewayHistory::default();
+                    }
+                    return Ok(ResponsesServiceResponse::new(output));
+                }
+                Err(error) => {
+                    if emitted_output || !retry.wait(&error).await {
+                        return Err(error.error);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn response(&self, body: &Value) -> Result<reqwest::Response, Failure> {
         let auth = self
             .config
             .auth
@@ -252,19 +286,27 @@ impl GatewayRoute {
             ))
             .bearer_auth(auth.bearer())
             .header("accept", "text/event-stream")
-            .json(&body);
+            .json(body);
         if sends_session_header(&self.config.base_url) {
             request = request.header("x-opencode-session", &self.config.session_id);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| connection_failure("gateway connection failed"))?;
+        let response = request.send().await.map_err(Failure::request)?;
         if !response.status().is_success() {
-            return Err(ResponseError::service(SessionError::http(
-                response.status().as_u16(),
-            )));
+            return Err(Failure::http(response).await);
         }
+        Ok(response)
+    }
+
+    async fn stream_attempt(
+        &self,
+        body: &Value,
+        kind: ResponsesAttemptKind,
+        model_call_index: u32,
+        started: Instant,
+        emitted_output: &mut bool,
+    ) -> Result<(ResponsesOutput, Vec<Value>), Failure> {
+        let compacting = matches!(kind, ResponsesAttemptKind::Compaction);
+        let response = self.response(body).await?;
         let chunks = futures_util::stream::try_unfold(
             (Box::pin(response.bytes_stream()), StreamBound::default()),
             |(mut input, mut bound)| async move {
@@ -293,6 +335,7 @@ impl GatewayRoute {
         );
         let mut stream = Box::pin(chunks.eventsource());
         let mut done_items = BTreeMap::new();
+        let mut streamed_compaction = None;
         let mut emitted_messages = HashSet::new();
         let mut response_id = None;
         let mut first_event = None;
@@ -306,9 +349,9 @@ impl GatewayRoute {
                         std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::UnexpectedEof
                     ) =>
                 {
-                    connection_failure("gateway connection ended before completion")
+                    Failure::connection("gateway connection ended before completion")
                 }
-                _ => failure("invalid gateway event stream"),
+                _ => failure("invalid gateway event stream").into(),
             })?;
             if frame.data == "[DONE]" {
                 break;
@@ -322,7 +365,7 @@ impl GatewayRoute {
                 response_id = Some(id.to_owned());
             }
             match event["type"].as_str() {
-                Some("response.output_text.delta") => {
+                Some("response.output_text.delta") if !compacting => {
                     first_output.get_or_insert_with(|| elapsed(started));
                     let text = event["delta"]
                         .as_str()
@@ -334,10 +377,11 @@ impl GatewayRoute {
                         response_id.as_deref(),
                     )
                     .await?;
+                    *emitted_output = true;
                 }
                 Some(
                     "response.reasoning_summary_text.delta" | "response.reasoning_summary.delta",
-                ) => {
+                ) if !compacting => {
                     first_output.get_or_insert_with(|| elapsed(started));
                     let text = event["delta"]
                         .as_str()
@@ -349,17 +393,37 @@ impl GatewayRoute {
                         response_id.as_deref(),
                     )
                     .await?;
+                    *emitted_output = true;
                 }
                 Some("response.output_item.done") => {
                     let index = output_index(&event)?;
                     let item = event["item"].clone();
-                    self.emit_message(
-                        &item,
-                        &mut emitted_messages,
-                        &item_key(model_call_index, index),
-                        response_id.as_deref(),
-                    )
-                    .await?;
+                    if compacting {
+                        if done_items.contains_key(&index) {
+                            return Err(
+                                failure("gateway compaction repeated an output index").into()
+                            );
+                        }
+                        if item["type"] == "compaction"
+                            && streamed_compaction.replace(item.clone()).is_some()
+                        {
+                            return Err(failure(
+                                "gateway compaction returned multiple compaction items",
+                            )
+                            .into());
+                        }
+                    }
+                    first_output.get_or_insert_with(|| elapsed(started));
+                    if !compacting {
+                        *emitted_output |= self
+                            .emit_message(
+                                &item,
+                                &mut emitted_messages,
+                                &item_key(model_call_index, index),
+                                response_id.as_deref(),
+                            )
+                            .await?;
+                    }
                     done_items.insert(index, item);
                 }
                 Some("response.completed") => {
@@ -368,27 +432,39 @@ impl GatewayRoute {
                         if done_items.keys().copied().ne(0..done_items.len()) {
                             return Err(failure(
                                 "gateway completion has incomplete output indexes",
-                            ));
+                            )
+                            .into());
                         }
                         response["output"] = json!(done_items.into_values().collect::<Vec<_>>());
                     }
-                    if let Some(items) = response["output"].as_array() {
+                    if !compacting && let Some(items) = response["output"].as_array() {
                         for (index, item) in items.iter().enumerate() {
-                            self.emit_message(
-                                item,
-                                &mut emitted_messages,
-                                &item_key(model_call_index, index),
-                                response_id.as_deref(),
-                            )
-                            .await?;
+                            *emitted_output |= self
+                                .emit_message(
+                                    item,
+                                    &mut emitted_messages,
+                                    &item_key(model_call_index, index),
+                                    response_id.as_deref(),
+                                )
+                                .await?;
                         }
                     }
                     let committed_output =
                         response["output"].as_array().cloned().unwrap_or_default();
                     let response: CompletedResponse = serde_json::from_value(response)
                         .map_err(|_| failure("invalid gateway completion"))?;
-                    if response.status != "completed" {
-                        return Err(failure("gateway response did not complete"));
+                    if response.status != "completed" || response.id.trim().is_empty() {
+                        return Err(failure("gateway response did not complete").into());
+                    }
+                    if compacting {
+                        let output = compaction_output(
+                            response,
+                            streamed_compaction,
+                            first_event.unwrap_or_default(),
+                            first_output.or_else(|| Some(elapsed(started))),
+                            pipeline,
+                        )?;
+                        return Ok((ResponsesOutput::Compaction(output), Vec::new()));
                     }
                     let output = generation_output(
                         response,
@@ -396,21 +472,17 @@ impl GatewayRoute {
                         first_output,
                         pipeline,
                     )?;
-                    history.input = input;
-                    history.input.extend(committed_output);
-                    history.tools = tools;
-                    history.response_id = Some(output.id.clone());
-                    return Ok(ResponsesServiceResponse::new(ResponsesOutput::Generation(
-                        output,
-                    )));
+                    return Ok((ResponsesOutput::Generation(output), committed_output));
                 }
-                Some("response.failed" | "response.incomplete" | "error") => {
-                    return Err(ResponseError::service(SessionError::provider_event(&event)));
+                Some("response.failed" | "response.incomplete" | "response.error" | "error") => {
+                    return Err(Failure::event(&event));
                 }
                 _ => {}
             }
         }
-        Err(connection_failure("gateway stream ended before completion"))
+        Err(Failure::connection(
+            "gateway stream ended before completion",
+        ))
     }
 
     async fn emit_message(
@@ -419,12 +491,12 @@ impl GatewayRoute {
         emitted: &mut HashSet<String>,
         item_key: &str,
         response_id: Option<&str>,
-    ) -> Result<(), ResponseError> {
+    ) -> Result<bool, ResponseError> {
         if item["type"] != "message" || item["role"] != "assistant" {
-            return Ok(());
+            return Ok(false);
         }
         if !emitted.insert(item_key.to_owned()) {
-            return Ok(());
+            return Ok(false);
         }
         let text = item["content"]
             .as_array()
@@ -434,7 +506,8 @@ impl GatewayRoute {
             .filter_map(|part| part["text"].as_str())
             .collect::<String>();
         self.emit("assistant_message", &text, item_key, response_id)
-            .await
+            .await?;
+        Ok(true)
     }
 }
 
@@ -491,6 +564,60 @@ fn generation_output(
         final_message: (!final_message.is_empty()).then_some(final_message),
         output_items: response.output,
         code_calls: calls,
+        usage: response.usage,
+        time_to_first_event_ns: first_event,
+        time_to_first_output_ns: first_output,
+        pipeline_stats: pipeline,
+    })
+}
+
+fn compaction_output(
+    mut response: CompletedResponse,
+    streamed: Option<Value>,
+    first_event: u64,
+    first_output: Option<u64>,
+    pipeline: ResponsePipelineStats,
+) -> Result<CompactionOutput, ResponseError> {
+    response
+        .output
+        .retain(|item| matches!(item, ResponseItem::Compaction { .. }));
+    if !matches!(response.output.as_slice(), [ResponseItem::Compaction { encrypted_content, .. }] if !encrypted_content.trim().is_empty())
+    {
+        return Err(failure(
+            "gateway compaction requires one encrypted compaction item",
+        ));
+    }
+    if let Some(streamed) = streamed {
+        let streamed: ResponseItem = serde_json::from_value(streamed)
+            .map_err(|_| failure("invalid gateway compaction item"))?;
+        match (&streamed, &response.output[0]) {
+            (
+                ResponseItem::Compaction {
+                    id: streamed_id,
+                    encrypted_content: streamed_content,
+                    ..
+                },
+                ResponseItem::Compaction {
+                    id,
+                    encrypted_content,
+                    ..
+                },
+            ) if streamed_content == encrypted_content
+                && streamed_id
+                    .as_ref()
+                    .zip(id.as_ref())
+                    .is_none_or(|(left, right)| left == right) => {}
+            _ => {
+                return Err(failure(
+                    "gateway compaction completion conflicts with streamed output",
+                ));
+            }
+        }
+    }
+    Ok(CompactionOutput {
+        id: response.id,
+        status: response.status,
+        item: response.output.pop().expect("validated compaction item"),
         usage: response.usage,
         time_to_first_event_ns: first_event,
         time_to_first_output_ns: first_output,

@@ -171,6 +171,12 @@ rollout path, working directory, provider/model settings, accepted environment,
 title, and timestamp. `github.com/savid/acp-go-core` supplies the store types
 and atomic mirror operations.
 
+After a prompt, the helper stops the native writer and appends an available
+snapshot checkpoint to the rollout. It retains token accounting and the request
+prefix so the next helper can compact before its first model call. Conversation
+history remains in its native records. Restore uses a checkpoint only at the
+matching final file boundary; later native records supersede it.
+
 The store is authoritative even when the default in-memory store is used.
 An adapter never adopts a native-only session that lacks a store entry.
 `session/load` restores state and replays messages, visible reasoning summaries,
@@ -219,9 +225,19 @@ failures may carry one of these `class` values:
 
 Configured API-key HTTPS gateways expose native function tools, including
 shell execution and file operations through the shell. Code Mode and freeform
-patch tools are excluded on those routes. Gateway remote compaction and
-automatic retries are unavailable; a failed operation preserves its committed
-history. Native default and WebSocket routes retain upstream transport behavior.
+patch tools are excluded on those routes. Automatic compaction uses the native
+model's context threshold and sends a terminal `compaction_trigger` through
+`/responses`; the provider must support that item and return an encrypted
+compaction item. The native rollout saves the compacted context for subsequent
+prompts and restoration. Failed or cancelled compaction preserves committed
+history.
+
+Gateway requests retry transient connection failures, rate limits, and service
+errors up to five total attempts with exponential backoff and jitter. Retries
+stop after assistant or reasoning output is delivered. Valid `Retry-After`
+delays up to 60 seconds are respected; longer delays fail without retrying
+early. Cancellation interrupts requests and retry delays. Native default and
+WebSocket routes retain upstream transport behavior.
 Shell sessions and other in-memory tool state last for one prompt; subsequent
 prompts resume the saved conversation in a new helper.
 Image tool outputs are not projected as ACP images.

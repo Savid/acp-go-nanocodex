@@ -52,6 +52,22 @@ Only requests to `https://opencode.ai/zen/go/v1` carry the native conversation I
 `x-opencode-session`, including after a helper restart. Each SSE event is
 limited to 32 MiB before parsing; incomplete events never reach native tools.
 
+Gateway compaction uses the native automatic threshold and sends a final
+`compaction_trigger` input item through `/responses`. Successful completion
+requires one encrypted `compaction` output item. Compaction produces native
+lifecycle events without assistant or reasoning presentation events, and the
+native rollout persists the resulting context. Failed or cancelled compaction
+leaves committed history intact.
+
+Gateway generation and compaction retry transient connection failures, HTTP
+408/409/429/5xx responses, and transient provider error events up to five total
+attempts. Backoff is exponential with jitter. Valid `Retry-After` delays up to
+60 seconds are honored; longer delays end the operation without retrying early.
+Authorization, quota, invalid input, and malformed provider data fail immediately.
+Generation never retries after delivering assistant or reasoning output. A retry
+cannot execute tools from an incomplete response. Cancellation interrupts both
+requests and retry delays.
+
 ## Methods
 
 - `initialize`: `{sessionId, model?, thinking?, apiBaseUrl?, websocketUrl?, modelIdPrefix?,
@@ -110,7 +126,9 @@ limited to 32 MiB before parsing; incomplete events never reach native tools.
 - `state`: `{}`. Flushes state while idle and returns the same session fields
   as initialization. A host can mirror only bytes below `committedBytes`.
 - `shutdown`: `{}`. Cancels an active turn, flushes and shuts down the agent,
-  then replies `{}` and exits. End of input also shuts down the agent.
+  appends an available snapshot checkpoint if a prompt ran, then replies `{}`
+  and exits. End of input performs the same shutdown. A caller can mirror the
+  complete stopped file.
 
 Requests that fail envelope decoding return `invalid_request` with a null ID.
 Decoded envelopes with zero or reused IDs or nonobject params return
@@ -132,3 +150,10 @@ the same rollout concurrently. Native rollout files and complete records
 are preserved, including a valid final JSON record without a newline.
 Hydration may remove an invalid, unterminated trailing fragment after the
 helper exits.
+
+The helper's `acp_checkpoint` rollout row retains the native snapshot head and
+request prefix, including context token accounting, without duplicating history.
+It is appended and synced only after the native writer has stopped. Its recorded
+byte boundary, history length, and native identity must match restoration; later
+native records supersede it. Restoring an unchanged session does not append
+another checkpoint. Header-only sessions have no checkpoint.
