@@ -1232,3 +1232,161 @@ async fn codeless_failed_summary_event_is_retried_before_history_changes() {
     assert_eq!(requests[1], requests[2], "summary retry changed history");
     assert_compacted_request(&requests[3], SUMMARY);
 }
+
+fn checkpoint(rollout: &Path) -> Value {
+    serde_json::from_slice(
+        &std::fs::read(format!("{}.acp-checkpoint.json", rollout.display())).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn context_overflow_compacts_before_the_next_prompt_after_restore() {
+    for (code, overflow) in [
+        ("context_length_exceeded", true),
+        ("context_window_exceeded", true),
+        ("invalid_prompt", false),
+    ] {
+        let mut replies = vec![
+            Reply::Text("old assistant details", 15),
+            Reply::FailedEvent(json!({"code":code})),
+        ];
+        if overflow {
+            replies.push(Reply::Summary {
+                text: SUMMARY,
+                streamed: false,
+            });
+        }
+        replies.extend([
+            Reply::Text("continued after failure", 15),
+            Reply::Text("continued after restart", 15),
+        ]);
+        let provider = Provider::start(replies).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path());
+        let mut config = config(&provider);
+        let initialized = helper.call(1, "initialize", config.clone()).await;
+        helper
+            .call(2, "prompt", prompt("retain original user input"))
+            .await;
+        helper.send(3, "prompt", prompt("failing input")).await;
+        let failed = helper.reply(3).await;
+        assert_eq!(failed["error"]["providerCode"], code, "{failed}");
+        helper.shutdown(4).await;
+        let rollout = Path::new(initialized["rolloutPath"].as_str().unwrap());
+        assert_eq!(checkpoint(rollout).get("compact_next").is_some(), overflow);
+
+        config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+        for (input, reply) in [
+            ("continue after failure", "continued after failure"),
+            ("continue after restart", "continued after restart"),
+        ] {
+            restore_into_empty_home(native_home.path(), &saved_session(rollout));
+            let mut helper = Helper::start(workspace.path(), native_home.path());
+            helper.call(1, "initialize", config.clone()).await;
+            let completed = helper.call(2, "prompt", prompt(input)).await;
+            assert_eq!(completed["finalMessage"], reply);
+            helper.shutdown(3).await;
+            assert!(checkpoint(rollout).get("compact_next").is_none());
+        }
+
+        let requests = provider.requests();
+        let generations = requests
+            .iter()
+            .filter(|request| request["tool_choice"] == "auto")
+            .collect::<Vec<_>>();
+        assert_eq!(generations.len(), 4, "{code}");
+        assert_eq!(requests.len(), 4 + usize::from(overflow), "{code}");
+        if overflow {
+            assert_summary_request(&requests[2], &requests[1]);
+            assert!(requests[2].to_string().contains("failing input"));
+            assert_compacted_request(&requests[3], SUMMARY);
+            assert_compacted_request(&requests[4], SUMMARY);
+        }
+    }
+}
+
+fn user_inputs(request: &Value) -> Vec<String> {
+    message_texts(request, "user")
+        .into_iter()
+        .filter(|text| text.ends_with(" input"))
+        .collect()
+}
+
+#[tokio::test]
+async fn overflowing_summary_request_drops_the_oldest_turns() {
+    const INPUTS: [&str; 5] = [
+        "first input",
+        "second input",
+        "third input",
+        "fourth input",
+        "fifth input",
+    ];
+    for overflows in [1, 4] {
+        let mut replies = vec![
+            Reply::Text("first answer", 15),
+            Reply::Text("second answer", 15),
+            Reply::Text("third answer", 15),
+            Reply::Text("fourth answer", 15),
+            Reply::Text("fifth answer", HIGH_USAGE),
+        ];
+        for _ in 0..overflows {
+            replies.push(Reply::FailedEvent(
+                json!({"code":"context_length_exceeded"}),
+            ));
+        }
+        replies.extend([
+            Reply::Summary {
+                text: SUMMARY,
+                streamed: false,
+            },
+            Reply::Text("continued after trimmed summary", 15),
+        ]);
+        let provider = Provider::start(replies).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path());
+        helper.call(1, "initialize", config(&provider)).await;
+        for (id, input) in (2..).zip(INPUTS) {
+            helper.call(id, "prompt", prompt(input)).await;
+        }
+        helper.send(7, "prompt", prompt("sixth input")).await;
+        let reply = helper.reply(7).await;
+        helper.shutdown(8).await;
+
+        let requests = provider.requests();
+        let attempts = (overflows + 1).min(4);
+        for (trimmed, request) in requests[5..5 + attempts].iter().enumerate() {
+            assert_eq!(request["tool_choice"], "none");
+            assert_eq!(user_inputs(request), INPUTS[trimmed..]);
+            assert_eq!(request.to_string().contains("first answer"), trimmed == 0);
+            assert_eq!(
+                input_items(request, "message")
+                    .iter()
+                    .filter(|item| item["role"] == "developer")
+                    .count(),
+                2
+            );
+            let last = request["input"].as_array().unwrap().last().unwrap();
+            assert!(last.to_string().contains(SUMMARY_INSTRUCTION));
+        }
+        if overflows == 1 {
+            assert_eq!(
+                reply["result"]["finalMessage"],
+                "continued after trimmed summary"
+            );
+            assert_eq!(requests.len(), 8);
+            assert_compacted_request(&requests[7], SUMMARY);
+            assert_eq!(&user_inputs(&requests[7])[..5], INPUTS);
+        } else {
+            // A failed summary reaches the turn as a native compaction failure.
+            assert_eq!(reply["error"]["code"], "native_error", "{reply}");
+            assert_eq!(
+                reply["error"]["message"],
+                "native agent could not complete the turn"
+            );
+            assert_eq!(requests.len(), 9);
+        }
+    }
+}

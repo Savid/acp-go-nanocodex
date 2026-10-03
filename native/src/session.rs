@@ -262,6 +262,7 @@ pub struct Session {
     text_events: bool,
     replaced_native_session_id: Option<String>,
     prompted: bool,
+    compact_next: bool,
     _writer_locks: Vec<File>,
 }
 
@@ -581,11 +582,13 @@ impl Session {
             .workspace(&workspace)
             .codex_home(&home)
             .tools(tools);
+        let mut compact_next = false;
         if let Some(resume) = resume {
             let path = resume.rollout_path().to_owned();
             let (_, snapshot, rollout) = resume.into_parts();
-            let snapshot = checkpoint::restore(&path, snapshot)
+            let (snapshot, overflowed) = checkpoint::restore(&path, snapshot)
                 .map_err(|_| SessionError::restore("native checkpoint could not be restored"))?;
+            compact_next = overflowed;
             builder = builder.resume(snapshot).rollout(rollout);
         } else {
             builder = builder.rollout(RolloutConfig::new(&home));
@@ -604,6 +607,7 @@ impl Session {
             text_events,
             replaced_native_session_id,
             prompted: false,
+            compact_next,
             _writer_locks: writer_locks,
         })
     }
@@ -660,6 +664,16 @@ impl Session {
         prompt
             .validate()
             .map_err(|_| SessionError::invalid_request())?;
+        if self.compact_next {
+            // Compaction changes native state, so shutdown refreshes the checkpoint.
+            self.prompted = true;
+            if let Err(error) = self.agent.compact().await {
+                // These events precede acceptance, so no prompt can carry them.
+                while self.events.try_recv_timed().is_some() {}
+                return Err(SessionError::native(error));
+            }
+            self.compact_next = false;
+        }
         let turn = self
             .agent
             .prompt(prompt)
@@ -667,6 +681,21 @@ impl Session {
             .map_err(SessionError::native)?;
         self.prompted = true;
         Ok(turn)
+    }
+
+    /// Classifies a failed turn. A context-window overflow makes the next
+    /// prompt compact first, including in a later helper.
+    pub fn turn_failed(&mut self, error: NanocodexError) -> SessionError {
+        let overflow = error
+            .responses_error()
+            .is_some_and(nanocodex::oai::transport::ResponsesError::is_context_window_exceeded);
+        let error = SessionError::native(error);
+        self.compact_next |= overflow
+            || matches!(
+                error.provider_code.as_deref(),
+                Some("context_length_exceeded" | "context_window_exceeded")
+            );
+        error
     }
 
     pub async fn flush_state(&self) -> Result<Value, SessionError> {
@@ -695,6 +724,7 @@ impl Session {
                         .expect("rollout recording enabled")
                         .path(),
                     snapshot,
+                    self.compact_next,
                 )
                 .is_err()
                 {

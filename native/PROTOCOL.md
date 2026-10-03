@@ -77,8 +77,12 @@ or is incomplete fails without retrying as `native_error` with the message
 `gateway compaction summary requested a tool`,
 `gateway compaction summary was empty`, or
 `gateway compaction summary was truncated`. Compaction produces native
-lifecycle events without assistant or reasoning presentation events. Failed or
-cancelled compaction leaves committed history intact. Routes without a gateway
+lifecycle events without assistant or reasoning presentation events. A summary
+request that fails with a `context_length_exceeded` or `context_window_exceeded`
+`providerCode` is sent again without its oldest turn, at most three times. A
+turn runs from one user input to the next; developer and context messages, the
+latest turn, and the trailing instruction stay, and native history is unchanged.
+Failed or cancelled compaction leaves committed history intact. Routes without a gateway
 keep native remote compaction and send `compaction` items unchanged, including
 marked ones.
 
@@ -152,7 +156,11 @@ requests and retry delays.
   `{stopReason:"end_turn"|"cancelled", finalMessage, usage?, nativeSessionId,
   rolloutPath, committedBytes}`. Usage has `inputTokens`, `cachedInputTokens`,
   `outputTokens`, `reasoningOutputTokens`, and `totalTokens`. A failed turn
-  returns an error after flushing its native state.
+  returns an error after flushing its native state. A turn that fails with a
+  native `ContextWindowExceeded` source or a `context_length_exceeded` or
+  `context_window_exceeded` `providerCode` marks the session, and the next
+  prompt runs native compaction before `accepted`. A failed compaction returns
+  its error, does not submit the input, and keeps the mark.
 - `cancel`: `{}`. Cancels the active turn and waits for native cancellation
   cleanup. Returns `{cancelled:boolean}`. It remains usable while a prompt RPC
   is open. Cancelling while idle is a successful no-op.
@@ -188,7 +196,8 @@ helper exits.
 The helper atomically replaces `<rollout>.acp-checkpoint.json` after a prompted
 helper shuts down its native writer. This optional file retains the native
 snapshot head and request prefix, including context token accounting, without
-duplicating history. Go mirrors the latest file in `config.checkpoint`, alongside
+duplicating history. It carries `compact_next:true` while the compaction mark
+is set. Go mirrors the latest file in `config.checkpoint`, alongside
 the native rows in the same store generation. Its byte boundary, history length,
 identity, version, and supported prefix shape must match restoration. Missing,
 stale, unreadable, or undecodable checkpoints fall back to native history and
@@ -202,5 +211,4 @@ frame-size bound. The 32 MiB bound applies to helper transport frames and invali
 unterminated recovery tails.
 
 Gateway context-overflow and invalid-image failures carry sanitized native
-`ResponsesError` sources for native repair. The native forced-compaction flag
-is not part of the saved snapshot and does not survive helper restarts.
+`ResponsesError` sources for native repair.

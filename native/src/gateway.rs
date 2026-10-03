@@ -166,6 +166,18 @@ const SUMMARY_SUFFIX: &str = "\n</summary>";
 /// prefix with this limit set.
 const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
+/// Bounds how many oldest turns an overflowing summary request drops.
+const MAX_SUMMARY_TRIMS: u32 = 3;
+
+/// Prefixes of the context messages that native history carries as user
+/// messages. Any other user message is input that starts a turn.
+const CONTEXT_PREFIXES: [&str; 4] = [
+    "<environment_context>",
+    "# AGENTS.md instructions",
+    "<turn_aborted>",
+    SUMMARY_PREFIX,
+];
+
 const SUMMARY_TOOL: &str = "gateway compaction summary requested a tool";
 const SUMMARY_EMPTY: &str = "gateway compaction summary was empty";
 const SUMMARY_TRUNCATED: &str = "gateway compaction summary was truncated";
@@ -177,6 +189,41 @@ fn summary_failure(message: &'static str) -> ResponseError {
 
 fn user_text(text: &str) -> Value {
     json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]})
+}
+
+fn user_input(item: &Value) -> bool {
+    item["type"] == "message"
+        && item["role"] == "user"
+        && !item["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part["text"].as_str())
+            .any(|text| {
+                CONTEXT_PREFIXES
+                    .iter()
+                    .any(|prefix| text.trim_start().starts_with(prefix))
+            })
+}
+
+/// Drops the oldest turn, from one user input up to the next, from a summary
+/// request. Developer and context messages, the latest turn, and the trailing
+/// instruction stay; dropping whole turns keeps tool calls with their outputs.
+fn drop_oldest_turn(input: &mut Vec<Value>) -> bool {
+    let history = input.len().saturating_sub(1);
+    let mut turns = (0..history).filter(|&index| user_input(&input[index]));
+    let (Some(first), Some(next)) = (turns.next(), turns.next()) else {
+        return false;
+    };
+    let mut index = 0;
+    input.retain(|item| {
+        let context = item["type"] == "message"
+            && (item["role"] == "developer" || (item["role"] == "user" && !user_input(item)));
+        let keep = !(first..next).contains(&index) || context;
+        index += 1;
+        keep
+    });
+    true
 }
 
 fn output_index(event: &Value) -> Result<usize, ResponseError> {
@@ -326,6 +373,7 @@ impl GatewayRoute {
             body["max_output_tokens"] = json!(SUMMARY_MAX_OUTPUT_TOKENS);
         }
         let mut retry = Retry::new();
+        let mut trims = 0;
         loop {
             let mut emitted_output = false;
             match self
@@ -345,6 +393,18 @@ impl GatewayRoute {
                     return Ok(ResponsesServiceResponse::new(output));
                 }
                 Err(error) => {
+                    // Only the summary request shrinks; native history keeps every turn.
+                    if compacting
+                        && trims < MAX_SUMMARY_TRIMS
+                        && error.error.is_context_window_exceeded()
+                        && body["input"].as_array_mut().is_some_and(drop_oldest_turn)
+                    {
+                        trims += 1;
+                        eprintln!(
+                            "gateway compaction summary exceeded the context window; retrying without the oldest turn ({trims}/{MAX_SUMMARY_TRIMS})"
+                        );
+                        continue;
+                    }
                     if !retry.wait(&error, emitted_output).await {
                         return Err(error.error);
                     }

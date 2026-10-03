@@ -174,8 +174,9 @@ and atomic mirror operations.
 
 After a prompt, the helper stops the native writer and atomically saves the latest
 optional snapshot checkpoint in `<rollout>.acp-checkpoint.json`. The store mirrors
-it in `config.checkpoint`. It retains token accounting and the request prefix so
-the next helper can compact before its first model call. Conversation history
+it in `config.checkpoint`. It retains token accounting, the request prefix, and a
+pending compaction after a context overflow, so the next helper can compact
+before its first model call. Conversation history
 remains in native records. Restore uses a checkpoint only when its byte boundary,
 history length, identity, and supported shape match; otherwise it rebuilds from
 native history. Checkpoint failures are diagnostic and do not fail a committed
@@ -242,9 +243,12 @@ compacted context for subsequent prompts and restoration. Failed or cancelled
 compaction preserves committed history. After the first committed turn, load
 and resume refuse an `apiBaseUrl` or `websocketUrl` change that moves a session
 between a custom endpoint and the native route; changing between custom
-endpoints remains allowed. Provider-reported context overflow retains its
-native error type, but the native forced-compaction flag is not retained across
-helper restarts.
+endpoints remains allowed. A turn that exceeds the provider context window
+fails without a retry, and the next prompt, in any later helper, runs native
+compaction before its input; if that compaction fails, the prompt fails and the
+next one tries again. A gateway summary request that exceeds the context window
+is sent again without its oldest remaining turn, at most three times; native
+history keeps every turn.
 
 Gateway requests retry connection failures, HTTP 408, 409, 429, and 5xx
 responses, and provider failure events whose code is missing, unrecognized, or

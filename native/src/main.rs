@@ -172,7 +172,7 @@ impl Server {
                     value["finalMessage"] = json!("");
                     Ok(value)
                 }
-                Err(error) => Err(SessionError::native(error)),
+                Err(error) => Err(session.turn_failed(error)),
             },
         };
         self.reply(active.id, response).await

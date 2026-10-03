@@ -18,6 +18,10 @@ struct Checkpoint {
     history_items: usize,
     head: SessionSnapshotHead,
     prefix: Vec<ResponseItem>,
+    /// The last turn overflowed the provider context window, so the next
+    /// prompt compacts before its input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    compact_next: bool,
 }
 
 fn sidecar(path: &Path) -> PathBuf {
@@ -30,7 +34,8 @@ fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid native checkpoint")
 }
 
-pub fn restore(path: &Path, snapshot: SessionSnapshot) -> io::Result<SessionSnapshot> {
+/// Returns the restored snapshot and whether the next prompt compacts first.
+pub fn restore(path: &Path, snapshot: SessionSnapshot) -> io::Result<(SessionSnapshot, bool)> {
     let mut file = OpenOptions::new().read(true).append(true).open(path)?;
     let mut end = file.metadata()?.len();
     if end > 0 {
@@ -45,10 +50,10 @@ pub fn restore(path: &Path, snapshot: SessionSnapshot) -> io::Result<SessionSnap
     }
     match restore_checkpoint(path, end, &snapshot) {
         Ok(Some(restored)) => Ok(restored),
-        Ok(None) => Ok(snapshot),
+        Ok(None) => Ok((snapshot, false)),
         Err(_) => {
             eprintln!("native checkpoint ignored; restoring native history");
-            Ok(snapshot)
+            Ok((snapshot, false))
         }
     }
 }
@@ -57,7 +62,7 @@ fn restore_checkpoint(
     path: &Path,
     end: u64,
     snapshot: &SessionSnapshot,
-) -> io::Result<Option<SessionSnapshot>> {
+) -> io::Result<Option<(SessionSnapshot, bool)>> {
     let metadata = match std::fs::symlink_metadata(sidecar(path)) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -103,15 +108,16 @@ fn restore_checkpoint(
     {
         return Err(invalid());
     }
-    Ok(Some(
+    Ok(Some((
         checkpoint
             .head
             .with_context(history, Some(checkpoint.prefix)),
-    ))
+        checkpoint.compact_next,
+    )))
 }
 
 // The native writer must be shut down before capturing its final byte boundary.
-pub fn save(path: &Path, snapshot: SessionSnapshot) -> io::Result<()> {
+pub fn save(path: &Path, snapshot: SessionSnapshot, compact_next: bool) -> io::Result<()> {
     let (head, history, prefix) = snapshot.into_context_parts();
     let Some(prefix) = prefix else {
         return Ok(());
@@ -121,6 +127,7 @@ pub fn save(path: &Path, snapshot: SessionSnapshot) -> io::Result<()> {
         history_items: history.len(),
         head,
         prefix,
+        compact_next,
     };
     let bytes = serde_json::to_vec(&checkpoint).map_err(|_| invalid())?;
     if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
