@@ -48,14 +48,15 @@ export NANOCODEX_TRANSPORT=https
 
 ./bin/acp-go-nanocodex \
   -path ./bin/acp-go-nanocodex-native \
-  -model gpt-6.1-sol
+  -model gpt-6-astra
 ```
 
 Use the URL and token supplied by the gateway operator for a remote gateway.
 The prefix must match the provider namespace returned by its authenticated
 `GET /v1/models` endpoint. The example selects
-`openai-codex/gpt-6.1-sol`; a different gateway account may expose a different
-namespace or model roster.
+`openai-codex/gpt-6-astra`, a ChatGPT-subscription model; a different gateway
+account may expose a different namespace or model roster. OMP serves API-key
+OpenAI models under `openai/` and OpenRouter models under `openrouter/openai/`.
 
 For a gateway exposing `openrouter/openai/gpt-6-luna`, use
 `NANOCODEX_MODEL_ID_PREFIX=openrouter/openai` and `-model gpt-6-luna`.
@@ -117,12 +118,14 @@ account.
 - Custom API-key HTTP endpoints receive standard Responses requests with
   direct `exec_command`, `write_stdin`, `update_plan`, and `view_image`
   function tools. Shell commands can read and edit workspace files.
-- Gateway compaction requires `/responses` to accept `compaction_trigger` and
-  return one encrypted compaction item. This applies independently to the
-  selected OpenRouter provider, OMP backend, and OpenCode Go route. Response
-  streaming alone does not establish compaction support. A refused trigger
-  preserves history but prevents continuation past the automatic threshold;
-  there is no local summary fallback. Encrypted content is opaque to the adapter.
+- Gateway compaction is a local summary requested through an ordinary
+  `/responses` call with the conversation's own prefix and `tool_choice:"none"`,
+  so it needs no provider compaction support. It works through OpenRouter and
+  the OMP auth-gateway, neither of which forwards OpenAI's `compaction_trigger`.
+  A session that holds a gateway summary must stay on a gateway route.
+- Gateways cache the shared request prefix without `prompt_cache_key`. A
+  `thought_level` change starts a separate provider cache, so the next call is
+  uncached.
 - Transient gateway failures retry up to five attempts before output is delivered.
   See [retry and persistence behavior](README.md#scope).
 - Code Mode is disabled on every route. The freeform `apply_patch` tool is

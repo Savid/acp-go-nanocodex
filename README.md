@@ -234,13 +234,15 @@ failures may carry one of these `class` values:
 Configured API-key HTTPS gateways expose native function tools, including
 shell execution and file operations through the shell. Freeform patch tools are
 excluded on those routes. Code Mode is disabled on every route. Automatic
-compaction uses the native model's context threshold and sends a terminal `compaction_trigger` through
-`/responses`; the provider must support that item and return an encrypted
-compaction item. The native rollout saves the compacted context for subsequent
-prompts and restoration. Failed or cancelled compaction preserves committed
-history. There is no local summary fallback for a refused trigger.
-Provider-reported context overflow retains its native error type, but the native forced-compaction
-flag is not retained across helper restarts.
+compaction uses the native model's context threshold. On gateway routes the
+helper asks the model for a plain-text summary through an ordinary `/responses`
+request with `tool_choice:"none"`, so no provider-specific compaction support is
+needed; native routes keep remote compaction. The native rollout saves the
+compacted context for subsequent prompts and restoration. Failed or cancelled
+compaction preserves committed history. A session that holds a gateway summary
+must stay on a gateway route. Provider-reported context overflow retains its
+native error type, but the native forced-compaction flag is not retained across
+helper restarts.
 
 Gateway requests retry transient connection failures, rate limits, and service
 errors up to five total attempts with exponential backoff and jitter. Retries

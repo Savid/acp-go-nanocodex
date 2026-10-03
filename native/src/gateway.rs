@@ -131,6 +131,54 @@ fn failure(message: &'static str) -> ResponseError {
     ResponseError::service(SessionError::new("transport_error", message))
 }
 
+/// Prefixes the summary text stored in a local `compaction` item. Provider
+/// ciphertext never starts with it, so only local summaries are translated.
+const SUMMARY_MARKER: &str = "acp-go-nanocodex:summary:v1\n";
+
+const SUMMARY_INSTRUCTION: &str = "Context checkpoint. The conversation above will be replaced by \
+your summary, and another instance of you will continue the task from it without the earlier \
+turns. Do not call tools. Reply with plain text only, using these sections:
+
+## Goal
+The user's objective, constraints, and stated preferences.
+
+## Progress
+Work completed, decisions made, and why.
+
+## State
+Files created or modified (exact paths), commands whose results matter, the current working \
+state, and unresolved errors.
+
+## Next
+The immediate next step and the remaining work.
+
+Preserve exact identifiers, paths, commands, and values. Be concise and stay under 2,000 words.";
+
+const SUMMARY_PREFIX: &str = "The earlier part of this conversation was compacted to save \
+context. The summary below records it. Treat it as background, not as a new request.
+
+<summary>
+";
+
+const SUMMARY_SUFFIX: &str = "\n</summary>";
+
+/// Bounds a runaway summary, including its reasoning. Gateways keep the cached
+/// prefix with this limit set.
+const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
+const SUMMARY_TOOL: &str = "gateway compaction summary requested a tool";
+const SUMMARY_EMPTY: &str = "gateway compaction summary was empty";
+const SUMMARY_TRUNCATED: &str = "gateway compaction summary was truncated";
+
+/// A summary reply that cannot become compacted context is a provider failure.
+fn summary_failure(message: &'static str) -> ResponseError {
+    ResponseError::service(SessionError::new("native_error", message))
+}
+
+fn user_text(text: &str) -> Value {
+    json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]})
+}
+
 fn output_index(event: &Value) -> Result<usize, ResponseError> {
     event["output_index"]
         .as_u64()
@@ -161,6 +209,17 @@ fn public_input(request: &ResponsesAttempt) -> Result<(Vec<Value>, Vec<Value>), 
                 );
             }
             Some("configuration_update") => {}
+            Some("compaction")
+                if item["encrypted_content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with(SUMMARY_MARKER)) =>
+            {
+                let summary =
+                    &item["encrypted_content"].as_str().unwrap_or_default()[SUMMARY_MARKER.len()..];
+                input.push(user_text(&format!(
+                    "{SUMMARY_PREFIX}{summary}{SUMMARY_SUFFIX}"
+                )));
+            }
             Some(
                 "message"
                 | "reasoning"
@@ -234,15 +293,38 @@ impl GatewayRoute {
             input = full;
             tools = history.tools.clone();
         }
+        // Gateways cannot create provider compaction items. A compaction attempt asks for a
+        // plain-text summary over the same prefix so the provider cache still applies.
+        let compacting = matches!(kind, ResponsesAttemptKind::Compaction);
+        if compacting {
+            match input.last_mut() {
+                Some(item) if item["type"] == "compaction_trigger" => {
+                    *item = user_text(SUMMARY_INSTRUCTION);
+                }
+                _ => return Err(failure("gateway compaction requires a trailing trigger")),
+            }
+        }
+        if input
+            .iter()
+            .any(|item| item["type"] == "compaction_trigger")
+        {
+            return Err(failure(
+                "native history contains an unsupported gateway item",
+            ));
+        }
         let model = match self.config.model_id_prefix.as_deref() {
             Some(prefix) => format!("{prefix}/{}", request.model().as_str()),
             None => request.model().as_str().to_owned(),
         };
-        let body = json!({
+        let mut body = json!({
             "model":model, "input":input, "tools":tools, "stream":true, "store":false,
             "reasoning":{"effort":request.thinking().as_str()},
-            "include":["reasoning.encrypted_content"], "tool_choice":"auto", "parallel_tool_calls":false,
+            "include":["reasoning.encrypted_content"],
+            "tool_choice":if compacting { "none" } else { "auto" }, "parallel_tool_calls":false,
         });
+        if compacting {
+            body["max_output_tokens"] = json!(SUMMARY_MAX_OUTPUT_TOKENS);
+        }
         let mut retry = Retry::new(&self.config.session_id, Some(model_call_index));
         loop {
             let mut emitted_output = false;
@@ -348,7 +430,6 @@ impl GatewayRoute {
         );
         let mut stream = Box::pin(chunks.eventsource());
         let mut done_items = BTreeMap::new();
-        let mut streamed_compaction = None;
         let mut emitted_messages = HashSet::new();
         let mut response_id = None;
         let mut first_event = None;
@@ -414,21 +495,6 @@ impl GatewayRoute {
                 Some("response.output_item.done") => {
                     let index = output_index(&event)?;
                     let item = event["item"].clone();
-                    if compacting {
-                        if done_items.contains_key(&index) {
-                            return Err(
-                                failure("gateway compaction repeated an output index").into()
-                            );
-                        }
-                        if item["type"] == "compaction"
-                            && streamed_compaction.replace(item.clone()).is_some()
-                        {
-                            return Err(failure(
-                                "gateway compaction returned multiple compaction items",
-                            )
-                            .into());
-                        }
-                    }
                     first_output.get_or_insert_with(|| elapsed(started));
                     if !compacting {
                         *emitted_output |= self
@@ -469,13 +535,15 @@ impl GatewayRoute {
                         response["output"].as_array().cloned().unwrap_or_default();
                     let response: CompletedResponse = serde_json::from_value(response)
                         .map_err(|_| failure("invalid gateway completion"))?;
+                    if compacting && response.status == "incomplete" {
+                        return Err(summary_failure(SUMMARY_TRUNCATED).into());
+                    }
                     if response.status != "completed" || response.id.trim().is_empty() {
                         return Err(failure("gateway response did not complete").into());
                     }
                     if compacting {
-                        let output = compaction_output(
+                        let output = summary_output(
                             response,
-                            streamed_compaction,
                             first_event.unwrap_or_default(),
                             first_output.or_else(|| Some(elapsed(started))),
                             pipeline,
@@ -489,6 +557,9 @@ impl GatewayRoute {
                         pipeline,
                     )?;
                     return Ok((ResponsesOutput::Generation(output), committed_output));
+                }
+                Some("response.incomplete") if compacting => {
+                    return Err(summary_failure(SUMMARY_TRUNCATED).into());
                 }
                 Some("response.failed" | "response.incomplete" | "response.error" | "error") => {
                     return Err(Failure::event(&event));
@@ -587,53 +658,45 @@ fn generation_output(
     })
 }
 
-fn compaction_output(
-    mut response: CompletedResponse,
-    streamed: Option<Value>,
+fn summary_output(
+    response: CompletedResponse,
     first_event: u64,
     first_output: Option<u64>,
     pipeline: ResponsePipelineStats,
 ) -> Result<CompactionOutput, ResponseError> {
-    response
-        .output
-        .retain(|item| matches!(item, ResponseItem::Compaction { .. }));
-    if !matches!(response.output.as_slice(), [ResponseItem::Compaction { encrypted_content, .. }] if !encrypted_content.trim().is_empty())
-    {
-        return Err(failure(
-            "gateway compaction requires one encrypted compaction item",
-        ));
-    }
-    if let Some(streamed) = streamed {
-        let streamed: ResponseItem = serde_json::from_value(streamed)
-            .map_err(|_| failure("invalid gateway compaction item"))?;
-        match (&streamed, &response.output[0]) {
-            (
-                ResponseItem::Compaction {
-                    id: streamed_id,
-                    encrypted_content: streamed_content,
-                    ..
-                },
-                ResponseItem::Compaction {
-                    id,
-                    encrypted_content,
-                    ..
-                },
-            ) if streamed_content == encrypted_content
-                && streamed_id
-                    .as_ref()
-                    .zip(id.as_ref())
-                    .is_none_or(|(left, right)| left == right) => {}
-            _ => {
-                return Err(failure(
-                    "gateway compaction completion conflicts with streamed output",
-                ));
+    let mut messages = Vec::new();
+    for item in &response.output {
+        let item = serde_json::to_value(item).map_err(|_| failure("invalid gateway completion"))?;
+        match item["type"].as_str() {
+            Some("message") if item["role"] == "assistant" => {
+                let text = item["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| part["type"] == "output_text")
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<String>();
+                if !text.trim().is_empty() {
+                    messages.push(text.trim().to_owned());
+                }
             }
+            Some("message" | "reasoning") => {}
+            Some(kind) if kind.ends_with("_call") => return Err(summary_failure(SUMMARY_TOOL)),
+            _ => return Err(failure("gateway returned an unsupported output item")),
         }
     }
+    if messages.is_empty() {
+        return Err(summary_failure(SUMMARY_EMPTY));
+    }
+    let summary = messages.join("\n\n");
+    let item = serde_json::from_value(json!({
+        "type":"compaction", "id":response.id, "encrypted_content":format!("{SUMMARY_MARKER}{summary}"),
+    }))
+    .map_err(|_| failure("invalid gateway compaction item"))?;
     Ok(CompactionOutput {
         id: response.id,
         status: response.status,
-        item: response.output.pop().expect("validated compaction item"),
+        item,
         usage: response.usage,
         time_to_first_event_ns: first_event,
         time_to_first_output_ns: first_output,

@@ -55,12 +55,27 @@ has a 4 MiB bound. Successful HTTP responses require `text/event-stream`.
 Non-SSE success responses fail without retrying. Incomplete events never reach
 native tools.
 
-Gateway compaction uses the native automatic threshold and sends a final
-`compaction_trigger` input item through `/responses`. Successful completion
-requires one encrypted `compaction` output item. Compaction produces native
-lifecycle events without assistant or reasoning presentation events, and the
-native rollout persists the resulting context. Failed or cancelled compaction
-leaves committed history intact.
+Gateway compaction uses the native automatic threshold and builds a local
+summary; gateway requests never carry `compaction_trigger`. The summary request
+repeats the generation request body and history with `tool_choice:"none"` and
+`max_output_tokens:16384`, and replaces the trigger with a user message asking
+for a plain-text checkpoint under Goal, Progress, State, and Next headings.
+Reasoning output is ignored; the trimmed assistant message text is the summary.
+The helper returns it to the native agent as a `compaction` item whose
+`encrypted_content` is `acp-go-nanocodex:summary:v1` and a newline followed by
+the summary, so the native rollout persists and replaces it like provider
+compaction. Gateway requests send each marked item as a user message: a fixed
+preface saying the earlier conversation was compacted and is background, not a
+new request, then the summary inside `<summary>` tags. Unmarked `compaction`
+items pass through unchanged. A summary reply that calls a tool, has no text,
+or is incomplete fails without retrying as `native_error` with the message
+`gateway compaction summary requested a tool`,
+`gateway compaction summary was empty`, or
+`gateway compaction summary was truncated`. Compaction produces native
+lifecycle events without assistant or reasoning presentation events. Failed or
+cancelled compaction leaves committed history intact. Routes without a gateway
+keep native remote compaction and send `compaction` items unchanged, including
+marked ones.
 
 Gateway generation and compaction retry transient connection failures, HTTP
 408/409/429/5xx responses, and transient provider error events up to five total
@@ -176,5 +191,4 @@ unterminated recovery tails.
 
 Gateway context-overflow and invalid-image failures carry sanitized native
 `ResponsesError` sources for native repair. The native forced-compaction flag
-is not part of the saved snapshot and does not survive helper restarts. Provider
-support for `compaction_trigger` is required; no local summary fallback is used.
+is not part of the saved snapshot and does not survive helper restarts.

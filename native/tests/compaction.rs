@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     convert::Infallible,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -28,7 +28,10 @@ use tokio::{
 
 const DEADLINE: Duration = Duration::from_secs(20);
 const HIGH_USAGE: u64 = 1_000_000;
-const SUMMARY: &str = "opaque-provider-compaction";
+const SUMMARY: &str = "Goal: keep the project anchor.";
+const SUMMARY_MARKER: &str = "acp-go-nanocodex:summary:v1\n";
+const SUMMARY_PREFIX: &str = "The earlier part of this conversation was compacted";
+const SUMMARY_INSTRUCTION: &str = "Context checkpoint.";
 
 struct Helper {
     child: Child,
@@ -113,15 +116,10 @@ impl Helper {
 enum Reply {
     Text(&'static str, u64),
     Tool,
-    Compact {
-        streamed: bool,
-    },
-    CompactWithPresentation {
-        streamed: bool,
-        completion_items: bool,
-    },
-    InvalidCompact(&'static str),
+    Summary { text: &'static str, streamed: bool },
+    InvalidSummary(&'static str),
     Reject,
+    ServerError,
     RetryDelay,
     Hang,
 }
@@ -233,6 +231,13 @@ async fn respond(
         )
             .into_response();
     }
+    if matches!(reply, Reply::ServerError) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":{"code":"server_error"}})),
+        )
+            .into_response();
+    }
     if matches!(reply, Reply::Reject) {
         return (
             StatusCode::BAD_REQUEST,
@@ -253,9 +258,16 @@ async fn respond(
             .into_response();
     }
     let mut events = vec![created];
-    let compact =
-        json!({"type":"compaction","id":format!("cmp_{number}"),"encrypted_content":SUMMARY});
     let mut status = "completed";
+    let summary_items = |text: &str| {
+        vec![
+            json!({"type":"reasoning","id":format!("rs_{number}"),"summary":[
+                {"type":"summary_text","text":"internal summary reasoning"}
+            ]}),
+            json!({"type":"message","id":format!("msg_{number}"),"role":"assistant","status":"completed",
+                "content":[{"type":"output_text","text":text,"annotations":[]}]}),
+        ]
+    };
     let (output, total_tokens) = match reply {
         Reply::Text(text, tokens) => (
             json!([{
@@ -271,72 +283,49 @@ async fn respond(
             }]),
             HIGH_USAGE,
         ),
-        Reply::Compact { streamed } => {
-            events.push(sse(json!({"type":"response.output_text.delta","output_index":0,"delta":"internal compaction text"})));
-            events.push(sse(json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"internal compaction reasoning"})));
+        Reply::Summary { text, streamed } => {
+            let items = summary_items(text);
+            events.push(sse(json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"internal summary reasoning"})));
+            events.push(sse(
+                json!({"type":"response.output_text.delta","output_index":1,"delta":text}),
+            ));
             if streamed {
-                events.push(sse(
-                    json!({"type":"response.output_item.done","output_index":0,"item":compact}),
-                ));
-                (json!([]), 15)
-            } else {
-                (json!([compact]), 15)
-            }
-        }
-        Reply::CompactWithPresentation {
-            streamed,
-            completion_items,
-        } => {
-            let items = vec![
-                json!({"type":"reasoning","id":"rs_compaction","summary":[
-                    {"type":"summary_text","text":"internal compaction reasoning"}
-                ]}),
-                compact,
-                json!({"type":"message","id":"msg_compaction","role":"assistant","content":[
-                    {"type":"output_text","text":"internal compaction text","annotations":[]}
-                ]}),
-            ];
-            if streamed {
-                events.push(sse(json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"internal compaction reasoning"})));
-                events.push(sse(json!({"type":"response.output_text.delta","output_index":2,"delta":"internal compaction text"})));
                 for (index, item) in items.iter().enumerate() {
                     events.push(sse(json!({"type":"response.output_item.done","output_index":index,"item":item})));
                 }
+                (json!([]), 15)
+            } else {
+                (json!(items), 15)
             }
-            (
-                if completion_items {
-                    json!(items)
-                } else {
-                    json!([])
-                },
-                15,
-            )
         }
-        Reply::InvalidCompact(kind) => {
-            let mut output = json!([compact]);
+        Reply::InvalidSummary(kind) => {
+            let mut output = json!(summary_items(SUMMARY));
             match kind {
-                "missing" => output = json!([]),
-                "duplicate" => output = json!([compact, compact]),
-                "empty_content" => output[0]["encrypted_content"] = json!(""),
+                "tool" => {
+                    output[1] = json!({
+                        "type":"function_call","id":"fc_summary","call_id":"call_summary","name":"exec_command","status":"completed",
+                        "arguments":json!({"cmd":"printf summary-tool >> compaction-tool.txt","login":false}).to_string()
+                    });
+                }
+                "empty" => output[1]["content"][0]["text"] = json!(" \n "),
+                "missing" => output = json!([output[0].clone()]),
                 "empty_id" => id.clear(),
                 "incomplete" => status = "incomplete",
-                "streamed_duplicate" | "streamed_repeated_index" => {
-                    events.push(sse(
-                        json!({"type":"response.output_item.done","output_index":0,"item":compact}),
-                    ));
-                    let index = if kind == "streamed_duplicate" { 1 } else { 0 };
-                    events.push(sse(json!({"type":"response.output_item.done","output_index":index,"item":compact})));
+                "incomplete_event" => {
+                    events.push(sse(json!({
+                        "type":"response.incomplete","response":{
+                            "id":id,"status":"incomplete","output":output,
+                            "incomplete_details":{"reason":"max_output_tokens"}
+                        }
+                    })));
+                    return ([("content-type", "text/event-stream")], events.concat())
+                        .into_response();
                 }
-                "streamed_conflict" => {
-                    let mut streamed = compact.clone();
-                    streamed["encrypted_content"] = json!("different-encrypted-context");
-                    events.push(sse(json!({"type":"response.output_item.done","output_index":0,"item":streamed})));
-                }
-                _ => panic!("unknown invalid compaction fixture"),
+                _ => panic!("unknown invalid summary fixture"),
             }
             (output, 15)
         }
-        Reply::Reject | Reply::RetryDelay | Reply::Hang => unreachable!(),
+        Reply::Reject | Reply::ServerError | Reply::RetryDelay | Reply::Hang => unreachable!(),
     };
     events.push(sse(json!({
         "type":"response.completed","response":{
@@ -380,20 +369,101 @@ fn rollout_records(state: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn assert_compaction_request(request: &Value) {
-    assert_eq!(input_items(request, "compaction_trigger").len(), 1);
-    assert_eq!(
-        request["input"].as_array().unwrap().last().unwrap()["type"],
-        "compaction_trigger"
-    );
+fn message_texts(request: &Value, role: &str) -> Vec<String> {
+    input_items(request, "message")
+        .iter()
+        .filter(|item| item["role"] == role)
+        .flat_map(|item| item["content"].as_array().cloned().unwrap_or_default())
+        .filter_map(|part| part["text"].as_str().map(str::to_owned))
+        .collect()
 }
 
-fn assert_compacted_request(request: &Value) {
-    let summaries = input_items(request, "compaction");
-    assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0]["encrypted_content"], SUMMARY);
+fn summaries(request: &Value) -> Vec<String> {
+    message_texts(request, "user")
+        .into_iter()
+        .filter(|text| text.starts_with(SUMMARY_PREFIX))
+        .collect()
+}
+
+fn saved_session(rollout: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    std::fs::read_dir(rollout.parent().expect("rollout directory"))
+        .expect("read rollout directory")
+        .map(|entry| entry.expect("rollout directory entry").path())
+        .filter(|path| path.is_file())
+        .map(|path| {
+            let bytes = std::fs::read(&path).expect("read saved session file");
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn restore_into_empty_home(native_home: &Path, saved: &[(PathBuf, Vec<u8>)]) {
+    std::fs::remove_dir_all(native_home).unwrap();
+    for (path, bytes) in saved {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+}
+
+/// A summary request sends the preceding generation's body and prefix, with
+/// tools disabled, an output bound, and the instruction in place of the native
+/// trigger.
+fn assert_summary_request(request: &Value, generation: &Value) {
+    for field in [
+        "model",
+        "tools",
+        "reasoning",
+        "include",
+        "parallel_tool_calls",
+        "store",
+        "stream",
+    ] {
+        assert_eq!(request[field], generation[field], "summary changed {field}");
+    }
+    let mut bounded = generation.clone();
+    bounded["max_output_tokens"] = json!(16_384);
+    let keys = |body: &Value| {
+        body.as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys(request), keys(&bounded));
+    assert_eq!(request["max_output_tokens"], 16_384);
+    assert!(generation.get("max_output_tokens").is_none());
+    assert_eq!(generation["tool_choice"], "auto");
+    assert_eq!(request["tool_choice"], "none");
     assert!(input_items(request, "compaction_trigger").is_empty());
-    assert!(!request.to_string().contains("old assistant details"));
+    let (instruction, history) = request["input"].as_array().unwrap().split_last().unwrap();
+    assert_eq!(instruction["type"], "message");
+    assert_eq!(instruction["role"], "user");
+    assert!(
+        instruction["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(SUMMARY_INSTRUCTION)
+    );
+    let prefix = generation["input"].as_array().unwrap();
+    assert_eq!(&history[..prefix.len()], prefix.as_slice());
+}
+
+fn assert_compacted_request(request: &Value, summary: &str) {
+    assert!(input_items(request, "compaction").is_empty());
+    assert!(input_items(request, "compaction_trigger").is_empty());
+    assert_eq!(request["tool_choice"], "auto");
+    assert!(request.get("max_output_tokens").is_none());
+    let summaries = summaries(request);
+    assert_eq!(summaries.len(), 1, "{request}");
+    assert!(summaries[0].ends_with(&format!("<summary>\n{summary}\n</summary>")));
+    let body = request.to_string();
+    for removed in [
+        "old assistant details",
+        SUMMARY_INSTRUCTION,
+        "internal summary reasoning",
+    ] {
+        assert!(!body.contains(removed), "compacted request kept {removed}");
+    }
 }
 
 #[tokio::test]
@@ -401,7 +471,10 @@ async fn automatic_compaction_replays_reduced_history_after_restart() {
     for streamed in [true, false] {
         let provider = Provider::start([
             Reply::Text("old assistant details", HIGH_USAGE),
-            Reply::Compact { streamed },
+            Reply::Summary {
+                text: SUMMARY,
+                streamed,
+            },
             Reply::Text("continued after compaction", 15),
             Reply::Text("continued after restart", 15),
         ])
@@ -418,15 +491,12 @@ async fn automatic_compaction_replays_reduced_history_after_restart() {
         let rollout = Path::new(initialized["rolloutPath"].as_str().unwrap());
         let saved = std::fs::read(rollout).unwrap();
         let checkpoint_path = format!("{}.acp-checkpoint.json", rollout.display());
-        let checkpoint = std::fs::read(&checkpoint_path).unwrap();
-        let last: Value = serde_json::from_slice(&checkpoint).unwrap();
-        assert_eq!(last["head"]["history"], json!([]));
+        let checkpoint: Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+        assert_eq!(checkpoint["head"]["history"], json!([]));
         assert!(!String::from_utf8_lossy(&saved).contains("acp_checkpoint"));
 
-        std::fs::remove_dir_all(native_home.path()).unwrap();
-        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
-        std::fs::write(rollout, saved).unwrap();
-        std::fs::write(checkpoint_path, checkpoint).unwrap();
+        restore_into_empty_home(native_home.path(), &saved_session(rollout));
         config["resumeSessionId"] = initialized["nativeSessionId"].clone();
         let mut helper = Helper::start(workspace.path(), native_home.path());
         helper.call(1, "initialize", config.clone()).await;
@@ -441,35 +511,44 @@ async fn automatic_compaction_replays_reduced_history_after_restart() {
                 .iter()
                 .any(|event| event["data"]["type"] == "model.compaction.completed")
         );
-        assert!(
+        let presented = json!(
             helper
                 .events
                 .iter()
                 .filter(|event| event["event"] != "native")
-                .all(|event| !event.to_string().contains("internal compaction"))
-        );
+                .collect::<Vec<_>>()
+        )
+        .to_string();
+        assert!(!presented.contains(SUMMARY));
+        assert!(!presented.contains("internal summary reasoning"));
         let records = rollout_records(&completed);
         let replacement = records
             .iter()
             .find(|record| record["type"] == "compacted")
             .expect("durable compaction");
-        assert!(
-            replacement["payload"]["replacement_history"]
-                .to_string()
-                .contains(SUMMARY)
+        let compactions = replacement["payload"]["replacement_history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "compaction")
+            .collect::<Vec<_>>();
+        assert_eq!(compactions.len(), 1);
+        assert_eq!(
+            compactions[0]["encrypted_content"],
+            format!("{SUMMARY_MARKER}{SUMMARY}")
         );
         helper.shutdown(3).await;
 
         let requests = provider.requests();
         assert_eq!(requests.len(), 3);
-        assert_compaction_request(&requests[1]);
+        assert_summary_request(&requests[1], &requests[0]);
         assert!(requests[1].to_string().contains("old assistant details"));
-        assert_compacted_request(&requests[2]);
+        assert_compacted_request(&requests[2], SUMMARY);
         for retained in ["remember the project anchor", "continue after compaction"] {
             assert!(requests[2].to_string().contains(retained));
         }
 
-        config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+        restore_into_empty_home(native_home.path(), &saved_session(rollout));
         let mut helper = Helper::start(workspace.path(), native_home.path());
         helper.call(1, "initialize", config).await;
         helper
@@ -478,58 +557,70 @@ async fn automatic_compaction_replays_reduced_history_after_restart() {
         helper.shutdown(3).await;
         let requests = provider.requests();
         assert_eq!(requests.len(), 4);
-        assert_compacted_request(&requests[3]);
-        for retained in [
-            "remember the project anchor",
-            "continue after compaction",
-            "continue after restart",
-        ] {
-            assert!(requests[3].to_string().contains(retained));
+        assert_compacted_request(&requests[3], SUMMARY);
+        for field in ["tools", "reasoning", "include"] {
+            assert_eq!(requests[3][field], requests[2][field]);
+        }
+        let compacted = requests[2]["input"].as_array().unwrap();
+        let restored = requests[3]["input"].as_array().unwrap();
+        assert_eq!(&restored[..compacted.len()], compacted.as_slice());
+        let appended = json!(&restored[compacted.len()..]).to_string();
+        for continued in ["continued after compaction", "continue after restart"] {
+            assert!(appended.contains(continued));
         }
     }
 }
 
 #[tokio::test]
-async fn compaction_ignores_accompanying_reasoning_and_assistant_items() {
-    for (streamed, completion_items) in [(true, false), (false, true), (true, true)] {
-        let provider = Provider::start([
-            Reply::Text("old assistant details", HIGH_USAGE),
-            Reply::CompactWithPresentation {
-                streamed,
-                completion_items,
-            },
-            Reply::Text("continued after compaction", 15),
-        ])
-        .await;
-        let workspace = TempDir::new().unwrap();
-        let native_home = TempDir::new().unwrap();
-        let mut helper = Helper::start(workspace.path(), native_home.path());
-        helper.call(1, "initialize", config(&provider)).await;
-        helper.call(2, "prompt", prompt("retain this input")).await;
-        let completed = helper.call(3, "prompt", prompt("continue")).await;
-        assert_eq!(completed["finalMessage"], "continued after compaction");
-        assert!(
-            helper
-                .events
-                .iter()
-                .any(|event| event["data"]["type"] == "model.compaction.completed")
-        );
-        assert!(
-            !json!(helper.events)
-                .to_string()
-                .contains("internal compaction")
-        );
-        assert!(
-            !json!(rollout_records(&completed))
-                .to_string()
-                .contains("internal compaction")
-        );
-        helper.shutdown(4).await;
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 3);
-        assert_compaction_request(&requests[1]);
-        assert_compacted_request(&requests[2]);
-        assert!(!requests[2].to_string().contains("internal compaction"));
+async fn repeated_compaction_supersedes_the_previous_summary() {
+    let provider = Provider::start([
+        Reply::Text("old assistant details", HIGH_USAGE),
+        Reply::Summary {
+            text: "first checkpoint summary",
+            streamed: false,
+        },
+        Reply::Text("middle assistant details", HIGH_USAGE),
+        Reply::Summary {
+            text: "second checkpoint summary",
+            streamed: true,
+        },
+        Reply::Text("continued after second compaction", 15),
+    ])
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path());
+    helper.call(1, "initialize", config(&provider)).await;
+    helper.call(2, "prompt", prompt("first input")).await;
+    helper.call(3, "prompt", prompt("second input")).await;
+    let completed = helper.call(4, "prompt", prompt("third input")).await;
+    assert_eq!(
+        completed["finalMessage"],
+        "continued after second compaction"
+    );
+    let records = rollout_records(&completed);
+    let compacted = records
+        .iter()
+        .filter(|record| record["type"] == "compacted")
+        .collect::<Vec<_>>();
+    assert_eq!(compacted.len(), 2);
+    let installed = compacted[1]["payload"]["replacement_history"].to_string();
+    assert!(installed.contains("second checkpoint summary"));
+    assert!(!installed.contains("first checkpoint summary"));
+    helper.shutdown(5).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 5);
+    assert_summary_request(&requests[1], &requests[0]);
+    assert_compacted_request(&requests[2], "first checkpoint summary");
+    assert_summary_request(&requests[3], &requests[2]);
+    assert!(requests[3].to_string().contains("middle assistant details"));
+    assert_compacted_request(&requests[4], "second checkpoint summary");
+    let latest = requests[4].to_string();
+    assert!(!latest.contains("first checkpoint summary"));
+    assert!(!latest.contains("middle assistant details"));
+    for retained in ["first input", "second input", "third input"] {
+        assert!(latest.contains(retained));
     }
 }
 
@@ -537,7 +628,10 @@ async fn compaction_ignores_accompanying_reasoning_and_assistant_items() {
 async fn mid_turn_compaction_includes_completed_tool_output_without_reexecuting_tools() {
     let provider = Provider::start([
         Reply::Tool,
-        Reply::Compact { streamed: true },
+        Reply::Summary {
+            text: SUMMARY,
+            streamed: true,
+        },
         Reply::Text("tool work retained", 15),
     ])
     .await;
@@ -556,36 +650,61 @@ async fn mid_turn_compaction_includes_completed_tool_output_without_reexecuting_
     );
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    assert_compaction_request(&requests[1]);
+    assert_summary_request(&requests[1], &requests[0]);
     let output = input_items(&requests[1], "function_call_output");
     assert_eq!(output.len(), 1);
     assert!(output[0].to_string().contains("tool-committed"));
-    assert_compacted_request(&requests[2]);
+    assert_compacted_request(&requests[2], SUMMARY);
     assert!(input_items(&requests[2], "function_call").is_empty());
     assert!(input_items(&requests[2], "function_call_output").is_empty());
 }
 
 #[tokio::test]
-async fn failed_or_invalid_compaction_preserves_history_for_restart() {
-    for kind in [
-        "rejected",
-        "missing",
-        "duplicate",
-        "empty_content",
-        "empty_id",
-        "incomplete",
-        "streamed_duplicate",
-        "streamed_repeated_index",
-        "streamed_conflict",
+async fn failed_or_invalid_summary_preserves_history_for_restart() {
+    for (kind, code, message) in [
+        ("rejected", "native_error", "provider rejected the request"),
+        (
+            "tool",
+            "native_error",
+            "gateway compaction summary requested a tool",
+        ),
+        (
+            "empty",
+            "native_error",
+            "gateway compaction summary was empty",
+        ),
+        (
+            "missing",
+            "native_error",
+            "gateway compaction summary was empty",
+        ),
+        (
+            "incomplete",
+            "native_error",
+            "gateway compaction summary was truncated",
+        ),
+        (
+            "incomplete_event",
+            "native_error",
+            "gateway compaction summary was truncated",
+        ),
+        (
+            "empty_id",
+            "transport_error",
+            "gateway response did not complete",
+        ),
     ] {
         let provider = Provider::start([
             Reply::Text("old assistant details", HIGH_USAGE),
             if kind == "rejected" {
                 Reply::Reject
             } else {
-                Reply::InvalidCompact(kind)
+                Reply::InvalidSummary(kind)
             },
-            Reply::Compact { streamed: false },
+            Reply::Summary {
+                text: SUMMARY,
+                streamed: false,
+            },
             Reply::Text("history survived failure", 15),
         ])
         .await;
@@ -599,10 +718,8 @@ async fn failed_or_invalid_compaction_preserves_history_for_restart() {
             .await;
         helper.send(3, "prompt", prompt("trigger compaction")).await;
         let failed = helper.reply(3).await;
-        assert!(
-            failed.get("error").is_some(),
-            "invalid compaction {kind} succeeded: {failed}"
-        );
+        assert_eq!(failed["error"]["code"], code, "{kind}: {failed}");
+        assert_eq!(failed["error"]["message"], message, "{kind}: {failed}");
         let state = helper.call(4, "state", json!({})).await;
         assert!(
             !rollout_records(&state)
@@ -610,10 +727,11 @@ async fn failed_or_invalid_compaction_preserves_history_for_restart() {
                 .any(|record| record["type"] == "compacted")
         );
         helper.shutdown(5).await;
+        assert!(!workspace.path().join("compaction-tool.txt").exists());
         assert_eq!(
             provider.requests().len(),
             2,
-            "invalid compaction must not retry: {kind}"
+            "invalid summary must not retry: {kind}"
         );
         config["resumeSessionId"] = initialized["nativeSessionId"].clone();
         let mut helper = Helper::start(workspace.path(), native_home.path());
@@ -624,25 +742,152 @@ async fn failed_or_invalid_compaction_preserves_history_for_restart() {
         helper.shutdown(3).await;
         let requests = provider.requests();
         assert_eq!(requests.len(), 4);
-        assert_compaction_request(&requests[2]);
+        assert_eq!(requests[2]["tool_choice"], "none");
         for retained in ["retain original user input", "old assistant details"] {
             assert!(
                 requests[2].to_string().contains(retained),
                 "missing retained history after {kind}"
             );
         }
-        assert_compacted_request(&requests[3]);
+        assert_compacted_request(&requests[3], SUMMARY);
         assert!(requests[3].to_string().contains("resume preserved history"));
     }
 }
 
 #[tokio::test]
-async fn cancellation_interrupts_compaction_and_keeps_history_for_restart() {
+async fn transient_summary_failure_is_retried() {
     let provider = Provider::start([
         Reply::Text("old assistant details", HIGH_USAGE),
-        Reply::Hang,
-        Reply::Compact { streamed: false },
-        Reply::Text("history survived cancellation", 15),
+        Reply::ServerError,
+        Reply::Summary {
+            text: SUMMARY,
+            streamed: false,
+        },
+        Reply::Text("continued after retry", 15),
+    ])
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path());
+    helper.call(1, "initialize", config(&provider)).await;
+    helper
+        .call(2, "prompt", prompt("retain original user input"))
+        .await;
+    let completed = helper
+        .call(3, "prompt", prompt("continue after retry"))
+        .await;
+    assert_eq!(completed["finalMessage"], "continued after retry");
+    helper.shutdown(4).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[1], requests[2]);
+    assert_summary_request(&requests[2], &requests[0]);
+    assert_compacted_request(&requests[3], SUMMARY);
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_compaction_and_keeps_history_for_restart() {
+    for retry_delay in [false, true] {
+        let provider = Provider::start([
+            Reply::Text("old assistant details", HIGH_USAGE),
+            if retry_delay {
+                Reply::RetryDelay
+            } else {
+                Reply::Hang
+            },
+            Reply::Summary {
+                text: SUMMARY,
+                streamed: false,
+            },
+            Reply::Text("history survived cancellation", 15),
+        ])
+        .await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path());
+        let mut config = config(&provider);
+        let initialized = helper.call(1, "initialize", config.clone()).await;
+        helper
+            .call(2, "prompt", prompt("retain original user input"))
+            .await;
+        helper
+            .send(3, "prompt", prompt("pending prompt at compaction"))
+            .await;
+        provider.wait_for_requests(2).await;
+        assert_eq!(provider.requests()[1]["tool_choice"], "none");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        helper.send(4, "cancel", json!({})).await;
+        timeout(Duration::from_secs(3), async {
+            let mut cancelled = false;
+            let mut completed = false;
+            while !cancelled || !completed {
+                let frame = helper.next().await;
+                if frame.get("event").is_some() {
+                    continue;
+                }
+                assert!(frame.get("error").is_none(), "cancel failed: {frame}");
+                match frame["id"].as_u64() {
+                    Some(3) => {
+                        assert_eq!(frame["result"]["stopReason"], "cancelled");
+                        assert!(
+                            !rollout_records(&frame["result"])
+                                .iter()
+                                .any(|record| record["type"] == "compacted")
+                        );
+                        completed = true;
+                    }
+                    Some(4) => {
+                        assert_eq!(frame["result"]["cancelled"], true);
+                        cancelled = true;
+                    }
+                    _ => panic!("unexpected cancellation reply: {frame}"),
+                }
+            }
+        })
+        .await
+        .expect("cancellation must interrupt the summary promptly");
+        helper.shutdown(5).await;
+        assert_eq!(provider.requests().len(), 2);
+        config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+        let mut helper = Helper::start(workspace.path(), native_home.path());
+        helper.call(1, "initialize", config).await;
+        helper
+            .call(2, "prompt", prompt("resume after cancelled compaction"))
+            .await;
+        helper.shutdown(3).await;
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2]["tool_choice"], "none");
+        for retained in [
+            "retain original user input",
+            "old assistant details",
+            "pending prompt at compaction",
+        ] {
+            assert!(requests[2].to_string().contains(retained));
+        }
+        assert_compacted_request(&requests[3], SUMMARY);
+        assert!(
+            requests[3]
+                .to_string()
+                .contains("resume after cancelled compaction")
+        );
+    }
+}
+
+#[tokio::test]
+async fn unmarked_compaction_items_are_sent_unchanged() {
+    // Equal-length edits keep every recorded byte boundary valid.
+    const MARKER: &str = r"acp-go-nanocodex:summary:v1\n";
+    const PROVIDER_CONTENT: &str = r"native-provider-ciphertext!\n";
+    assert_eq!(MARKER.len(), PROVIDER_CONTENT.len());
+    let provider = Provider::start([
+        Reply::Text("old assistant details", HIGH_USAGE),
+        Reply::Summary {
+            text: SUMMARY,
+            streamed: false,
+        },
+        Reply::Text("continued after compaction", 15),
+        Reply::Text("continued with provider content", 15),
     ])
     .await;
     let workspace = TempDir::new().unwrap();
@@ -650,64 +895,32 @@ async fn cancellation_interrupts_compaction_and_keeps_history_for_restart() {
     let mut helper = Helper::start(workspace.path(), native_home.path());
     let mut config = config(&provider);
     let initialized = helper.call(1, "initialize", config.clone()).await;
-    helper
-        .call(2, "prompt", prompt("retain original user input"))
-        .await;
-    helper
-        .send(3, "prompt", prompt("pending prompt at compaction"))
-        .await;
-    provider.wait_for_requests(2).await;
-    assert_compaction_request(&provider.requests()[1]);
-    helper.send(4, "cancel", json!({})).await;
-    let mut cancelled = false;
-    let mut completed = false;
-    while !cancelled || !completed {
-        let frame = helper.next().await;
-        if frame.get("event").is_some() {
-            continue;
-        }
-        assert!(frame.get("error").is_none(), "cancel failed: {frame}");
-        match frame["id"].as_u64() {
-            Some(3) => {
-                assert_eq!(frame["result"]["stopReason"], "cancelled");
-                assert!(
-                    !rollout_records(&frame["result"])
-                        .iter()
-                        .any(|record| record["type"] == "compacted")
-                );
-                completed = true;
-            }
-            Some(4) => {
-                assert_eq!(frame["result"]["cancelled"], true);
-                cancelled = true;
-            }
-            _ => panic!("unexpected cancellation reply: {frame}"),
-        }
+    helper.call(2, "prompt", prompt("first input")).await;
+    helper.call(3, "prompt", prompt("second input")).await;
+    helper.shutdown(4).await;
+    let rollout = Path::new(initialized["rolloutPath"].as_str().unwrap());
+    let mut rewritten = 0;
+    for (path, bytes) in saved_session(rollout) {
+        let text = String::from_utf8(bytes).unwrap();
+        rewritten += text.matches(MARKER).count();
+        std::fs::write(path, text.replace(MARKER, PROVIDER_CONTENT)).unwrap();
     }
-    helper.shutdown(5).await;
+    assert!(rewritten > 0);
+
     config["resumeSessionId"] = initialized["nativeSessionId"].clone();
     let mut helper = Helper::start(workspace.path(), native_home.path());
     helper.call(1, "initialize", config).await;
-    helper
-        .call(2, "prompt", prompt("resume after cancelled compaction"))
-        .await;
+    helper.call(2, "prompt", prompt("third input")).await;
     helper.shutdown(3).await;
     let requests = provider.requests();
     assert_eq!(requests.len(), 4);
-    assert_compaction_request(&requests[2]);
-    for retained in [
-        "retain original user input",
-        "old assistant details",
-        "pending prompt at compaction",
-    ] {
-        assert!(requests[2].to_string().contains(retained));
-    }
-    assert_compacted_request(&requests[3]);
-    assert!(
-        requests[3]
-            .to_string()
-            .contains("resume after cancelled compaction")
+    let compactions = input_items(&requests[3], "compaction");
+    assert_eq!(compactions.len(), 1);
+    assert_eq!(
+        compactions[0]["encrypted_content"],
+        format!("native-provider-ciphertext!\n{SUMMARY}")
     );
+    assert!(summaries(&requests[3]).is_empty());
 }
 
 #[tokio::test]
@@ -800,7 +1013,7 @@ async fn later_native_records_invalidate_checkpoint_accounting() {
     helper.shutdown(3).await;
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    assert!(input_items(&requests[1], "compaction_trigger").is_empty());
+    assert_eq!(requests[1]["tool_choice"], "auto");
     assert!(
         requests[1]
             .to_string()
