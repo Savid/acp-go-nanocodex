@@ -106,7 +106,7 @@ func applyOptions(opts []Option) Options {
 	options := Options{
 		AgentName:    "acp-go-nanocodex",
 		AgentTitle:   "acp-go-nanocodex",
-		AgentVersion: "0.1.0",
+		AgentVersion: "0.2.0",
 	}
 
 	for _, opt := range opts {
