@@ -122,7 +122,8 @@ account.
   `/responses` call with the conversation's own prefix and `tool_choice:"none"`,
   so it needs no provider compaction support. It works through OpenRouter and
   the OMP auth-gateway, neither of which forwards OpenAI's `compaction_trigger`.
-  A session that holds a gateway summary must stay on a gateway route.
+  A started session cannot move between a custom endpoint and the native
+  route; see [route pinning](README.md#scope).
 - Gateways cache the shared request prefix without `prompt_cache_key`. A
   `thought_level` change starts a separate provider cache, so the next call is
   uncached.

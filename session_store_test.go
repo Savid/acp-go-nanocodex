@@ -444,3 +444,41 @@ func TestCheckpointMetadataMirrorsAndRehydratesWithoutAddingNativeRows(t *testin
 	require.NoError(t, err)
 	require.JSONEq(t, string(checkpoint), string(hydrated))
 }
+
+func TestStartedSessionsKeepTheirRouteClass(t *testing.T) {
+	t.Parallel()
+
+	gateway := func(endpoint, prefix, keyEnv string) NanocodexOptions {
+		return NewNanocodexOptions(WithNanocodexAPIBaseURL(endpoint), WithNanocodexModelIDPrefix(prefix), WithNanocodexAPIKeyEnv(keyEnv))
+	}
+	websocket := NewNanocodexOptions(WithNanocodexWebsocketURL("wss://gateway.example/v1/responses"))
+	for _, test := range []struct {
+		name              string
+		created, restored NanocodexOptions
+		started           bool
+		want              error
+	}{
+		{name: "native to gateway after a turn", restored: gateway("https://one.example/v1", "one", "ONE_KEY"), started: true, want: wire.Unsupported("_meta.nanocodex.options.apiBaseUrl")},
+		{name: "native to websocket endpoint after a turn", restored: websocket, started: true, want: wire.Unsupported("_meta.nanocodex.options.websocketUrl")},
+		{name: "native to gateway before a turn", restored: gateway("https://one.example/v1", "one", "ONE_KEY")},
+		{name: "gateway to gateway after a turn", created: gateway("https://one.example/v1", "one", "ONE_KEY"), restored: gateway("https://two.example/v1", "two", "TWO_KEY"), started: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			a, _, _, workspace := fixtureAgent(t)
+			created := fixtureSession(t, a, workspace, WithSessionNanocodexOptions(test.created))
+			if test.started {
+				fixturePrompt(t, a, created.SessionId, "commit a turn")
+			}
+			_, err := a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+			require.NoError(t, err)
+			_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace, WithSessionNanocodexOptions(test.restored)))
+			require.Equal(t, test.want, err)
+		})
+	}
+
+	// Restore metadata cannot clear a stored endpoint, so the pin is checked directly for this direction.
+	require.Equal(t, wire.Unsupported("_meta.nanocodex.options.apiBaseUrl"), pinRoute(gateway("https://one.example/v1", "one", "ONE_KEY"), NanocodexOptions{}))
+	require.Equal(t, wire.Unsupported("_meta.nanocodex.options.websocketUrl"), pinRoute(websocket, NanocodexOptions{}))
+}

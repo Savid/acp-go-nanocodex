@@ -366,6 +366,12 @@ func (a *Agent) restore(ctx context.Context, id acp.SessionId, cwd string, dirs 
 		return nil, wire.Unsupported(wire.MetaOptionPath(vendor, "model"))
 	}
 
+	if stored.record.Started {
+		if routeErr := pinRoute(stored.record.Options, parsed.options); routeErr != nil {
+			return nil, routeErr
+		}
+	}
+
 	slot, err := a.reserveSlot()
 	if err != nil {
 		return nil, err

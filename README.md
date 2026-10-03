@@ -239,8 +239,10 @@ helper asks the model for a plain-text summary through an ordinary `/responses`
 request with `tool_choice:"none"`, so no provider-specific compaction support is
 needed; native routes keep remote compaction. The native rollout saves the
 compacted context for subsequent prompts and restoration. Failed or cancelled
-compaction preserves committed history. A session that holds a gateway summary
-must stay on a gateway route. Provider-reported context overflow retains its
+compaction preserves committed history. After the first committed turn, load
+and resume refuse an `apiBaseUrl` or `websocketUrl` change that moves a session
+between a custom endpoint and the native route; changing between custom
+endpoints remains allowed. Provider-reported context overflow retains its
 native error type, but the native forced-compaction flag is not retained across
 helper restarts.
 
