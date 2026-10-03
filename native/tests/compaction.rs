@@ -122,6 +122,7 @@ enum Reply {
     },
     InvalidCompact(&'static str),
     Reject,
+    RetryDelay,
     Hang,
 }
 
@@ -224,6 +225,14 @@ async fn respond(
     let Some(reply) = reply else {
         return (StatusCode::BAD_REQUEST, "unexpected request").into_response();
     };
+    if matches!(reply, Reply::RetryDelay) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "30")],
+            Json(json!({"error":{"code":"server_error"}})),
+        )
+            .into_response();
+    }
     if matches!(reply, Reply::Reject) {
         return (
             StatusCode::BAD_REQUEST,
@@ -327,7 +336,7 @@ async fn respond(
             }
             (output, 15)
         }
-        Reply::Reject | Reply::Hang => unreachable!(),
+        Reply::Reject | Reply::RetryDelay | Reply::Hang => unreachable!(),
     };
     events.push(sse(json!({
         "type":"response.completed","response":{
@@ -408,15 +417,16 @@ async fn automatic_compaction_replays_reduced_history_after_restart() {
         helper.shutdown(3).await;
         let rollout = Path::new(initialized["rolloutPath"].as_str().unwrap());
         let saved = std::fs::read(rollout).unwrap();
-        let last: Value =
-            serde_json::from_str(std::str::from_utf8(&saved).unwrap().lines().last().unwrap())
-                .unwrap();
-        assert_eq!(last["type"], "acp_checkpoint");
-        assert_eq!(last["payload"]["head"]["history"], json!([]));
+        let checkpoint_path = format!("{}.acp-checkpoint.json", rollout.display());
+        let checkpoint = std::fs::read(&checkpoint_path).unwrap();
+        let last: Value = serde_json::from_slice(&checkpoint).unwrap();
+        assert_eq!(last["head"]["history"], json!([]));
+        assert!(!String::from_utf8_lossy(&saved).contains("acp_checkpoint"));
 
         std::fs::remove_dir_all(native_home.path()).unwrap();
         std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
         std::fs::write(rollout, saved).unwrap();
+        std::fs::write(checkpoint_path, checkpoint).unwrap();
         config["resumeSessionId"] = initialized["nativeSessionId"].clone();
         let mut helper = Helper::start(workspace.path(), native_home.path());
         helper.call(1, "initialize", config.clone()).await;
@@ -719,13 +729,11 @@ async fn observation_preserves_checkpoint_and_complete_final_records_without_new
         helper.shutdown(3).await;
         let path = Path::new(initialized["rolloutPath"].as_str().unwrap());
         let saved = std::fs::read_to_string(path).unwrap();
-        let mut rows = saved.lines().collect::<Vec<_>>();
         if native_only {
-            let removed: Value = serde_json::from_str(rows.pop().unwrap()).unwrap();
-            assert_eq!(removed["type"], "acp_checkpoint");
+            std::fs::remove_file(format!("{}.acp-checkpoint.json", path.display())).unwrap();
         }
-        let unterminated = rows.join("\n");
-        std::fs::write(path, &unterminated).unwrap();
+        let unterminated = saved.trim_end_matches('\n');
+        std::fs::write(path, unterminated).unwrap();
         config["resumeSessionId"] = initialized["nativeSessionId"].clone();
 
         for _ in 0..2 {
@@ -802,7 +810,7 @@ async fn later_native_records_invalidate_checkpoint_accounting() {
 }
 
 #[tokio::test]
-async fn checkpoint_identity_and_boundary_mismatches_fail_without_changing_rollout() {
+async fn checkpoint_mismatches_fall_back_without_changing_native_history() {
     let provider = Provider::start([Reply::Text("retained response", 15)]).await;
     let workspace = TempDir::new().unwrap();
     let native_home = TempDir::new().unwrap();
@@ -815,8 +823,9 @@ async fn checkpoint_identity_and_boundary_mismatches_fail_without_changing_rollo
     helper.shutdown(3).await;
     let path = Path::new(initialized["rolloutPath"].as_str().unwrap());
     let saved = std::fs::read_to_string(path).unwrap();
-    let final_start = saved.trim_end_matches('\n').rfind('\n').unwrap() + 1;
-    let checkpoint: Value = serde_json::from_str(&saved[final_start..]).unwrap();
+    let checkpoint_path = format!("{}.acp-checkpoint.json", path.display());
+    let checkpoint: Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
     config["resumeSessionId"] = initialized["nativeSessionId"].clone();
     for field in [
         "version",
@@ -826,24 +835,141 @@ async fn checkpoint_identity_and_boundary_mismatches_fail_without_changing_rollo
         "workspace",
         "preceding_bytes",
         "history_items",
+        "prefix",
+        "missing_head",
+        "invalid_json",
     ] {
         let mut invalid = checkpoint.clone();
         match field {
-            "version" => invalid["payload"]["head"][field] = json!(99),
-            "preceding_bytes" | "history_items" => invalid["payload"][field] = json!(0),
-            _ => invalid["payload"]["head"][field] = json!("mismatched checkpoint"),
+            "version" => invalid["head"][field] = json!(99),
+            "preceding_bytes" | "history_items" => invalid[field] = json!(0),
+            "prefix" => invalid["prefix"] = json!([{"type":"unknown"}]),
+            "missing_head" => invalid["head"].as_object_mut().unwrap().clear(),
+            "invalid_json" => {}
+            _ => invalid["head"][field] = json!("mismatched checkpoint"),
         }
-        let corrupt = format!("{}{invalid}", &saved[..final_start]);
-        std::fs::write(path, &corrupt).unwrap();
+        let corrupt = if field == "invalid_json" {
+            "{".to_string()
+        } else {
+            invalid.to_string()
+        };
+        std::fs::write(&checkpoint_path, &corrupt).unwrap();
         let mut helper = Helper::start(workspace.path(), native_home.path());
         helper.send(1, "initialize", config.clone()).await;
         let result = helper.reply(1).await;
         assert!(
-            result.get("error").is_some(),
-            "mismatched {field} was accepted"
+            result.get("result").is_some(),
+            "mismatched {field} prevented native restore: {result}"
         );
         helper.shutdown(2).await;
-        assert_eq!(std::fs::read_to_string(path).unwrap(), corrupt);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), saved);
     }
     assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn checkpoint_write_failure_does_not_fail_a_committed_turn() {
+    let provider = Provider::start([Reply::Text("committed response", 15)]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path());
+    let initialized = helper.call(1, "initialize", config(&provider)).await;
+    let path = Path::new(initialized["rolloutPath"].as_str().unwrap());
+    std::fs::create_dir(format!("{}.acp-checkpoint.json", path.display())).unwrap();
+    helper
+        .call(
+            2,
+            "prompt",
+            prompt("commit despite optional metadata failure"),
+        )
+        .await;
+    helper.shutdown(3).await;
+    assert!(
+        std::fs::read_to_string(path)
+            .unwrap()
+            .contains("committed response")
+    );
+}
+
+#[tokio::test]
+async fn writer_lock_survives_until_native_shutdown() {
+    let provider = Provider::start([Reply::Text("saved reply", 15)]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut first = Helper::start(workspace.path(), native_home.path());
+    let mut config = config(&provider);
+    let initialized = first.call(1, "initialize", config.clone()).await;
+    first
+        .call(2, "prompt", prompt("keep native writer alive"))
+        .await;
+    config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+    let mut second = Helper::start(workspace.path(), native_home.path());
+    second.send(1, "initialize", config.clone()).await;
+    assert_eq!(second.reply(1).await["error"]["code"], "restore_failed");
+    second.shutdown(2).await;
+    first.shutdown(3).await;
+    let mut third = Helper::start(workspace.path(), native_home.path());
+    third.call(1, "initialize", config).await;
+    third.shutdown(2).await;
+}
+
+#[tokio::test]
+async fn cancel_and_shutdown_interrupt_compaction_retry_delay() {
+    for shutdown in [false, true] {
+        let provider = Provider::start([
+            Reply::Text("retained history", HIGH_USAGE),
+            Reply::RetryDelay,
+        ])
+        .await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path());
+        helper.call(1, "initialize", config(&provider)).await;
+        helper.call(2, "prompt", prompt("fill context")).await;
+        helper
+            .send(3, "prompt", prompt("compact before continuing"))
+            .await;
+        provider.wait_for_requests(2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let method = if shutdown { "shutdown" } else { "cancel" };
+        helper.send(4, method, json!({})).await;
+        timeout(Duration::from_secs(3), async {
+            let mut prompt_done = false;
+            let mut control_done = false;
+            while !prompt_done || !control_done {
+                let frame = helper.next().await;
+                if frame.get("event").is_some() {
+                    continue;
+                }
+                assert!(frame.get("error").is_none(), "control failure: {frame}");
+                match frame["id"].as_u64() {
+                    Some(3) => {
+                        assert_eq!(frame["result"]["stopReason"], "cancelled");
+                        prompt_done = true;
+                    }
+                    Some(4) => {
+                        if !shutdown {
+                            assert_eq!(frame["result"]["cancelled"], true);
+                        }
+                        control_done = true;
+                    }
+                    _ => panic!("unexpected reply: {frame}"),
+                }
+            }
+        })
+        .await
+        .expect("retry delay must be interruptible");
+        if shutdown {
+            assert!(
+                timeout(DEADLINE, helper.child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+        } else {
+            helper.shutdown(5).await;
+        }
+        assert_eq!(provider.requests().len(), 2);
+    }
 }

@@ -294,6 +294,19 @@ impl GatewayRoute {
         if !response.status().is_success() {
             return Err(Failure::http(response).await);
         }
+        if !response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+            })
+        {
+            return Err(Failure::non_sse(response).await);
+        }
         Ok(response)
     }
 
@@ -359,6 +372,9 @@ impl GatewayRoute {
             first_event.get_or_insert_with(|| elapsed(started));
             pipeline.event_count += 1;
             pipeline.event_bytes += frame.data.len() as u64;
+            if pipeline.event_bytes > MAX_RESPONSE_BYTES as u64 {
+                return Err(failure("gateway response exceeds 4 MiB").into());
+            }
             let event: Value = serde_json::from_str(&frame.data)
                 .map_err(|_| failure("invalid gateway event JSON"))?;
             if let Some(id) = event["response"]["id"].as_str().filter(|id| !id.is_empty()) {
@@ -631,6 +647,8 @@ fn sends_session_header(base_url: &str) -> bool {
     })
 }
 
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Default)]
 struct StreamBound {
     event_bytes: usize,
@@ -648,8 +666,8 @@ impl StreamBound {
                 continue;
             }
             self.event_bytes += 1;
-            if self.event_bytes > crate::MAX_FRAME_BYTES {
-                return Err(std::io::Error::other("gateway event exceeds 32 MiB"));
+            if self.event_bytes > MAX_RESPONSE_BYTES {
+                return Err(std::io::Error::other("gateway event exceeds 4 MiB"));
             }
             self.previous_cr = byte == b'\r';
             if byte == b'\r' || byte == b'\n' {

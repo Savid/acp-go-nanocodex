@@ -4,6 +4,7 @@ use reqwest::header::HeaderMap;
 use serde_json::Value;
 use std::{
     collections::hash_map::DefaultHasher,
+    error::Error,
     hash::{Hash, Hasher},
     time::{Duration, SystemTime},
 };
@@ -73,26 +74,45 @@ impl Failure {
             let classified = SessionError::provider_event(&event);
             if classified.provider_code.is_some() {
                 error.provider_code = classified.provider_code;
-                error.message = classified.message;
+                if classified.message != "provider response did not complete" {
+                    error.message = classified.message;
+                }
             }
         }
         Self {
-            error: ResponseError::service(error),
+            error: ResponseError::service(error.with_provider_source()),
             retryable,
             retry_after,
         }
+    }
+
+    pub async fn non_sse(response: reqwest::Response) -> Self {
+        let mut failure = Self::http(response).await;
+        failure.retryable = false;
+        let session = failure
+            .error
+            .source()
+            .and_then(|source| source.downcast_ref::<SessionError>());
+        if session.is_none_or(|error| error.provider_code.is_none()) {
+            failure.error = ResponseError::service(SessionError::new(
+                "transport_error",
+                "gateway requires a text/event-stream response",
+            ));
+        }
+        failure
     }
 
     pub fn event(event: &Value) -> Self {
         let error = SessionError::provider_event(event);
         let detail = error_detail(event);
         Self {
-            error: ResponseError::service(error),
+            error: ResponseError::service(error.with_provider_source()),
             retryable: provider_retry(event) == Some(true),
             retry_after: detail
                 .get("retry_after")
                 .and_then(Value::as_f64)
-                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .map(|seconds| Duration::from_secs_f64(seconds.min(61.0))),
         }
     }
 }
@@ -193,25 +213,38 @@ fn terminal_code(code: &str) -> bool {
     )
 }
 
+fn decimal_delay(value: &str, milliseconds: bool) -> Option<Duration> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let maximum = if milliseconds { 61_000 } else { 61 };
+    let count = value.bytes().fold(0_u64, |count, byte| {
+        count
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'))
+            .min(maximum)
+    });
+    Some(if milliseconds {
+        Duration::from_millis(count)
+    } else {
+        Duration::from_secs(count)
+    })
+}
+
 fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     if let Some(delay) = headers
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
+        .and_then(|value| decimal_delay(value, true))
     {
         return Some(delay);
     }
     let value = headers.get("retry-after")?.to_str().ok()?;
-    value
-        .parse::<f64>()
-        .ok()
-        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
-        .or_else(|| {
-            httpdate::parse_http_date(value)
-                .ok()
-                .map(|date| date.duration_since(now).unwrap_or_default())
-        })
+    decimal_delay(value, false).or_else(|| {
+        httpdate::parse_http_date(value)
+            .ok()
+            .map(|date| date.duration_since(now).unwrap_or_default())
+    })
 }
 
 pub struct Retry {
@@ -233,19 +266,42 @@ impl Retry {
         if !failure.retryable || self.attempt >= MAX_ATTEMPTS {
             return None;
         }
-        if let Some(delay) = failure.retry_after {
-            return (delay <= MAX_SERVER_DELAY).then_some(delay);
+        if failure
+            .retry_after
+            .is_some_and(|delay| delay > MAX_SERVER_DELAY)
+        {
+            return None;
         }
         let base_ms = 200_u64 << self.attempt.saturating_sub(1).min(4);
         let jitter = 75 + self.seed.wrapping_add(u64::from(self.attempt) * 31) % 51;
-        Some(Duration::from_millis(base_ms * jitter / 100))
+        Some(
+            Duration::from_millis(base_ms * jitter / 100)
+                .max(failure.retry_after.unwrap_or_default()),
+        )
     }
 
     pub async fn wait(&mut self, failure: &Failure) -> bool {
         let Some(delay) = self.delay(failure) else {
+            if failure
+                .retry_after
+                .is_some_and(|delay| delay > MAX_SERVER_DELAY)
+            {
+                eprintln!(
+                    "gateway stopped after {} attempt(s): server retry delay exceeds 60 seconds",
+                    self.attempt
+                );
+            } else {
+                eprintln!("gateway stopped after {} attempt(s)", self.attempt);
+            }
             return false;
         };
         self.attempt += 1;
+        eprintln!(
+            "gateway retry attempt {}/{} in {} ms",
+            self.attempt,
+            MAX_ATTEMPTS,
+            delay.as_millis()
+        );
         tokio::time::sleep(delay).await;
         true
     }
@@ -254,6 +310,32 @@ impl Retry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_repair_errors_keep_safe_metadata_and_drop_provider_messages() {
+        for code in [
+            "context_length_exceeded",
+            "context_window_exceeded",
+            "invalid_image",
+        ] {
+            let failure = Failure::event(
+                &serde_json::json!({"error":{"code":code,"message":"secret provider body"}}),
+            );
+            let typed = failure
+                .error
+                .responses_error()
+                .expect("native repair source");
+            assert_eq!(typed.is_context_window_exceeded(), code != "invalid_image");
+            assert!(!format!("{typed:?}").contains("secret"));
+            let safe = failure
+                .error
+                .source()
+                .unwrap()
+                .downcast_ref::<SessionError>()
+                .unwrap();
+            assert_eq!(safe.provider_code.as_deref(), Some(code));
+        }
+    }
 
     #[test]
     fn retry_delays_are_bounded_and_server_delays_are_respected() {
@@ -278,11 +360,8 @@ mod tests {
     fn retry_after_accepts_seconds_milliseconds_and_http_dates() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let mut headers = HeaderMap::new();
-        headers.insert("retry-after", "1.5".parse().unwrap());
-        assert_eq!(
-            retry_after(&headers, now),
-            Some(Duration::from_millis(1500))
-        );
+        headers.insert("retry-after", "2".parse().unwrap());
+        assert_eq!(retry_after(&headers, now), Some(Duration::from_secs(2)));
         headers.insert("retry-after-ms", "200".parse().unwrap());
         assert_eq!(retry_after(&headers, now), Some(Duration::from_millis(200)));
         headers.remove("retry-after-ms");
@@ -293,7 +372,22 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(retry_after(&headers, now), Some(Duration::from_secs(2)));
-        for value in ["-1", "NaN", "infinity", "invalid"] {
+        headers.insert("retry-after", "99999999999999999999".parse().unwrap());
+        assert!(retry_after(&headers, now).unwrap() > MAX_SERVER_DELAY);
+        headers.insert("retry-after-ms", "99999999999999999999".parse().unwrap());
+        assert!(retry_after(&headers, now).unwrap() > MAX_SERVER_DELAY);
+        headers.remove("retry-after-ms");
+        let mut failure = Failure::connection("connection failed");
+        failure.retry_after = Some(Duration::ZERO);
+        assert!(Retry::new("session", None).delay(&failure).unwrap() >= Duration::from_millis(150));
+        assert!(
+            Retry::new("session", None)
+                .delay(&Failure::event(
+                    &serde_json::json!({"error":{"code":"rate_limit_exceeded", "retry_after":1e20}})
+                ))
+                .is_none()
+        );
+        for value in ["-1", "NaN", "infinity", "invalid", "1e20", "1.5", "5, 10"] {
             headers.insert("retry-after", value.parse().unwrap());
             assert_eq!(retry_after(&headers, now), None);
         }

@@ -50,7 +50,10 @@ operations use native direct tools. Unsupported custom tools are excluded.
 Gateway requests omit `prompt_cache_key` and carry the adapter's `User-Agent`.
 Only requests to `https://opencode.ai/zen/go/v1` carry the native conversation ID as
 `x-opencode-session`, including after a helper restart. Each SSE event is
-limited to 32 MiB before parsing; incomplete events never reach native tools.
+limited to 4 MiB before parsing; accumulated event data for one response also
+has a 4 MiB bound. Successful HTTP responses require `text/event-stream`.
+Non-SSE success responses fail without retrying. Incomplete events never reach
+native tools.
 
 Gateway compaction uses the native automatic threshold and sends a final
 `compaction_trigger` input item through `/responses`. Successful completion
@@ -62,7 +65,10 @@ leaves committed history intact.
 Gateway generation and compaction retry transient connection failures, HTTP
 408/409/429/5xx responses, and transient provider error events up to five total
 attempts. Backoff is exponential with jitter. Valid `Retry-After` delays up to
-60 seconds are honored; longer delays end the operation without retrying early.
+60 seconds are honored, as are `retry-after-ms` values. Backoff remains the
+minimum delay, including for zero server delays. Overflowing decimal values and
+delays over 60 seconds end the operation without retrying early. Retry attempts,
+delays, and exhausted/refused retries produce redacted stderr diagnostics.
 Authorization, quota, invalid input, and malformed provider data fail immediately.
 Generation never retries after delivering assistant or reasoning output. A retry
 cannot execute tools from an incomplete response. Cancellation interrupts both
@@ -126,7 +132,7 @@ requests and retry delays.
 - `state`: `{}`. Flushes state while idle and returns the same session fields
   as initialization. A host can mirror only bytes below `committedBytes`.
 - `shutdown`: `{}`. Cancels an active turn, flushes and shuts down the agent,
-  appends an available snapshot checkpoint if a prompt ran, then replies `{}`
+  saves an optional snapshot checkpoint if a prompt ran, then replies `{}`
   and exits. End of input performs the same shutdown. A caller can mirror the
   complete stopped file.
 
@@ -144,16 +150,31 @@ Authentication, configuration, and process-start failures remain distinct.
 
 The Go adapter holds an advisory lock per native UUID from before hydration
 until the helper exits and is reaped. Empty-session replacement also locks
-the candidate UUID. The helper is private to that adapter and requires its
-caller to own these locks. Unrelated native consumers must avoid writing
-the same rollout concurrently. Native rollout files and complete records
-are preserved, including a valid final JSON record without a newline.
+the candidate UUID. The helper holds `<uuid>.writer.lock` under
+`CODEX_HOME/nanocodex/acp-locks/` for every initialized and resumed UUID until
+shutdown. Hydration and stopped snapshots acquire that writer lock before
+accessing native files. Unrelated native consumers must honor writer exclusion.
+Native rollout files and complete records are preserved, including a valid final JSON record without a newline.
 Hydration may remove an invalid, unterminated trailing fragment after the
 helper exits.
 
-The helper's `acp_checkpoint` rollout row retains the native snapshot head and
-request prefix, including context token accounting, without duplicating history.
-It is appended and synced only after the native writer has stopped. Its recorded
-byte boundary, history length, and native identity must match restoration; later
-native records supersede it. Restoring an unchanged session does not append
-another checkpoint. Header-only sessions have no checkpoint.
+The helper atomically replaces `<rollout>.acp-checkpoint.json` after a prompted
+helper shuts down its native writer. This optional file retains the native
+snapshot head and request prefix, including context token accounting, without
+duplicating history. Go mirrors the latest file in `config.checkpoint`, alongside
+the native rows in the same store generation. Its byte boundary, history length,
+identity, version, and supported prefix shape must match restoration. Missing,
+stale, unreadable, or undecodable checkpoints fall back to native history and
+produce a redacted stderr diagnostic when present but unusable. Failed checkpoint
+writes also produce a diagnostic without failing shutdown. Observations preserve
+the checkpoint; header-only sessions have none. The file is limited to 1 MiB.
+
+Prompt parameters are limited to 12 MiB of encoded JSON before native admission.
+Native rollout rows, including complete compacted histories, have no protocol
+frame-size bound. The 32 MiB bound applies to helper transport frames and invalid
+unterminated recovery tails.
+
+Gateway context-overflow and invalid-image failures carry sanitized native
+`ResponsesError` sources for native repair. The native forced-compaction flag
+is not part of the saved snapshot and does not survive helper restarts. Provider
+support for `compaction_trigger` is required; no local summary fallback is used.

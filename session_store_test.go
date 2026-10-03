@@ -393,3 +393,54 @@ func TestLoadOwnsForegroundUntilReplayCompletes(t *testing.T) {
 		})
 	}
 }
+
+func TestRestoreRefusesAnActiveNativeWriterBeforeHydration(t *testing.T) {
+	t.Parallel()
+	a, _, home, workspace := fixtureAgent(t)
+	created := fixtureSession(t, a, workspace)
+	completed := fixturePrompt(t, a, created.SessionId, "committed history")
+	_, err := a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	id := nativeID(t, completed.Meta)
+	path := rolloutPath(home, id)
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	lock, err := process.LockFile(filepath.Join(home, "nanocodex", "acp-locks", id+".writer.lock"))
+	require.NoError(t, err)
+	defer lock.Close()
+	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.Equal(t, wire.RestoreFailed(vendor), err)
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	require.NoError(t, lock.Close())
+	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.NoError(t, err)
+}
+
+func TestCheckpointMetadataMirrorsAndRehydratesWithoutAddingNativeRows(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a, _, home, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, a, workspace)
+	completed := fixturePrompt(t, a, created.SessionId, "saved history")
+	path := rolloutPath(home, nativeID(t, completed.Meta))
+	checkpoint := json.RawMessage(`{"preceding_bytes":123,"history_items":2,"head":{},"prefix":[]}`)
+	require.NoError(t, nanocodex.WriteCheckpoint(home, path, checkpoint))
+	_, err := a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.JSONEq(t, string(checkpoint), string(record.Checkpoint))
+	for _, row := range rows {
+		require.NotContains(t, string(row), "preceding_bytes")
+	}
+	require.NoError(t, os.Remove(path+".acp-checkpoint.json"))
+	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.NoError(t, err)
+	hydrated, err := nanocodex.ReadCheckpoint(home, path)
+	require.NoError(t, err)
+	require.JSONEq(t, string(checkpoint), string(hydrated))
+}

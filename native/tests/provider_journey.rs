@@ -143,6 +143,7 @@ enum Reply {
         error: Value,
     },
     HttpBody(Value),
+    NonSse(&'static str, &'static str),
     RawSse(Bytes),
     ErrorEvent {
         code: String,
@@ -282,6 +283,9 @@ async fn respond(
             })),
         )
             .into_response();
+    }
+    if let Reply::NonSse(content_type, body) = &reply {
+        return ([("content-type", *content_type)], *body).into_response();
     }
     if let Reply::HttpBody(body) = &reply {
         return (
@@ -440,6 +444,7 @@ async fn respond(
         Reply::Rejected
         | Reply::HttpError { .. }
         | Reply::HttpBody(_)
+        | Reply::NonSse(_, _)
         | Reply::RawSse(_)
         | Reply::ErrorEvent { .. }
         | Reply::Dropped
@@ -1088,11 +1093,16 @@ async fn dropped_gateway_connection_is_a_connection_error() {
 
 #[tokio::test]
 async fn oversized_gateway_event_fails_without_retaining_the_unbounded_stream() {
-    let provider = Provider::start([Reply::Oversized]).await;
+    let provider = Provider::start([
+        Reply::Oversized,
+        Reply::Text("usable after rejected event"),
+        Reply::Text("usable after restart"),
+    ])
+    .await;
     let workspace = TempDir::new().unwrap();
     let native_home = TempDir::new().unwrap();
     let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
-    helper
+    let initialized = helper
         .call(
             1,
             "initialize",
@@ -1103,7 +1113,16 @@ async fn oversized_gateway_event_fails_without_retaining_the_unbounded_stream() 
     let result = helper.reply(2).await;
     assert_eq!(result["error"]["code"], "transport_error");
     assert_eq!(result["error"]["message"], "invalid gateway event stream");
+    helper.call(3, "prompt", prompt("small valid prompt")).await;
+    helper.shutdown(4).await;
+    let mut config = initialize(&provider, "FIXTURE_API_KEY", "openai");
+    config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+    config["sessionId"] = initialized["nativeSessionId"].clone();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper.call(1, "initialize", config).await;
+    helper.call(2, "prompt", prompt("continue safely")).await;
     helper.shutdown(3).await;
+    assert_eq!(provider.requests().len(), 3);
 }
 
 #[tokio::test]
@@ -1638,4 +1657,64 @@ async fn gateway_permanent_error_categories_override_transient_codes_and_statuse
             assert_eq!(provider.requests().len(), 1);
         }
     }
+}
+
+#[tokio::test]
+async fn non_sse_success_is_never_retried() {
+    for (mime, body, code) in [
+        (
+            "application/json",
+            r#"{"id":"billed-generation","status":"completed","output":[]}"#,
+            "transport_error",
+        ),
+        ("text/html", "<html>proxy page</html>", "transport_error"),
+        (
+            "application/json",
+            r#"{"error":{"code":"invalid_api_key","message":"fixture-bearer-token"}}"#,
+            "native_error",
+        ),
+    ] {
+        let provider = Provider::start([Reply::NonSse(mime, body)]).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        helper
+            .call(
+                1,
+                "initialize",
+                initialize(&provider, "FIXTURE_API_KEY", "openai"),
+            )
+            .await;
+        helper.send(2, "prompt", prompt("one request only")).await;
+        let failed = helper.reply(2).await;
+        assert_eq!(failed["error"]["code"], code);
+        assert!(!failed.to_string().contains("fixture-bearer-token"));
+        helper.shutdown(3).await;
+        assert_eq!(provider.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn oversized_prompt_leaves_native_history_usable() {
+    let provider = Provider::start([Reply::Text("accepted after oversize")]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    let initialized = helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    helper
+        .send(2, "prompt", prompt(&"x".repeat(12 * 1024 * 1024)))
+        .await;
+    assert_eq!(helper.reply(2).await["error"]["code"], "invalid_request");
+    assert!(provider.requests().is_empty());
+    helper.call(3, "prompt", prompt("accepted input")).await;
+    helper.shutdown(4).await;
+    let rollout = std::fs::read_to_string(initialized["rolloutPath"].as_str().unwrap()).unwrap();
+    assert!(rollout.len() < 100_000);
+    assert!(rollout.contains("accepted after oversize"));
 }

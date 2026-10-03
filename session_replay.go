@@ -3,6 +3,7 @@ package nanocodexacp
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
@@ -38,6 +39,36 @@ func (s *session) replay(ctx context.Context) error {
 					if err := s.replayUserContent(ctx, part); err != nil {
 						return err
 					}
+				}
+			}
+		case "compacted":
+			var payload struct {
+				History []json.RawMessage `json:"replacement_history"` //nolint:tagliatelle // Native protocol field.
+			}
+			if err := json.Unmarshal(row.Payload, &payload); err != nil {
+				return wire.RestoreFailed(vendor)
+			}
+
+			start := len(payload.History)
+			for index, rawItem := range slices.Backward(payload.History) {
+				var item struct {
+					Type string `json:"type"`
+					Role string `json:"role"`
+				}
+				if err := json.Unmarshal(rawItem, &item); err != nil {
+					return wire.RestoreFailed(vendor)
+				}
+
+				if item.Type == "message" && item.Role == "user" {
+					start = index + 1
+
+					break
+				}
+			}
+
+			for _, item := range payload.History[start:] {
+				if err := s.replayResponseItem(ctx, item); err != nil {
+					return err
 				}
 			}
 		case "response_item":

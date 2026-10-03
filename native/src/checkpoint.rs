@@ -3,14 +3,14 @@ use nanocodex::{
     oai::responses::ResponseItem,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    path::Path,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
 };
 
-const RECORD_TYPE: &str = "acp_checkpoint";
+const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Deserialize, Serialize)]
 struct Checkpoint {
@@ -20,126 +20,125 @@ struct Checkpoint {
     prefix: Vec<ResponseItem>,
 }
 
-struct Tail {
-    record: Value,
-    start: u64,
-    end: u64,
-    terminated: bool,
+fn sidecar(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".acp-checkpoint.json");
+    name.into()
 }
 
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid native checkpoint")
 }
 
-fn tail(file: &mut File) -> io::Result<Tail> {
-    let end = file.metadata()?.len();
-    let limit = end.min(crate::MAX_FRAME_BYTES as u64 + 2);
-    let mut count = limit.min(8192);
-    loop {
-        file.seek(SeekFrom::End(-(count as i64)))?;
-        let mut bytes = vec![0; count as usize];
-        file.read_exact(&mut bytes)?;
-        let terminated = bytes.last() == Some(&b'\n');
-        if terminated {
-            bytes.pop();
-        }
-        let start = match bytes.iter().rposition(|byte| *byte == b'\n') {
-            Some(index) => index + 1,
-            None if count == end => 0,
-            None if count < limit => {
-                count = (count * 2).min(limit);
-                continue;
-            }
-            None => return Err(invalid()),
-        };
-        if bytes.len() - start > crate::MAX_FRAME_BYTES {
-            return Err(invalid());
-        }
-        return Ok(Tail {
-            record: serde_json::from_slice(&bytes[start..]).map_err(|_| invalid())?,
-            start: end - count + start as u64,
-            end,
-            terminated,
-        });
-    }
-}
-
 pub fn restore(path: &Path, snapshot: SessionSnapshot) -> io::Result<SessionSnapshot> {
     let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-    let tail = tail(&mut file)?;
-    let snapshot = if tail.record["type"] == RECORD_TYPE {
-        let checkpoint: Checkpoint =
-            serde_json::from_value(tail.record["payload"].clone()).map_err(|_| invalid())?;
-        let (original, history, _) = snapshot.into_context_parts();
-        if checkpoint.preceding_bytes != tail.start || checkpoint.history_items != history.len() {
-            return Err(invalid());
+    let mut end = file.metadata()?.len();
+    if end > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            end += 1;
         }
-        let original = serde_json::to_value(original).map_err(|_| invalid())?;
-        let restored = serde_json::to_value(&checkpoint.head).map_err(|_| invalid())?;
-        for field in [
-            "version",
-            "model",
-            "lineage_id",
-            "prompt_cache_key",
-            "workspace",
-        ] {
-            if original.get(field) != restored.get(field) {
-                return Err(invalid());
-            }
-        }
-        checkpoint
-            .head
-            .with_context(history, Some(checkpoint.prefix))
-    } else {
-        snapshot
-    };
-    if !tail.terminated {
-        append_bytes(&mut file, tail.end, b"\n")?;
     }
-    Ok(snapshot)
+    match restore_checkpoint(path, end, &snapshot) {
+        Ok(Some(restored)) => Ok(restored),
+        Ok(None) => Ok(snapshot),
+        Err(_) => {
+            eprintln!("native checkpoint ignored; restoring native history");
+            Ok(snapshot)
+        }
+    }
 }
 
-// The native writer must be shut down before this appends to its rollout.
-pub fn append(path: &Path, snapshot: SessionSnapshot) -> io::Result<()> {
+fn restore_checkpoint(
+    path: &Path,
+    end: u64,
+    snapshot: &SessionSnapshot,
+) -> io::Result<Option<SessionSnapshot>> {
+    let metadata = match std::fs::symlink_metadata(sidecar(path)) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_BYTES {
+        return Err(invalid());
+    }
+    let file = match File::open(sidecar(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_BYTES {
+        return Err(invalid());
+    }
+    let checkpoint: Checkpoint =
+        serde_json::from_reader(file.take(MAX_CHECKPOINT_BYTES + 1)).map_err(|_| invalid())?;
+    let (original, history, _) = snapshot.clone().into_context_parts();
+    if checkpoint.preceding_bytes != end || checkpoint.history_items != history.len() {
+        return Err(invalid());
+    }
+    let original = serde_json::to_value(original).map_err(|_| invalid())?;
+    let restored = serde_json::to_value(&checkpoint.head).map_err(|_| invalid())?;
+    for field in [
+        "version",
+        "model",
+        "lineage_id",
+        "prompt_cache_key",
+        "workspace",
+    ] {
+        if original.get(field) != restored.get(field) {
+            return Err(invalid());
+        }
+    }
+    let prefix = serde_json::to_value(&checkpoint.prefix).map_err(|_| invalid())?;
+    if checkpoint.prefix.len() != 2
+        || prefix[0]["type"] != "additional_tools"
+        || prefix[0]["role"] != "developer"
+        || prefix[1]["type"] != "message"
+        || prefix[1]["role"] != "developer"
+    {
+        return Err(invalid());
+    }
+    Ok(Some(
+        checkpoint
+            .head
+            .with_context(history, Some(checkpoint.prefix)),
+    ))
+}
+
+// The native writer must be shut down before capturing its final byte boundary.
+pub fn save(path: &Path, snapshot: SessionSnapshot) -> io::Result<()> {
     let (head, history, prefix) = snapshot.into_context_parts();
     let Some(prefix) = prefix else {
         return Ok(());
     };
-    let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-    let tail = tail(&mut file)?;
     let checkpoint = Checkpoint {
-        preceding_bytes: tail.end + u64::from(!tail.terminated),
+        preceding_bytes: path.metadata()?.len(),
         history_items: history.len(),
         head,
         prefix,
     };
-    let payload = serde_json::to_value(checkpoint).map_err(|_| invalid())?;
-    let timestamp = tail.record["timestamp"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(invalid)?;
-    let mut row = serde_json::to_vec(&json!({
-        "timestamp":timestamp,"type":RECORD_TYPE,"payload":payload,
-    }))
-    .map_err(|_| invalid())?;
-    if row.len() > crate::MAX_FRAME_BYTES {
+    let bytes = serde_json::to_vec(&checkpoint).map_err(|_| invalid())?;
+    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
         return Err(invalid());
     }
-    if !tail.terminated {
-        row.insert(0, b'\n');
-    }
-    row.push(b'\n');
-    append_bytes(&mut file, tail.end, &row)
-}
-
-fn append_bytes(file: &mut File, original_len: u64, bytes: &[u8]) -> io::Result<()> {
-    if file.metadata()?.len() != original_len {
-        return Err(invalid());
-    }
-    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        file.set_len(original_len)?;
+    let destination = sidecar(path);
+    let stage = destination.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&stage)?;
+        file.write_all(&bytes)?;
         file.sync_all()?;
-        return Err(error);
-    }
-    Ok(())
+        std::fs::rename(&stage, &destination)?;
+        File::open(destination.parent().ok_or_else(invalid)?)?.sync_all()
+    })();
+    let _ = std::fs::remove_file(stage);
+    result
 }

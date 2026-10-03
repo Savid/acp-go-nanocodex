@@ -312,7 +312,10 @@ func newProviderWithResponseMode(t *testing.T, shell bool, mode string) *provide
 			writeEvent(map[string]any{"type": "response.created", "response": map[string]any{"id": id, "status": "in_progress"}})
 		}
 
+		compacting := mode == "compaction" && strings.Contains(string(mustJSON(t, body["input"])), `"type":"compaction_trigger"`)
 		switch {
+		case compacting:
+			output = []map[string]any{{"type": "compaction", "id": "fixture-compaction", "encrypted_content": "opaque-compaction"}}
 		case mode == "view-image" && number == 1:
 			output = []map[string]any{{"type": "function_call", "call_id": "image-fixture", "name": "view_image", "arguments": `{"path":"fixture.png"}`}}
 		case mode == "idless-calls" && number == 1:
@@ -344,9 +347,13 @@ func newProviderWithResponseMode(t *testing.T, shell bool, mode string) *provide
 			output = append(output, message)
 		}
 
+		inputTokens, totalTokens := 12, 15
+		if mode == "compaction" && number == 1 {
+			inputTokens, totalTokens = 1_000_000, 1_000_003
+		}
 		writeEvent(map[string]any{"type": "response.completed", "response": map[string]any{
 			"id": id, "status": "completed", "output": output,
-			"usage": map[string]any{"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
+			"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 3, "total_tokens": totalTokens},
 		}})
 	}))
 	t.Cleanup(provider.server.Close)

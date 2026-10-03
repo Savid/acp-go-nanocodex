@@ -170,6 +170,11 @@ func (s *session) mapPrompt(ctx context.Context, blocks []acp.ContentBlock) ([]n
 		return nil, wire.Unsupported("prompt")
 	}
 
+	encoded, err := json.Marshal(map[string]any{"content": content})
+	if err != nil || len(encoded) > nanocodex.MaxPromptBytes {
+		return nil, acp.NewInvalidParams("prompt content exceeds 12 MiB")
+	}
+
 	return content, nil
 }
 

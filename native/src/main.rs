@@ -13,6 +13,8 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 
 use session::{Session, SessionError};
 
+const MAX_PROMPT_BYTES: usize = 12 * 1024 * 1024;
+
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Deserialize)]

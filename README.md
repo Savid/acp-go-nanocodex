@@ -75,7 +75,8 @@ func main() {
 version requires. `Serve` closes its agent when the connection or context
 ends. It accepts caller-supplied streams and does not take ownership of their
 underlying files.
-`NewAgent` exposes the ACP methods for direct integration.
+`NewAgent` exposes the ACP methods without an attached notification transport.
+Use `Serve` with caller-supplied streams to receive session updates and replay.
 
 ### Process options
 
@@ -171,24 +172,31 @@ rollout path, working directory, provider/model settings, accepted environment,
 title, and timestamp. `github.com/savid/acp-go-core` supplies the store types
 and atomic mirror operations.
 
-After a prompt, the helper stops the native writer and appends an available
-snapshot checkpoint to the rollout. It retains token accounting and the request
-prefix so the next helper can compact before its first model call. Conversation
-history remains in its native records. Restore uses a checkpoint only at the
-matching final file boundary; later native records supersede it.
+After a prompt, the helper stops the native writer and atomically saves the latest
+optional snapshot checkpoint in `<rollout>.acp-checkpoint.json`. The store mirrors
+it in `config.checkpoint`. It retains token accounting and the request prefix so
+the next helper can compact before its first model call. Conversation history
+remains in native records. Restore uses a checkpoint only when its byte boundary,
+history length, identity, and supported shape match; otherwise it rebuilds from
+native history. Checkpoint failures are diagnostic and do not fail a committed
+turn. Native history corruption still fails restore.
 
 The store is authoritative even when the default in-memory store is used.
 An adapter never adopts a native-only session that lacks a store entry.
 `session/load` restores state and replays messages, visible reasoning summaries,
-and function/custom tool calls with their text results. Multimodal tool results
-replay only their text parts. `session/resume` restores without replay.
+and function/custom tool calls with their text results, including new output in
+compacted replacement history. Items discarded by native mid-turn compaction
+before persistence cannot replay. Multimodal tool results replay only their text
+parts. `session/resume` restores without replay.
 A native file with additional rows
 is adopted only when its shared prefix agrees with the store. Divergence fails
 restore. Deletion tombstones the store and leaves native files intact.
 
 Native files live under `CODEX_HOME/sessions/`. The Go adapter holds the native
-UUID lock from before hydration until the helper has exited and been reaped. New, load, and resume responses and
-list entries expose that UUID in `_meta.nanocodex.nativeSessionId`, distinct
+UUID lock from before hydration until the helper has exited and been reaped.
+The helper holds a separate writer lock for its lifetime; hydration and stopped
+snapshots refuse an active writer even after an adapter crash. New, load, and
+resume responses and list entries expose that UUID in `_meta.nanocodex.nativeSessionId`, distinct
 from the ACP `sessionId`. After shutdown, use it as both `sessionId` and `resumeSessionId` in the
 [native helper protocol](native/PROTOCOL.md) to continue independently.
 
@@ -224,22 +232,31 @@ failures may carry one of these `class` values:
 ## Scope
 
 Configured API-key HTTPS gateways expose native function tools, including
-shell execution and file operations through the shell. Code Mode and freeform
-patch tools are excluded on those routes. Automatic compaction uses the native
-model's context threshold and sends a terminal `compaction_trigger` through
+shell execution and file operations through the shell. Freeform patch tools are
+excluded on those routes. Code Mode is disabled on every route. Automatic
+compaction uses the native model's context threshold and sends a terminal `compaction_trigger` through
 `/responses`; the provider must support that item and return an encrypted
 compaction item. The native rollout saves the compacted context for subsequent
 prompts and restoration. Failed or cancelled compaction preserves committed
-history.
+history. There is no local summary fallback for a refused trigger.
+Provider-reported context overflow retains its native error type, but the native forced-compaction
+flag is not retained across helper restarts.
 
 Gateway requests retry transient connection failures, rate limits, and service
 errors up to five total attempts with exponential backoff and jitter. Retries
 stop after assistant or reasoning output is delivered. Valid `Retry-After`
-delays up to 60 seconds are respected; longer delays fail without retrying
-early. Cancellation interrupts requests and retry delays. Native default and
-WebSocket routes retain upstream transport behavior.
+and `retry-after-ms` delays up to 60 seconds are respected with the normal
+backoff as a minimum; longer delays fail without retrying early. Redacted retry
+attempts and delays go to helper stderr. Cancellation interrupts requests and
+retry delays. Native default and WebSocket routes retain upstream transport
+behavior.
 Shell sessions and other in-memory tool state last for one prompt; subsequent
 prompts resume the saved conversation in a new helper.
+Prompt parameters are limited to 12 MiB of encoded JSON before admission.
+Gateway responses require `text/event-stream`; each event and the accumulated
+event data for one response are limited to 4 MiB. These limits leave room for
+native event envelopes. Compacted native rows can contain an entire history and
+are not limited to the helper's 32 MiB protocol frame size.
 Image tool outputs are not projected as ACP images.
 
 ## Releases

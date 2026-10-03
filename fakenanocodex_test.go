@@ -174,6 +174,9 @@ func (f *fakeNative) initialize(req fakeRequest) error {
 	if err := f.refresh(); err != nil {
 		return err
 	}
+	if params.ResumeSessionID != "" && replaced == "" && os.Getenv("NANOCODEX_TEST_RESUME_PATH_DRIFT") == "1" {
+		f.state.RolloutPath = filepath.Join(home, "sessions", "decoy-"+id+".jsonl")
+	}
 	if path := os.Getenv("NANOCODEX_TEST_CAPTURE"); path != "" {
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {

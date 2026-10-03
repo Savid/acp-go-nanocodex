@@ -3,6 +3,7 @@ package nanocodexacp
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -31,36 +32,38 @@ type runtime struct {
 }
 
 type sessionBinding struct {
-	state   nanocodex.State
-	options NanocodexOptions
-	rows    [][]byte
-	started bool
+	checkpoint json.RawMessage
+	state      nanocodex.State
+	options    NanocodexOptions
+	rows       [][]byte
+	started    bool
 }
 
 type session struct {
-	agent     *Agent
-	id        acp.SessionId
-	cwd       string
-	ephemeral bool
-	gate      chan struct{}
-	mu        sync.Mutex
-	closing   bool
-	closed    chan struct{}
-	closeOnce sync.Once
-	closeErr  error
-	poisoned  bool
-	options   NanocodexOptions
-	state     nanocodex.State
-	binding   *sessionBinding
-	home      string
-	title     string
-	updatedAt int64
-	started   bool
-	rows      [][]byte
-	rt        *runtime
-	turn      *turn
-	lc        lifecycle.Publisher
-	raw       *wire.RawEvents
+	checkpoint json.RawMessage
+	agent      *Agent
+	id         acp.SessionId
+	cwd        string
+	ephemeral  bool
+	gate       chan struct{}
+	mu         sync.Mutex
+	closing    bool
+	closed     chan struct{}
+	closeOnce  sync.Once
+	closeErr   error
+	poisoned   bool
+	options    NanocodexOptions
+	state      nanocodex.State
+	binding    *sessionBinding
+	home       string
+	title      string
+	updatedAt  int64
+	started    bool
+	rows       [][]byte
+	rt         *runtime
+	turn       *turn
+	lc         lifecycle.Publisher
+	raw        *wire.RawEvents
 }
 
 func (a *Agent) environment(options NanocodexOptions) process.Environment {
@@ -136,7 +139,7 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 			return nil, wire.RestoreFailed(vendor)
 		}
 
-		if hydrateErr := s.hydrate(storedSession{rows: s.rows, record: sessionRecord{NativeSessionID: s.state.NativeSessionID, RolloutRelative: rel, Title: s.title, UpdatedAtUnixMilli: s.updatedAt}}); hydrateErr != nil {
+		if hydrateErr := s.hydrate(storedSession{rows: s.rows, record: sessionRecord{NativeSessionID: s.state.NativeSessionID, RolloutRelative: rel, Checkpoint: s.checkpoint, Title: s.title, UpdatedAtUnixMilli: s.updatedAt}}); hydrateErr != nil {
 			return nil, hydrateErr
 		}
 	}
@@ -270,12 +273,26 @@ func (rt *runtime) stop() error {
 	closeErr := rt.proc.Close()
 	<-rt.client.Done()
 
-	var lockErr error
-	for _, lock := range rt.locks {
-		lockErr = errors.Join(lockErr, lock.Close())
+	releaseLocks := func() error {
+		var lockErr error
+		for _, lock := range rt.locks {
+			lockErr = errors.Join(lockErr, lock.Close())
+		}
+
+		rt.locksReleased.Store(true)
+
+		return lockErr
 	}
 
-	rt.locksReleased.Store(true)
+	var lockErr error
+
+	select {
+	case <-rt.proc.Done():
+		lockErr = releaseLocks()
+	default:
+		go func() { <-rt.proc.Done(); _ = releaseLocks() }()
+	}
+
 	rt.cleanupErr = errors.Join(shutdownErr, closeErr, lockErr)
 
 	return errors.Join(callErr, rt.cleanupErr)
@@ -297,6 +314,12 @@ func (s *session) applyState(state nanocodex.State) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.state.NativeSessionID == state.NativeSessionID && s.state.RolloutPath != "" && s.state.RolloutPath != state.RolloutPath {
+		s.poisoned = true
+
+		return wire.SessionPoisoned(vendor, "native_session_identity_drift")
+	}
+
 	if s.state.NativeSessionID != "" && s.state.NativeSessionID != state.NativeSessionID {
 		if s.started || !nanocodex.EmptyRows(s.rows) || state.ReplacedNativeSessionID != s.state.NativeSessionID {
 			s.poisoned = true
@@ -304,7 +327,7 @@ func (s *session) applyState(state nanocodex.State) error {
 			return wire.SessionPoisoned(vendor, "native_session_identity_drift")
 		}
 
-		s.binding = &sessionBinding{state: s.state, options: s.options.clone(), rows: s.rows, started: s.started}
+		s.binding = &sessionBinding{checkpoint: s.checkpoint, state: s.state, options: s.options.clone(), rows: s.rows, started: s.started}
 	}
 
 	s.state = state
@@ -343,6 +366,7 @@ func (s *session) rollbackBinding() {
 		s.state = binding.state
 		s.options = binding.options
 		s.rows = binding.rows
+		s.checkpoint = binding.checkpoint
 		s.started = binding.started
 		s.binding = nil
 	}

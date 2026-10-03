@@ -30,6 +30,8 @@ use std::{
 pub struct SessionError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
+    #[serde(skip)]
+    source: Option<std::sync::Arc<nanocodex::oai::transport::ResponsesError>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,6 +46,7 @@ impl SessionError {
             code,
             message,
             status_code: None,
+            source: None,
             provider_code: None,
             field: None,
         }
@@ -196,7 +199,38 @@ impl fmt::Display for SessionError {
         f.write_str(self.message)
     }
 }
-impl Error for SessionError {}
+impl Error for SessionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|error| error as &(dyn Error + 'static))
+    }
+}
+
+impl SessionError {
+    pub fn with_provider_source(mut self) -> Self {
+        use nanocodex::oai::transport::ResponsesError;
+        let event = json!({"error":{"code":self.provider_code}}).to_string();
+        self.source = match self.provider_code.as_deref() {
+            Some("context_length_exceeded" | "context_window_exceeded") => {
+                Some(std::sync::Arc::new(ResponsesError::ContextWindowExceeded {
+                    event,
+                }))
+            }
+            Some(
+                "invalid_image"
+                | "image_too_large"
+                | "image_too_small"
+                | "unsupported_image_format"
+                | "image_not_found",
+            ) => Some(std::sync::Arc::new(ResponsesError::InvalidImageRequest {
+                event,
+            })),
+            _ => None,
+        };
+        self
+    }
+}
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -228,6 +262,7 @@ pub struct Session {
     text_events: bool,
     replaced_native_session_id: Option<String>,
     prompted: bool,
+    _writer_locks: Vec<File>,
 }
 
 fn context_window(model: Model) -> u64 {
@@ -330,6 +365,36 @@ fn endpoint(value: &str, websocket: bool, field: &'static str) -> Result<(), Ses
     Ok(())
 }
 
+fn writer_locks(home: &Path, config: &Config) -> Result<Vec<File>, SessionError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = home.join("nanocodex/acp-locks");
+    std::fs::create_dir_all(&directory).map_err(|_| SessionError::persistence())?;
+    let mut locks = Vec::new();
+    let mut identities = vec![config.session_id.as_str()];
+    if let Some(id) = config.resume_session_id.as_deref()
+        && id != config.session_id
+    {
+        identities.push(id);
+    }
+    for id in identities {
+        if !uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id) {
+            return Err(SessionError::invalid_config());
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(directory.join(format!("{id}.writer.lock")))
+            .map_err(|_| SessionError::persistence())?;
+        file.try_lock()
+            .map_err(|_| SessionError::restore("native rollout writer is active"))?;
+        locks.push(file);
+    }
+    Ok(locks)
+}
+
 impl Session {
     pub async fn open(params: Value) -> Result<Self, SessionError> {
         let mut config: Config =
@@ -346,6 +411,7 @@ impl Session {
             .or_else(|| env_value("NANOCODEX_API_KEY_ENV"));
         let workspace = env::current_dir().map_err(|_| SessionError::invalid_config())?;
         let home = native_home(&workspace)?;
+        let writer_locks = writer_locks(&home, &config)?;
         let mut model = config
             .model
             .as_deref()
@@ -538,6 +604,7 @@ impl Session {
             text_events,
             replaced_native_session_id,
             prompted: false,
+            _writer_locks: writer_locks,
         })
     }
 
@@ -570,6 +637,16 @@ impl Session {
     }
 
     pub async fn prompt(&mut self, params: Value) -> Result<Turn, SessionError> {
+        if serde_json::to_vec(&params)
+            .map_err(|_| SessionError::invalid_request())?
+            .len()
+            > crate::MAX_PROMPT_BYTES
+        {
+            return Err(SessionError::new(
+                "invalid_request",
+                "prompt content exceeds 12 MiB",
+            ));
+        }
         let params: PromptParams =
             serde_json::from_value(params).map_err(|_| SessionError::invalid_request())?;
         if params
@@ -611,16 +688,26 @@ impl Session {
             .await
             .map_err(|_| SessionError::persistence())?;
         match snapshot {
-            Some(Ok(snapshot)) => checkpoint::append(
-                self.agent
-                    .rollout()
-                    .expect("rollout recording enabled")
-                    .path(),
-                snapshot,
-            )
-            .map_err(|_| SessionError::persistence()),
-            None | Some(Err(NanocodexError::ForkBeforeCompletedTurn)) => Ok(()),
-            Some(Err(_)) => Err(SessionError::persistence()),
+            Some(Ok(snapshot)) => {
+                if checkpoint::save(
+                    self.agent
+                        .rollout()
+                        .expect("rollout recording enabled")
+                        .path(),
+                    snapshot,
+                )
+                .is_err()
+                {
+                    eprintln!(
+                        "native checkpoint could not be saved; native history remains committed"
+                    );
+                }
+            }
+            None | Some(Err(NanocodexError::ForkBeforeCompletedTurn)) => {}
+            Some(Err(_)) => {
+                eprintln!("native checkpoint unavailable; native history remains committed")
+            }
         }
+        Ok(())
     }
 }

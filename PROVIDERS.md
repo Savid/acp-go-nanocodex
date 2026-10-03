@@ -117,9 +117,17 @@ account.
 - Custom API-key HTTP endpoints receive standard Responses requests with
   direct `exec_command`, `write_stdin`, `update_plan`, and `view_image`
   function tools. Shell commands can read and edit workspace files.
-- Code Mode, the freeform `apply_patch` tool, provider web search, image
-  generation, gateway remote compaction, and automatic gateway retries are
-  unavailable. Unsupported gateway input or output fails the turn.
+- Gateway compaction requires `/responses` to accept `compaction_trigger` and
+  return one encrypted compaction item. This applies independently to the
+  selected OpenRouter provider, OMP backend, and OpenCode Go route. Response
+  streaming alone does not establish compaction support. A refused trigger
+  preserves history but prevents continuation past the automatic threshold;
+  there is no local summary fallback. Encrypted content is opaque to the adapter.
+- Transient gateway failures retry up to five attempts before output is delivered.
+  See [retry and persistence behavior](README.md#scope).
+- Code Mode is disabled on every route. The freeform `apply_patch` tool is
+  excluded on gateways; provider web search and image generation are disabled.
+  Unsupported gateway input or output fails the turn.
 - Native OpenAI/ChatGPT routes retain Nanocodex's own transport. Custom gateway
   routing requires API-key authentication and HTTPS mode. Plain HTTP and
   WebSocket endpoints are accepted only on `localhost` or loopback IPs.

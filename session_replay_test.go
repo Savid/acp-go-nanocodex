@@ -1,6 +1,7 @@
 package nanocodexacp
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"testing"
@@ -126,4 +127,40 @@ func appendReplayItems(t *testing.T, path string, items []any) {
 		require.NoError(t, encoder.Encode(map[string]any{"timestamp": "2026-10-02T03:00:00Z", "type": "response_item", "payload": item}))
 	}
 	require.NoError(t, file.Sync())
+}
+
+func TestReplayCompactedTurnProjectsOnlyNewVisibleItems(t *testing.T) {
+	t.Parallel()
+	a, client, _, _ := fixtureAgent(t)
+	data, err := os.ReadFile("testdata/compacted-replay.jsonl")
+	require.NoError(t, err)
+	s := session{agent: a, rows: bytes.Split(bytes.TrimSpace(data), []byte{'\n'})}
+	require.NoError(t, s.replay(t.Context()))
+	notifications, frames := client.snapshot()
+	var users, thoughts []string
+	var tools, results int
+	for _, notification := range notifications {
+		update := notification.Update
+		if update.UserMessageChunk != nil {
+			users = append(users, update.UserMessageChunk.Content.Text.Text)
+		}
+		if update.AgentThoughtChunk != nil {
+			thoughts = append(thoughts, update.AgentThoughtChunk.Content.Text.Text)
+		}
+		if update.ToolCall != nil {
+			tools++
+		}
+		if update.ToolCallUpdate != nil {
+			results++
+		}
+	}
+	require.Equal(t, []string{"first user", "second user"}, users)
+	require.Equal(t, "first answersecond answer", client.text())
+	require.Equal(t, []string{"visible thought"}, thoughts)
+	require.Equal(t, 1, tools)
+	require.Equal(t, 1, results)
+	for _, frame := range frames {
+		require.NotContains(t, string(frame), "private instructions")
+		require.NotContains(t, string(frame), "opaque-summary")
+	}
 }

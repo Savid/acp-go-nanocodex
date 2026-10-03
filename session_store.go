@@ -2,6 +2,7 @@ package nanocodexacp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 )
 
 type sessionRecord struct {
+	Checkpoint         json.RawMessage  `json:"checkpoint,omitempty"`
 	SessionID          string           `json:"sessionId"`
 	NativeSessionID    string           `json:"nativeSessionId"`
 	Cwd                string           `json:"cwd"`
@@ -76,6 +78,14 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 		defer lock.Close()
 	}
 
+	if limit < 0 {
+		lock, lockErr := process.LockFile(filepath.Join(home, "nanocodex", "acp-locks", state.NativeSessionID+".writer.lock"))
+		if lockErr != nil {
+			return lockErr
+		}
+		defer lock.Close()
+	}
+
 	rows, err := nanocodex.ReadRows(home, state.RolloutPath, limit)
 	if err != nil {
 		return err
@@ -103,7 +113,12 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 	updated := time.Now().UnixMilli()
 	started := !nanocodex.EmptyRows(rows)
 
-	record := sessionRecord{SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: options, Title: title, Started: started, UpdatedAtUnixMilli: updated}
+	checkpoint, checkpointErr := nanocodex.ReadCheckpoint(home, state.RolloutPath)
+	if checkpointErr != nil {
+		s.agent.log.WarnContext(ctx, "native checkpoint unavailable; mirroring native history")
+	}
+
+	record := sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: options, Title: title, Started: started, UpdatedAtUnixMilli: updated}
 	if !s.ephemeral {
 		storeCtx, finish := s.agent.observe.StartSessionStore(ctx, "replace")
 		err = sessionlog.Commit(storeCtx, s.agent.store, string(s.id), rows, record)
@@ -116,6 +131,7 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 
 	s.mu.Lock()
 	s.rows = rows
+	s.checkpoint = checkpoint
 	s.binding = nil
 	s.started = started
 	s.updatedAt = updated
@@ -188,6 +204,12 @@ func (s *session) hydrate(stored storedSession) error {
 		return wire.RestoreFailed(vendor)
 	}
 
+	lock, err := process.LockFile(filepath.Join(s.home, "nanocodex", "acp-locks", stored.record.NativeSessionID+".writer.lock"))
+	if err != nil {
+		return wire.RestoreFailed(vendor)
+	}
+	defer lock.Close()
+
 	native, err := nanocodex.ReadRows(s.home, path, -1)
 	if err != nil {
 		return wire.RestoreFailed(vendor)
@@ -222,9 +244,20 @@ func (s *session) hydrate(stored storedSession) error {
 		}
 	}
 
+	checkpoint := stored.record.Checkpoint
+	if nativeWins && len(rows) > len(stored.rows) {
+		checkpoint, _ = nanocodex.ReadCheckpoint(s.home, path)
+	} else {
+		if err := nanocodex.WriteCheckpoint(s.home, path, checkpoint); err != nil {
+			s.agent.log.Warn("native checkpoint unavailable; restoring native history")
+		}
+	}
+
 	s.mu.Lock()
 	s.state.NativeSessionID = stored.record.NativeSessionID
 	s.state.RolloutPath = path
+
+	s.checkpoint = checkpoint
 	s.rows = rows
 	s.started = !nanocodex.EmptyRows(rows)
 	s.title = stored.record.Title
@@ -346,6 +379,7 @@ func (a *Agent) restore(ctx context.Context, id acp.SessionId, cwd string, dirs 
 
 	s.state = nanocodex.State{NativeSessionID: stored.record.NativeSessionID, RolloutPath: filepath.Join(s.home, stored.record.RolloutRelative)}
 	s.rows = stored.rows
+	s.checkpoint = stored.record.Checkpoint
 	s.started = stored.record.Started
 	s.title = stored.record.Title
 	s.updatedAt = stored.record.UpdatedAtUnixMilli
@@ -359,12 +393,12 @@ func (a *Agent) restore(ctx context.Context, id acp.SessionId, cwd string, dirs 
 	}
 
 	response := &acp.LoadSessionResponse{Meta: wire.NativeSessionMeta(vendor, s.state.NativeSessionID), ConfigOptions: s.configOptions()}
-	s.gate <- struct{}{}
+	releaseReplay := wire.HoldSessionGate(s.gate)
 
 	var replayErr error
 
 	defer func() {
-		<-s.gate
+		releaseReplay()
 
 		if replayErr != nil {
 			_ = s.close()
