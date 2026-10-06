@@ -11,6 +11,7 @@ use std::{collections::HashSet, io};
 use tokio::io::{AsyncWriteExt, BufWriter, Stdout};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
+use gateway::GatewayEvent;
 use session::{Session, SessionError};
 
 const MAX_PROMPT_BYTES: usize = 12 * 1024 * 1024;
@@ -65,6 +66,23 @@ impl Server {
         .await
     }
 
+    async fn gateway_write(&mut self, id: u64, event: GatewayEvent) -> io::Result<()> {
+        self.write(json!({"event":event.event,"requestId":id,"data":event.data}))
+            .await
+    }
+
+    /// Writes every pending gateway event under the request whose work caused it.
+    async fn gateway_drain(&mut self, id: u64) -> io::Result<()> {
+        loop {
+            let event = self
+                .session
+                .as_mut()
+                .and_then(|session| session.gateway_events.try_recv().ok());
+            let Some(event) = event else { return Ok(()) };
+            self.gateway_write(id, event).await?;
+        }
+    }
+
     async fn native_event(
         &mut self,
         id: u64,
@@ -74,20 +92,13 @@ impl Server {
         if matches!(
             data.kind,
             AgentEventKind::ModelCallCompleted
+                | AgentEventKind::ModelCallFailed
                 | AgentEventKind::ToolCall
                 | AgentEventKind::AssistantMessage
                 | AgentEventKind::RunCompleted
                 | AgentEventKind::RunFailed
         ) {
-            loop {
-                let event = self
-                    .session
-                    .as_mut()
-                    .and_then(|session| session.gateway_events.try_recv().ok());
-                let Some(event) = event else { break };
-                self.write(json!({"event":event.event,"requestId":id,"data":event.data}))
-                    .await?;
-            }
+            self.gateway_drain(id).await?;
         }
         let mut value = serde_json::to_value(&data)?;
         if matches!(
@@ -137,15 +148,7 @@ impl Server {
             let Some(event) = event else { break };
             self.native_event(active.id, event.event).await?;
         }
-        loop {
-            let event = self
-                .session
-                .as_mut()
-                .and_then(|session| session.gateway_events.try_recv().ok());
-            let Some(event) = event else { break };
-            self.write(json!({"event":event.event,"requestId":active.id,"data":event.data}))
-                .await?;
-        }
+        self.gateway_drain(active.id).await?;
         let session = self.session.as_mut().expect("active turn owns a session");
         let flushed = session.agent.flush_rollout().await;
         let response = match flushed {
@@ -226,6 +229,9 @@ impl Server {
                 if self.active.is_some() {
                     Err(SessionError::busy())
                 } else if let Some(session) = &mut self.session {
+                    // Nothing reads the gateway channel while a compaction runs
+                    // before acceptance, so the events it produces must stay well
+                    // below the channel capacity.
                     match session.prompt(request.params).await {
                         Ok(turn) => {
                             self.write(json!({"event":"accepted", "requestId":request.id,
@@ -238,7 +244,11 @@ impl Server {
                             });
                             return Ok(true);
                         }
-                        Err(error) => Err(error),
+                        Err(error) => {
+                            // Compaction before acceptance may have billed summary calls.
+                            self.gateway_drain(request.id).await?;
+                            Err(error)
+                        }
                     }
                 } else {
                     Err(SessionError::not_initialized())
@@ -311,7 +321,7 @@ impl Server {
                 }, if gateway_active => {
                     if let Some(event) = event {
                         let id = self.active.as_ref().expect("active gateway stream").id;
-                        self.write(json!({"event":event.event,"requestId":id,"data":event.data})).await?;
+                        self.gateway_write(id, event).await?;
                     }
                 }
                 line = input.next() => {

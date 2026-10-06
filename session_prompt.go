@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 
@@ -204,7 +205,19 @@ func (s *session) runPrompt(ctx context.Context, p acp.PromptRequest, content []
 		invariantErr error
 	)
 
-	err = rt.client.Call(ctx, "prompt", map[string]any{"content": content}, &result, func(frame nanocodex.Frame) error { return s.promptEvent(ctx, t, frame) })
+	var eventErr error
+
+	err = rt.client.Call(ctx, "prompt", map[string]any{"content": content}, &result, func(frame nanocodex.Frame) error {
+		eventErr = s.promptEvent(ctx, t, frame)
+
+		return eventErr
+	})
+	if eventErr != nil {
+		// A cancellation replaces this error in the prompt response, so the log
+		// is the only trace of a rejected frame such as a dropped charge.
+		s.agent.log.WarnContext(ctx, "native prompt event rejected", slog.Any("error", eventErr))
+	}
+
 	if err == nil {
 		invariantErr = s.applyPromptResult(t, result)
 		err = invariantErr
@@ -314,6 +327,11 @@ func (s *session) applyPromptResult(t *turn, result nanocodex.Result) error {
 }
 
 func (s *session) promptEvent(ctx context.Context, t *turn, frame nanocodex.Frame) error {
+	// A billed call counts even when it precedes acceptance or follows a cancel.
+	if frame.Event == "call_cost" {
+		return s.callCost(ctx, frame.Data)
+	}
+
 	if frame.Event == "accepted" {
 		if !t.accepted.CompareAndSwap(false, true) {
 			return errors.New("duplicate native acceptance")

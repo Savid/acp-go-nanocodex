@@ -60,6 +60,19 @@ has a 4 MiB bound. Successful HTTP responses require `text/event-stream`.
 Non-SSE success responses fail without retrying. Incomplete events never reach
 native tools.
 
+Each terminal gateway event, including `response.incomplete` and
+`response.failed`, whose `response.usage.cost` is a non-negative number
+produces a `call_cost` event with `data: {cost}`: the provider's USD charge for
+that response, with `-0.0` sent as `0`. Usage whose `is_byok` is `true`
+produces none. Other usage fields, including `estimated_cost`, are ignored.
+Generation and compaction summary responses report alike, including attempts
+that are retried and summaries the helper rejects. A call's `call_cost`
+precedes its native `model.call.completed`, and every `call_cost` precedes the
+reply of the prompt whose work produced it. Compaction that runs before
+`accepted` delivers its `call_cost` events after `accepted`, or before the
+prompt's error reply when the prompt is not accepted. Native routes produce no
+`call_cost`.
+
 Gateway compaction uses the native automatic threshold and builds a local
 summary; gateway requests never carry `compaction_trigger`. The summary request
 repeats the generation request body and history with `tool_choice:"none"` and

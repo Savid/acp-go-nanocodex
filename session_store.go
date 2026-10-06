@@ -26,6 +26,7 @@ type sessionRecord struct {
 	Title              string           `json:"title,omitempty"`
 	Started            bool             `json:"started"`
 	UpdatedAtUnixMilli int64            `json:"updatedAtUnixMilli"`
+	CostUSD            *float64         `json:"costUsd,omitempty"`
 }
 
 type storedSession struct {
@@ -42,6 +43,12 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 	binding := s.binding
 	options := s.options.clone()
 	title := s.title
+
+	var cost *float64
+	if s.cost != nil {
+		cost = new(*s.cost)
+	}
+
 	rt := s.rt
 	s.mu.Unlock()
 
@@ -118,7 +125,7 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 		s.agent.log.WarnContext(ctx, "native checkpoint unavailable; mirroring native history")
 	}
 
-	record := sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: options, Title: title, Started: started, UpdatedAtUnixMilli: updated}
+	record := sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: options, Title: title, Started: started, UpdatedAtUnixMilli: updated, CostUSD: cost}
 	if !s.ephemeral {
 		storeCtx, finish := s.agent.observe.StartSessionStore(ctx, "replace")
 		err = sessionlog.Commit(storeCtx, s.agent.store, string(s.id), rows, record)
@@ -176,6 +183,10 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 	}
 
 	if record.SessionID != string(id) || !nanocodex.ValidSessionID(record.NativeSessionID) || !filepath.IsAbs(record.Cwd) || record.UpdatedAtUnixMilli <= 0 || !filepath.IsLocal(record.RolloutRelative) {
+		return storedSession{}, errInvalidStoredSession
+	}
+
+	if cost := record.CostUSD; cost != nil && *cost < 0 {
 		return storedSession{}, errInvalidStoredSession
 	}
 
@@ -389,6 +400,7 @@ func (a *Agent) restore(ctx context.Context, id acp.SessionId, cwd string, dirs 
 	s.started = stored.record.Started
 	s.title = stored.record.Title
 	s.updatedAt = stored.record.UpdatedAtUnixMilli
+	s.cost = stored.record.CostUSD
 
 	if err = s.observeNative(ctx); err != nil {
 		return nil, nativeLaunchError(err, parsed.present)

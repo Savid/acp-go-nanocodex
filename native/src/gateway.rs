@@ -297,6 +297,13 @@ fn public_input(request: &ResponsesAttempt) -> Result<(Vec<Value>, Vec<Value>), 
 }
 
 impl GatewayRoute {
+    async fn send(&self, event: &'static str, data: Value) -> Result<(), ResponseError> {
+        self.events
+            .send(GatewayEvent { event, data })
+            .await
+            .map_err(|_| failure("provider event consumer closed"))
+    }
+
     async fn emit(
         &self,
         event: &'static str,
@@ -308,10 +315,16 @@ impl GatewayRoute {
         if let Some(id) = response_id {
             data["responseId"] = json!(id);
         }
-        self.events
-            .send(GatewayEvent { event, data })
-            .await
-            .map_err(|_| failure("provider event consumer closed"))
+        self.send(event, data).await
+    }
+
+    /// Reports the provider's charge for a terminal response, whatever its
+    /// status, because the provider bills a response the helper later rejects.
+    async fn charge(&self, response: &Value) -> Result<(), ResponseError> {
+        match reported_cost(response) {
+            Some(cost) => self.send("call_cost", json!({"cost":cost})).await,
+            None => Ok(()),
+        }
     }
 
     async fn execute(
@@ -569,6 +582,7 @@ impl GatewayRoute {
                     done_items.insert(index, item);
                 }
                 Some("response.completed") => {
+                    self.charge(&event["response"]).await?;
                     let mut response = event["response"].clone();
                     if response["output"].as_array().is_none_or(Vec::is_empty) {
                         if done_items.keys().copied().ne(0..done_items.len()) {
@@ -619,9 +633,11 @@ impl GatewayRoute {
                     return Ok((ResponsesOutput::Generation(output), committed_output));
                 }
                 Some("response.incomplete") if compacting => {
+                    self.charge(&event["response"]).await?;
                     return Err(summary_failure(SUMMARY_TRUNCATED).into());
                 }
                 Some("response.failed" | "response.incomplete" | "response.error" | "error") => {
+                    self.charge(&event["response"]).await?;
                     return Err(Failure::event(&event));
                 }
                 _ => {}
@@ -660,6 +676,20 @@ impl GatewayRoute {
 
 fn elapsed(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The USD charge a response's usage reports. A call with `is_byok: true`
+/// reports only the gateway fee, not the call's charge.
+fn reported_cost(response: &Value) -> Option<f64> {
+    let usage = &response["usage"];
+    if usage["is_byok"] == true {
+        return None;
+    }
+    // Adding zero turns a reported -0.0 into 0.0.
+    usage["cost"]
+        .as_f64()
+        .filter(|cost| *cost >= 0.0)
+        .map(|cost| cost + 0.0)
 }
 
 fn generation_output(

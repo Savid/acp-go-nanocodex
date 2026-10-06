@@ -164,13 +164,23 @@ cancels the native turn. The prompt response waits for native cleanup, the
 store commit, and final lifecycle publication. Cancelling a handler context
 does not release turn ownership or cancel native work.
 
+Each completed generation call that reports usage publishes one
+`usage_update`. `cost` is the session's cumulative USD sum of the `usage.cost`
+charges gateway responses report. Native routes, BYOK calls, and calls without
+a reported charge add nothing, so it may understate the session's charge.
+`cost` is absent until the first priced call and survives load and resume.
+Charges reported after a prompt's last `usage_update` (compaction summaries,
+retried or rejected responses, or calls during a cancelled or failed prompt)
+first appear on the next one.
+
 ## Persistence
 
 `SessionStoreFormat` is `nanocodex-rollout-jsonl-v1`. The main subpath contains
 raw native rollout rows; `config` contains the ACP/native identities, relative
 rollout path, working directory, provider/model settings, accepted environment,
-title, and timestamp. `github.com/savid/acp-go-core` supplies the store types
-and atomic mirror operations.
+title, timestamp, and the cumulative cost once a call is priced.
+`github.com/savid/acp-go-core` supplies the store types and atomic mirror
+operations.
 
 After a prompt, the helper stops the native writer and atomically saves the latest
 optional snapshot checkpoint in `<rollout>.acp-checkpoint.json`. The store mirrors

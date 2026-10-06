@@ -201,6 +201,11 @@ impl Provider {
     }
 }
 
+/// The charge the fixture reports for its numbered response.
+fn cost(number: usize) -> f64 {
+    f64::from(u32::try_from(number).expect("response number")) / 8.0
+}
+
 fn sse(event: Value) -> String {
     format!("data: {event}\n\n")
 }
@@ -259,9 +264,10 @@ async fn respond(
             .into_response();
     }
     if let Reply::FailedEvent(error) = &reply {
-        let failed = sse(
-            json!({"type":"response.failed","response":{"id":id,"status":"failed","error":error}}),
-        );
+        let failed = sse(json!({"type":"response.failed","response":{
+            "id":id,"status":"failed","error":error,
+            "usage":{"input_tokens":12,"output_tokens":0,"total_tokens":12,"cost":cost(number)}
+        }}));
         return (
             [("content-type", "text/event-stream")],
             [created, failed].concat(),
@@ -326,7 +332,8 @@ async fn respond(
                     events.push(sse(json!({
                         "type":"response.incomplete","response":{
                             "id":id,"status":"incomplete","output":output,
-                            "incomplete_details":{"reason":"max_output_tokens"}
+                            "incomplete_details":{"reason":"max_output_tokens"},
+                            "usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15,"cost":cost(number)}
                         }
                     })));
                     return ([("content-type", "text/event-stream")], events.concat())
@@ -345,7 +352,7 @@ async fn respond(
     events.push(sse(json!({
         "type":"response.completed","response":{
             "id":id,"status":status,"output":output,
-            "usage":{"input_tokens":total_tokens - 3,"output_tokens":3,"total_tokens":total_tokens}
+            "usage":{"input_tokens":total_tokens - 3,"output_tokens":3,"total_tokens":total_tokens,"cost":cost(number)}
         }
     })));
     ([("content-type", "text/event-stream")], events.concat()).into_response()
@@ -360,6 +367,14 @@ fn config(provider: &Provider) -> Value {
 
 fn prompt(text: &str) -> Value {
     json!({"content":[{"type":"text","text":text}]})
+}
+
+fn call_costs(events: &[Value]) -> Vec<f64> {
+    events
+        .iter()
+        .filter(|event| event["event"] == "call_cost")
+        .map(|event| event["data"]["cost"].as_f64().expect("call cost"))
+        .collect()
 }
 
 fn input_items(request: &Value, kind: &str) -> Vec<Value> {
@@ -520,6 +535,7 @@ async fn automatic_compaction_replays_reduced_history_after_restart() {
             .await;
         assert_eq!(completed["finalMessage"], "continued after compaction");
         assert_eq!(completed["usage"]["totalTokens"], 30);
+        assert_eq!(call_costs(&helper.events), [cost(2), cost(3)]);
         assert!(
             helper
                 .events
@@ -731,10 +747,17 @@ async fn failed_or_invalid_summary_preserves_history_for_restart() {
         helper
             .call(2, "prompt", prompt("retain original user input"))
             .await;
+        helper.events.clear();
         helper.send(3, "prompt", prompt("trigger compaction")).await;
         let failed = helper.reply(3).await;
         assert_eq!(failed["error"]["code"], code, "{kind}: {failed}");
         assert_eq!(failed["error"]["message"], message, "{kind}: {failed}");
+        let billed = if kind == "rejected" {
+            vec![]
+        } else {
+            vec![cost(2)]
+        };
+        assert_eq!(call_costs(&helper.events), billed, "{kind}");
         let state = helper.call(4, "state", json!({})).await;
         assert!(
             !rollout_records(&state)
@@ -1307,6 +1330,55 @@ async fn context_overflow_compacts_before_the_next_prompt_after_restore() {
     }
 }
 
+#[tokio::test]
+async fn compaction_before_acceptance_delivers_summary_costs_with_its_prompt() {
+    let provider = Provider::start([
+        Reply::Text("old assistant details", 15),
+        Reply::FailedEvent(json!({"code":"context_length_exceeded"})),
+        Reply::InvalidSummary("empty"),
+        Reply::Summary {
+            text: SUMMARY,
+            streamed: false,
+        },
+        Reply::Text("continued after compaction", 15),
+    ])
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path());
+    helper.call(1, "initialize", config(&provider)).await;
+    helper
+        .call(2, "prompt", prompt("retain original user input"))
+        .await;
+    helper.send(3, "prompt", prompt("overflowing input")).await;
+    let overflowed = helper.reply(3).await;
+    assert_eq!(
+        overflowed["error"]["providerCode"], "context_length_exceeded",
+        "{overflowed}"
+    );
+
+    helper.events.clear();
+    helper.send(4, "prompt", prompt("refused input")).await;
+    let refused = helper.reply(4).await;
+    assert_eq!(
+        refused["error"]["message"],
+        "gateway compaction summary was empty"
+    );
+    assert!(helper.events.iter().all(|event| event["requestId"] == 4
+        && event["event"] != "accepted"
+        && event["event"] != "native"));
+    assert_eq!(call_costs(&helper.events), [cost(3)]);
+
+    helper.events.clear();
+    let completed = helper.call(5, "prompt", prompt("accepted input")).await;
+    assert_eq!(completed["finalMessage"], "continued after compaction");
+    assert_eq!(helper.events[0]["event"], "accepted");
+    assert!(helper.events.iter().all(|event| event["requestId"] == 5));
+    assert_eq!(call_costs(&helper.events), [cost(4), cost(5)]);
+    helper.shutdown(6).await;
+    assert_eq!(provider.requests().len(), 5);
+}
+
 fn user_inputs(request: &Value) -> Vec<String> {
     message_texts(request, "user")
         .into_iter()
@@ -1351,8 +1423,10 @@ async fn overflowing_summary_request_drops_the_oldest_turns() {
         for (id, input) in (2..).zip(INPUTS) {
             helper.call(id, "prompt", prompt(input)).await;
         }
+        helper.events.clear();
         helper.send(7, "prompt", prompt("sixth input")).await;
         let reply = helper.reply(7).await;
+        let billed = call_costs(&helper.events);
         helper.shutdown(8).await;
 
         let requests = provider.requests();
@@ -1377,6 +1451,8 @@ async fn overflowing_summary_request_drops_the_oldest_turns() {
                 "continued after trimmed summary"
             );
             assert_eq!(requests.len(), 8);
+            // The overflowing attempt, the trimmed summary and the continuation.
+            assert_eq!(billed, [cost(6), cost(7), cost(8)]);
             assert_compacted_request(&requests[7], SUMMARY);
             assert_eq!(&user_inputs(&requests[7])[..5], INPUTS);
         } else {
@@ -1387,6 +1463,7 @@ async fn overflowing_summary_request_drops_the_oldest_turns() {
                 "native agent could not complete the turn"
             );
             assert_eq!(requests.len(), 9);
+            assert_eq!(billed, [cost(6), cost(7), cost(8), cost(9)]);
         }
     }
 }

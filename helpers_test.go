@@ -1,8 +1,10 @@
 package nanocodexacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/stretchr/testify/require"
 )
@@ -78,6 +81,56 @@ func (c *recordingClient) reset() {
 	c.notifications = nil
 	c.raw = nil
 	c.extensions = nil
+}
+
+func usageCosts(c *recordingClient) []*acp.Cost {
+	rows, _ := c.snapshot()
+	var costs []*acp.Cost
+	for _, row := range rows {
+		if usage := row.Update.UsageUpdate; usage != nil {
+			costs = append(costs, usage.Cost)
+		}
+	}
+
+	return costs
+}
+
+func usd(amount float64) *acp.Cost { return &acp.Cost{Amount: amount, Currency: costCurrency} }
+
+func storedCost(t *testing.T, store acpcore.SessionStore, id acp.SessionId) *float64 {
+	t.Helper()
+	var record sessionRecord
+	_, found, err := sessionlog.Load(t.Context(), store, string(id), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	return record.CostUSD
+}
+
+// logBuffer collects text log output from concurrent goroutines.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+func captureLogs() (*slog.Logger, *logBuffer) {
+	logs := &logBuffer{}
+
+	return slog.New(slog.NewTextHandler(logs, nil)), logs
 }
 
 func waitForText(t *testing.T, c *recordingClient, text string) {
