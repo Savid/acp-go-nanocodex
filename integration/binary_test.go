@@ -4,13 +4,20 @@ package integration
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -553,4 +560,202 @@ func TestSmokeCheckpointStoreRestoreAndCompactedReplay(t *testing.T) {
 	require.NotContains(t, replay, "fixture-summary")
 	restored.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
 	restored.stop()
+}
+
+func TestSmokeGatewayModelJourney(t *testing.T) {
+	requireIntegration(t)
+
+	const model = "fixture-gateway/model-1"
+	identity := "You are Codex, a coding agent running `" + model + "`. "
+	provider := newProvider(t, true)
+	store := acpcore.NewInMemorySessionStore()
+	home, workspace := t.TempDir(), t.TempDir()
+	first := startEmbedded(t, home, store)
+	initializeACP(t, first)
+	options := nanocodexacp.NewNanocodexOptions(
+		nanocodexacp.WithNanocodexModel(model), nanocodexacp.WithNanocodexContextWindow(262144),
+		nanocodexacp.WithNanocodexAPIBaseURL(provider.server.URL+"/v1"), nanocodexacp.WithNanocodexModelIDPrefix("openai"),
+	)
+	created := first.call(t, "session/new", wire.NewSessionRequest(workspace, nanocodexacp.WithSessionRawEvents(true), nanocodexacp.WithSessionNanocodexOptions(options)))
+	id := sessionID(t, created)
+	requireSelectedModel(t, created, model, 262144)
+	first.call(t, "session/prompt", wire.TextPromptRequest(id, "create the fixture file"))
+	require.Equal(t, "answer-2", first.text(t))
+	content, err := os.ReadFile(filepath.Join(workspace, "integration-proof.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "native-file-value", string(content))
+	var sizes []int
+	for _, notice := range first.notices {
+		if notice["method"] != "session/update" {
+			continue
+		}
+		var notification acp.SessionNotification
+		require.NoError(t, json.Unmarshal(mustJSON(t, notice["params"]), &notification))
+		if usage := notification.Update.UsageUpdate; usage != nil {
+			sizes = append(sizes, usage.Size)
+		}
+	}
+	require.Equal(t, []int{262144, 262144}, sizes)
+	// Raw events name the gateway model, never the default base model or its prices.
+	var raw []string
+	for _, notice := range first.notices {
+		if notice["method"] == nanocodexacp.RawEventMethod {
+			raw = append(raw, string(mustJSON(t, notice)))
+		}
+	}
+	require.NotEmpty(t, raw)
+	require.Contains(t, strings.Join(raw, "\n"), `"model":"`+model+`"`)
+	for _, event := range raw {
+		require.NotContains(t, event, "gpt-6-luna")
+		require.NotContains(t, event, "cost_status")
+	}
+	first.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	first.stop()
+
+	restored := startEmbedded(t, home, store)
+	initializeACP(t, restored)
+	for option, changed := range map[string]nanocodexacp.NanocodexOption{
+		"model":     nanocodexacp.WithNanocodexModel("fixture-gateway/model-2"),
+		"baseModel": nanocodexacp.WithNanocodexBaseModel("gpt-6.1-sol"),
+	} {
+		request := wire.LoadSessionRequest(id, workspace, nanocodexacp.WithSessionNanocodexOptions(nanocodexacp.NewNanocodexOptions(changed)))
+		requireRefusedField(t, restored.refusal(t, "session/load", request), option)
+	}
+	widened := nanocodexacp.NewNanocodexOptions(nanocodexacp.WithNanocodexContextWindow(524288))
+	loaded := restored.call(t, "session/load", wire.LoadSessionRequest(id, workspace, nanocodexacp.WithSessionNanocodexOptions(widened)))
+	requireSelectedModel(t, loaded, model, 524288)
+	restored.notices = nil
+	restored.call(t, "session/prompt", wire.TextPromptRequest(id, "continue from the previous tool output"))
+	require.Equal(t, "answer-3", restored.text(t))
+	restored.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	resumed := restored.call(t, "session/resume", acp.ResumeSessionRequest{SessionId: id, Cwd: workspace})
+	requireSelectedModel(t, resumed, model, 524288)
+	restored.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	restored.stop()
+
+	requests := provider.history(t)
+	require.Len(t, requests, 3)
+	for _, request := range requests {
+		require.Equal(t, model, request["model"])
+		require.True(t, strings.HasPrefix(developerPrompt(t, request), identity))
+	}
+	require.Contains(t, string(mustJSON(t, requests[2])), "tool-proof")
+}
+
+func TestLiveGatewayModelJourney(t *testing.T) {
+	requireIntegration(t)
+
+	if os.Getenv("ACP_GO_NANOCODEX_RUN_LIVE_TOKENS") != "1" {
+		t.Skip("set ACP_GO_NANOCODEX_RUN_LIVE_TOKENS=1 to spend model tokens")
+	}
+
+	model := os.Getenv("ACP_GO_NANOCODEX_GATEWAY_MODEL")
+	if model == "" {
+		t.Skip("set ACP_GO_NANOCODEX_GATEWAY_MODEL to run the gateway-model journey")
+	}
+
+	upstream, err := url.Parse(strings.TrimSuffix(os.Getenv("OPENAI_BASE_URL"), "/"))
+	require.NoError(t, err)
+	require.NotEmpty(t, upstream.Host, "the gateway-model journey requires OPENAI_BASE_URL")
+	keyEnv := cmp.Or(os.Getenv("NANOCODEX_API_KEY_ENV"), "OPENAI_API_KEY")
+	require.NotEmpty(t, os.Getenv(keyEnv), "the gateway-model journey requires the selected API key")
+
+	// A loopback recording proxy exposes the wire requests the helper sends to the gateway.
+	var mu sync.Mutex
+	var requests []map[string]any
+	forward := &httputil.ReverseProxy{Rewrite: func(request *httputil.ProxyRequest) { request.SetURL(upstream) }, FlushInterval: -1}
+	recorder := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			http.Error(writer, "unreadable request", http.StatusBadRequest)
+
+			return
+		}
+		var decoded map[string]any
+		if json.Unmarshal(body, &decoded) == nil {
+			mu.Lock()
+			requests = append(requests, decoded)
+			mu.Unlock()
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		forward.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(recorder.Close)
+	recorded := func() []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return append([]map[string]any(nil), requests...)
+	}
+
+	command := exec.CommandContext(t.Context(), binaryPath(t, "ACP_GO_NANOCODEX_AGENT_BINARY", "acp-go-nanocodex", true),
+		"--path", binaryPath(t, "ACP_GO_NANOCODEX_HARNESS_PATH", "acp-go-nanocodex-native", true), "--home", t.TempDir(), "--model", model)
+	command.Env = append(os.Environ(), "OTEL_SDK_DISABLED=true", "OPENAI_BASE_URL="+recorder.URL, "NANOCODEX_TRANSPORT=https",
+		"NANOCODEX_BASE_MODEL=", "NANOCODEX_CONTEXT_WINDOW=")
+	h := startCommand(t, command)
+	h.timeout = 2 * time.Minute
+	initializeACP(t, h)
+	workspace, markerDir := t.TempDir(), t.TempDir()
+	sentinel := "ACP_NANOCODEX_GATEWAY_" + uuid.NewString()
+	require.NoError(t, os.WriteFile(filepath.Join(markerDir, "acp-native-marker"), []byte("#!/bin/sh\nprintf '%s' '"+sentinel+"'\n"), 0o700))
+	options := nanocodexacp.NewNanocodexOptions(nanocodexacp.WithNanocodexExtraPathDirs(markerDir))
+	created := h.call(t, "session/new", wire.NewSessionRequest(workspace, nanocodexacp.WithSessionNanocodexOptions(options)))
+	id := sessionID(t, created)
+	requireSelectedModel(t, created, model, 0)
+	response := h.call(t, "session/prompt", wire.TextPromptRequest(id, "Use exec_command with login:false to run acp-native-marker by name using PATH. Reply with exactly its complete stdout and nothing else."))
+	require.Equal(t, "end_turn", response["stopReason"])
+	require.Equal(t, sentinel, h.text(t))
+	require.Contains(t, string(mustJSON(t, h.notices)), `"sessionUpdate":"tool_call"`)
+	used := 0
+	for _, notice := range h.notices {
+		if notice["method"] != "session/update" {
+			continue
+		}
+		var notification acp.SessionNotification
+		require.NoError(t, json.Unmarshal(mustJSON(t, notice["params"]), &notification))
+		if usage := notification.Update.UsageUpdate; usage != nil {
+			used = usage.Used
+		}
+	}
+	require.Positive(t, used)
+	identity := "You are Codex, a coding agent running `" + model + "`. "
+	toolTurn := recorded()
+	require.GreaterOrEqual(t, len(toolTurn), 2)
+	for _, request := range toolTurn {
+		require.Equal(t, model, request["model"])
+		require.True(t, strings.HasPrefix(developerPrompt(t, request), identity))
+	}
+
+	h.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	h.notices = nil
+	h.call(t, "session/load", wire.LoadSessionRequest(id, workspace))
+	require.Equal(t, sentinel, h.text(t), "an unchanged load must replay the tool turn")
+	h.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	for option, changed := range map[string]nanocodexacp.NanocodexOption{
+		"model":     nanocodexacp.WithNanocodexModel(model + "-changed"),
+		"baseModel": nanocodexacp.WithNanocodexBaseModel("gpt-6.1-sol"),
+	} {
+		request := wire.LoadSessionRequest(id, workspace, nanocodexacp.WithSessionNanocodexOptions(nanocodexacp.NewNanocodexOptions(changed)))
+		requireRefusedField(t, h.refusal(t, "session/load", request), option)
+	}
+
+	// A window at the last reported usage puts the restored context above the
+	// automatic compaction threshold.
+	narrowed := nanocodexacp.NewNanocodexOptions(nanocodexacp.WithNanocodexContextWindow(int64(used)))
+	loaded := h.call(t, "session/load", wire.LoadSessionRequest(id, workspace, nanocodexacp.WithSessionNanocodexOptions(narrowed)))
+	requireSelectedModel(t, loaded, model, used)
+	h.notices = nil
+	continued := h.call(t, "session/prompt", wire.TextPromptRequest(id, "Reply with exactly the stdout you reported before and nothing else."))
+	require.Equal(t, "end_turn", continued["stopReason"])
+	require.Equal(t, sentinel, h.text(t), "the compacted context must keep the tool output")
+	compacted := recorded()[len(toolTurn):]
+	require.GreaterOrEqual(t, len(compacted), 2)
+	require.Equal(t, "none", compacted[0]["tool_choice"], "the first restored request must be the compaction summary")
+	for _, request := range compacted {
+		require.Equal(t, model, request["model"])
+		require.True(t, strings.HasPrefix(developerPrompt(t, request), identity))
+	}
+	h.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	h.call(t, "session/delete", wire.DeleteSessionRequest(id))
+	h.stop()
 }

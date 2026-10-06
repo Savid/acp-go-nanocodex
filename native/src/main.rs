@@ -110,6 +110,9 @@ impl Server {
                 }
             }
         }
+        if let (Some(session), Some(payload)) = (&self.session, value["payload"].as_object_mut()) {
+            session.report_gateway_model(payload);
+        }
         if let Some(details) = value
             .get_mut("payload")
             .and_then(|payload| payload.get_mut("usage"))

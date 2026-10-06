@@ -50,6 +50,8 @@ impl Helper {
             .env_remove("NANOCODEX_MODEL_ID_PREFIX")
             .env_remove("NANOCODEX_TRANSPORT")
             .env_remove("NANOCODEX_API_KEY_ENV")
+            .env_remove("NANOCODEX_BASE_MODEL")
+            .env_remove("NANOCODEX_CONTEXT_WINDOW")
             .env("COMPACTION_FIXTURE_KEY", "fixture-token")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -134,6 +136,7 @@ struct ProviderState {
 struct Fixture {
     state: Arc<Mutex<ProviderState>>,
     requested: Arc<Notify>,
+    model: &'static str,
 }
 
 struct Provider {
@@ -150,12 +153,17 @@ impl Drop for Provider {
 
 impl Provider {
     async fn start(replies: impl IntoIterator<Item = Reply>) -> Self {
+        Self::serving("provider/gpt-6.1-sol", replies).await
+    }
+
+    async fn serving(model: &'static str, replies: impl IntoIterator<Item = Reply>) -> Self {
         let fixture = Fixture {
             state: Arc::new(Mutex::new(ProviderState {
                 requests: Vec::new(),
                 replies: replies.into_iter().collect(),
             })),
             requested: Arc::new(Notify::new()),
+            model,
         };
         let app = Router::new()
             .route("/v1/responses", post(respond))
@@ -211,7 +219,7 @@ async fn respond(
     Json(body): Json<Value>,
 ) -> Response {
     assert_eq!(headers["authorization"], "Bearer fixture-token");
-    assert_eq!(body["model"], "provider/gpt-6.1-sol");
+    assert_eq!(body["model"], fixture.model);
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
     assert!(body.get("previous_response_id").is_none());
@@ -1387,6 +1395,76 @@ async fn overflowing_summary_request_drops_the_oldest_turns() {
                 "native agent could not complete the turn"
             );
             assert_eq!(requests.len(), 9);
+        }
+    }
+}
+
+#[tokio::test]
+async fn configured_context_window_sets_the_compaction_threshold() {
+    const GATEWAY_MODEL: &str = "fixture/gateway-model";
+    // Above 90% of a 50,000-token window and far below the default threshold.
+    const USAGE: u64 = 46_000;
+    for (model, wire_model, window, identity) in [
+        (
+            "gpt-6.1-sol",
+            "provider/gpt-6.1-sol",
+            Some(50_000),
+            "You are Codex, an agent based on GPT-6. ",
+        ),
+        (
+            GATEWAY_MODEL,
+            GATEWAY_MODEL,
+            Some(50_000),
+            "You are Codex, a coding agent running `fixture/gateway-model`. ",
+        ),
+        (
+            GATEWAY_MODEL,
+            GATEWAY_MODEL,
+            None,
+            "You are Codex, a coding agent running `fixture/gateway-model`. ",
+        ),
+    ] {
+        let mut replies = vec![Reply::Text("old assistant details", USAGE)];
+        if window.is_some() {
+            replies.push(Reply::Summary {
+                text: SUMMARY,
+                streamed: false,
+            });
+        }
+        replies.push(Reply::Text("continued within the window", 15));
+        let provider = Provider::serving(wire_model, replies).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path());
+        let mut config = config(&provider);
+        config["model"] = json!(model);
+        if let Some(window) = window {
+            config["contextWindow"] = json!(window);
+        }
+        let state = helper.call(1, "initialize", config).await;
+        let selected = state["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == model)
+            .expect("selected model row");
+        assert_eq!(
+            selected.get("contextWindow"),
+            window.map(|window| json!(window)).as_ref()
+        );
+        helper.call(2, "prompt", prompt("fill the window")).await;
+        let completed = helper.call(3, "prompt", prompt("continue")).await;
+        assert_eq!(completed["finalMessage"], "continued within the window");
+        helper.shutdown(4).await;
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2 + usize::from(window.is_some()), "{model}");
+        for request in &requests {
+            assert!(message_texts(request, "developer")[0].starts_with(identity));
+        }
+        if window.is_some() {
+            assert_summary_request(&requests[1], &requests[0]);
+            assert_compacted_request(&requests[2], SUMMARY);
         }
     }
 }

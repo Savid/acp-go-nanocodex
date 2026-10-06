@@ -28,6 +28,9 @@ use tower::{Layer, Service};
 pub struct GatewayConfig {
     pub auth: OpenAiAuth,
     pub base_url: String,
+    /// A gateway model is sent verbatim in place of the prefixed native model
+    /// and replaces the native model's identity in the developer prompt.
+    pub model: Option<String>,
     pub model_id_prefix: Option<String>,
     pub session_id: String,
 }
@@ -226,6 +229,46 @@ fn drop_oldest_turn(input: &mut Vec<Value>) -> bool {
     true
 }
 
+/// Rewrites a native prompt's first sentence, `You are <name>, ...`, which
+/// names the native model, to name the gateway model while keeping the agent
+/// name. A sentence ends at the first period followed by whitespace or the end
+/// of the text, so rewriting a rewritten prompt leaves it unchanged. Returns
+/// `None` when the prompt has no such sentence.
+pub fn gateway_identity(prompt: &str, model: &str) -> Option<String> {
+    let rest = prompt.strip_prefix("You are ")?;
+    let end = rest
+        .match_indices('.')
+        .map(|(index, _)| index + 1)
+        .find(|&end| rest[end..].chars().next().is_none_or(char::is_whitespace))?;
+    let (name, _) = rest[..end].split_once(',')?;
+    if name.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "You are {name}, a coding agent running `{model}`.{}",
+        &rest[end..]
+    ))
+}
+
+/// Rewrites the identity sentence of the first developer message, where the
+/// native prompt names its model, for the gateway model.
+fn replace_identity(input: &mut [Value], model: &str) -> Result<(), ResponseError> {
+    let missing = || failure("gateway request has no model identity to replace");
+    let text = input
+        .iter_mut()
+        .find(|item| item["type"] == "message" && item["role"] == "developer")
+        .and_then(|item| item.get_mut("content"))
+        .and_then(|content| content.get_mut(0))
+        .and_then(|part| part.get_mut("text"))
+        .ok_or_else(missing)?;
+    let replaced = text
+        .as_str()
+        .and_then(|prompt| gateway_identity(prompt, model))
+        .ok_or_else(missing)?;
+    *text = json!(replaced);
+    Ok(())
+}
+
 fn output_index(event: &Value) -> Result<usize, ResponseError> {
     event["output_index"]
         .as_u64()
@@ -359,9 +402,13 @@ impl GatewayRoute {
                 "native history contains an unsupported gateway item",
             ));
         }
-        let model = match self.config.model_id_prefix.as_deref() {
-            Some(prefix) => format!("{prefix}/{}", request.model().as_str()),
-            None => request.model().as_str().to_owned(),
+        if let Some(model) = &self.config.model {
+            replace_identity(&mut input, model)?;
+        }
+        let model = match (&self.config.model, self.config.model_id_prefix.as_deref()) {
+            (Some(model), _) => model.clone(),
+            (None, Some(prefix)) => format!("{prefix}/{}", request.model().as_str()),
+            (None, None) => request.model().as_str().to_owned(),
         };
         let mut body = json!({
             "model":model, "input":input, "tools":tools, "stream":true, "store":false,
@@ -814,7 +861,99 @@ impl StreamBound {
 
 #[cfg(test)]
 mod tests {
-    use super::sends_session_header;
+    use super::{gateway_identity, replace_identity, sends_session_header};
+    use nanocodex::{Model, oai::tower::ResponsesServiceConfig};
+    use serde_json::{Value, json};
+
+    fn developer(text: &str) -> Value {
+        json!({"type":"message","role":"developer","content":[{"type":"input_text","text":text}]})
+    }
+
+    #[test]
+    fn identity_replaces_only_the_first_sentence_and_is_stable() {
+        for (prompt, name, rest) in [
+            (
+                "You are Nanocodex, a coding assistant powered by mimo-v2.6-pro. You and the user",
+                "Nanocodex",
+                " You and the user",
+            ),
+            (
+                "You are Codex, an agent based on GPT-6.\n\n# Personality",
+                "Codex",
+                "\n\n# Personality",
+            ),
+            ("You are Codex, briefly.", "Codex", ""),
+        ] {
+            for model in [
+                "qwen3.8-flash",
+                "provider/model.",
+                "openrouter/anthropic/claude",
+            ] {
+                let mut input = vec![
+                    json!({"type":"message","role":"user","content":[{"type":"input_text","text":"context"}]}),
+                    developer(prompt),
+                    developer("You are also bound by these permissions. Keep them."),
+                ];
+                let expected = format!("You are {name}, a coding agent running `{model}`.{rest}");
+                for _ in 0..2 {
+                    replace_identity(&mut input, model).expect("identity sentence");
+                    assert_eq!(input[1]["content"][0]["text"], expected);
+                }
+                assert_eq!(
+                    input[2]["content"][0]["text"],
+                    "You are also bound by these permissions. Keep them."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_identity_sentence_fails_the_request() {
+        for mut input in [
+            Vec::new(),
+            vec![
+                json!({"type":"message","role":"user","content":[{"type":"input_text","text":"You are here, Hi."}]}),
+            ],
+            vec![developer("Answer briefly. You are concise, really.")],
+            vec![developer("You are Codex, without a sentence end")],
+            vec![developer("You are Codex.5, with no sentence end")],
+            vec![developer("You are Codex. Next, a comma.")],
+            vec![developer("You are , unnamed.")],
+        ] {
+            let error = replace_identity(&mut input, "gateway/model").unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "gateway request has no model identity to replace"
+            );
+        }
+    }
+
+    #[test]
+    fn every_native_prompt_has_a_replaceable_identity() {
+        for (model, name) in [
+            (Model::Astra, "Codex"),
+            (Model::Sol, "Codex"),
+            (Model::Luna, "Codex"),
+            (Model::Glm53, "Nanocodex"),
+            (Model::Kimi, "Nanocodex"),
+            (Model::Mimo, "Nanocodex"),
+        ] {
+            let prompt = ResponsesServiceConfig {
+                model,
+                ..Default::default()
+            }
+            .system_prompt()
+            .into_owned();
+            let replaced = gateway_identity(&prompt, "gateway/model")
+                .unwrap_or_else(|| panic!("{} prompt identity", model.as_str()));
+            let identity = format!("You are {name}, a coding agent running `gateway/model`. ");
+            assert!(replaced.starts_with(&identity), "{}", model.as_str());
+            assert!(prompt.ends_with(&replaced[identity.len() - 1..]));
+            let mut input = vec![developer(&prompt)];
+            replace_identity(&mut input, "gateway/model").expect("identity sentence");
+            assert_eq!(input[0]["content"][0]["text"], replaced);
+        }
+    }
 
     #[test]
     fn session_identity_is_only_sent_to_the_opencode_go_endpoint() {

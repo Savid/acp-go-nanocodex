@@ -40,9 +40,9 @@ type Options struct {
 	// InputHandoffRoot is the absolute directory under which handoff-form
 	// prompt images are read. Empty rejects the handoff form.
 	InputHandoffRoot string
-	// DefaultModel selects the model for new sessions by native model ID.
+	// DefaultModel selects the model for new sessions.
 	DefaultModel string
-	// ConfiguredModels are the model ids the host lists explicitly, in native model-ID form.
+	// ConfiguredModels are the model ids the host lists explicitly.
 	ConfiguredModels []string
 	// Env is the static agent-scoped overlay on the inherited process
 	// environment every Nanocodex helper process runs with.
@@ -176,7 +176,7 @@ func WithInputHandoffRoot(dir string) Option {
 	return func(options *Options) { options.InputHandoffRoot = dir }
 }
 
-// WithDefaultModel selects the model for new sessions by native model ID.
+// WithDefaultModel selects the model for new sessions.
 func WithDefaultModel(model string) Option {
 	return func(options *Options) { options.DefaultModel = model }
 }

@@ -2,6 +2,7 @@ package nanocodexacp
 
 import (
 	"maps"
+	"math"
 	"net/netip"
 	"net/url"
 	"slices"
@@ -13,15 +14,17 @@ import (
 )
 
 const (
-	metaThinking                         = "thinking"
-	metaAPIBaseURL                       = "apiBaseUrl"
-	metaWebsocketURL                     = "websocketUrl"
-	metaAPIKeyEnv                        = "apiKeyEnv"
-	metaOptionsKey                       = "options"
-	metaRawEventKey                      = "rawEvent"
-	metaEnabledKey                       = "enabled"
-	configModel      acp.SessionConfigId = "model"
-	configThinking   acp.SessionConfigId = "thought_level"
+	metaThinking                          = "thinking"
+	metaBaseModel                         = "baseModel"
+	metaContextWindow                     = "contextWindow"
+	metaAPIBaseURL                        = "apiBaseUrl"
+	metaWebsocketURL                      = "websocketUrl"
+	metaAPIKeyEnv                         = "apiKeyEnv"
+	metaOptionsKey                        = "options"
+	metaRawEventKey                       = "rawEvent"
+	metaEnabledKey                        = "enabled"
+	configModel       acp.SessionConfigId = "model"
+	configThinking    acp.SessionConfigId = "thought_level"
 )
 
 // NanocodexOptions selects one native agent's model, route, and environment.
@@ -29,13 +32,19 @@ type NanocodexOptions struct {
 	Model         string            `json:"model,omitempty"`
 	Env           map[string]string `json:"env,omitempty"`
 	ExtraPathDirs []string          `json:"extraPathDirs,omitempty"`
-	Thinking      string            `json:"thinking,omitempty"`
-	APIBaseURL    string            `json:"apiBaseUrl,omitempty"`
-	WebsocketURL  string            `json:"websocketUrl,omitempty"`
-	ModelIDPrefix string            `json:"modelIdPrefix,omitempty"`
-	Transport     string            `json:"transport,omitempty"`
-	APIKeyEnv     string            `json:"apiKeyEnv,omitempty"`
-	AuthFile      string            `json:"authFile,omitempty"`
+	// BaseModel is the native model whose settings a gateway model uses.
+	BaseModel string `json:"baseModel,omitempty"`
+	// ContextWindow is the token window used for context accounting, usage
+	// size, and compaction; zero leaves the helper's environment value or the
+	// model default.
+	ContextWindow int64  `json:"contextWindow,omitempty"`
+	Thinking      string `json:"thinking,omitempty"`
+	APIBaseURL    string `json:"apiBaseUrl,omitempty"`
+	WebsocketURL  string `json:"websocketUrl,omitempty"`
+	ModelIDPrefix string `json:"modelIdPrefix,omitempty"`
+	Transport     string `json:"transport,omitempty"`
+	APIKeyEnv     string `json:"apiKeyEnv,omitempty"`
+	AuthFile      string `json:"authFile,omitempty"`
 }
 
 // NanocodexOption configures per-session native options.
@@ -51,9 +60,21 @@ func NewNanocodexOptions(opts ...NanocodexOption) NanocodexOptions {
 	return options.clone()
 }
 
-// WithNanocodexModel selects a native model ID.
+// WithNanocodexModel selects a native model ID, or a gateway model ID on a
+// configured gateway route.
 func WithNanocodexModel(model string) NanocodexOption {
 	return func(o *NanocodexOptions) { o.Model = model }
+}
+
+// WithNanocodexBaseModel selects the native model whose settings a gateway model uses.
+func WithNanocodexBaseModel(model string) NanocodexOption {
+	return func(o *NanocodexOptions) { o.BaseModel = model }
+}
+
+// WithNanocodexContextWindow sets the token window used for context accounting,
+// usage size, and compaction.
+func WithNanocodexContextWindow(tokens int64) NanocodexOption {
+	return func(o *NanocodexOptions) { o.ContextWindow = tokens }
 }
 
 // WithNanocodexEnv sets the session environment overlay.
@@ -134,20 +155,24 @@ func (o NanocodexOptions) values() map[string]any {
 		values["extraPathDirs"] = slices.Clone(o.ExtraPathDirs)
 	}
 
+	if o.ContextWindow != 0 {
+		values[metaContextWindow] = o.ContextWindow
+	}
+
 	return values
 }
 
 func (o NanocodexOptions) strings() map[string]string {
 	return map[string]string{
-		"model": o.Model, metaThinking: o.Thinking, metaAPIBaseURL: o.APIBaseURL, metaWebsocketURL: o.WebsocketURL,
+		"model": o.Model, metaBaseModel: o.BaseModel, metaThinking: o.Thinking, metaAPIBaseURL: o.APIBaseURL, metaWebsocketURL: o.WebsocketURL,
 		"modelIdPrefix": o.ModelIDPrefix, "transport": o.Transport, metaAPIKeyEnv: o.APIKeyEnv, "authFile": o.AuthFile,
 	}
 }
 
 func (o NanocodexOptions) initialize(sessionID, nativeID string) nanocodex.Initialize {
 	return nanocodex.Initialize{
-		Model: o.Model, Thinking: o.Thinking, APIBaseURL: o.APIBaseURL, WebsocketURL: o.WebsocketURL, ModelIDPrefix: o.ModelIDPrefix,
-		Transport: o.Transport, APIKeyEnv: o.APIKeyEnv, AuthFile: o.AuthFile, SessionID: sessionID, ResumeSessionID: nativeID,
+		Model: o.Model, BaseModel: o.BaseModel, ContextWindow: o.ContextWindow, Thinking: o.Thinking, APIBaseURL: o.APIBaseURL, WebsocketURL: o.WebsocketURL,
+		ModelIDPrefix: o.ModelIDPrefix, Transport: o.Transport, APIKeyEnv: o.APIKeyEnv, AuthFile: o.AuthFile, SessionID: sessionID, ResumeSessionID: nativeID,
 	}
 }
 
@@ -221,6 +246,13 @@ func parseSessionMeta(meta map[string]any) (sessionMeta, error) {
 					}
 
 					parsed.options.ExtraPathDirs = dirs
+				case metaContextWindow:
+					tokens, ok := positiveInteger(value)
+					if !ok {
+						return parsed, wire.Unsupported(path)
+					}
+
+					parsed.options.ContextWindow = tokens
 				default:
 					text, ok := value.(string)
 					if !ok || text == "" {
@@ -230,6 +262,8 @@ func parseSessionMeta(meta map[string]any) (sessionMeta, error) {
 					switch name {
 					case "model":
 						parsed.options.Model = text
+					case metaBaseModel:
+						parsed.options.BaseModel = text
 					case metaThinking:
 						parsed.options.Thinking = text
 					case metaAPIBaseURL:
@@ -272,6 +306,14 @@ func validateNativeOptions(o NanocodexOptions) error {
 		return wire.Unsupported(wire.MetaOptionPath(vendor, "model"))
 	}
 
+	if o.BaseModel != "" && !validModel(o.BaseModel) {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaBaseModel))
+	}
+
+	if o.ContextWindow < 0 {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaContextWindow))
+	}
+
 	if o.Transport != "" && o.Transport != "https" && o.Transport != "websocket" {
 		return wire.Unsupported(wire.MetaOptionPath(vendor, "transport"))
 	}
@@ -310,6 +352,32 @@ func validateNativeOptions(o NanocodexOptions) error {
 	return nil
 }
 
+// forModelChange drops the settings that describe the previously selected model.
+func (o NanocodexOptions) forModelChange() NanocodexOptions {
+	o.BaseModel = ""
+	o.ContextWindow = 0
+	o.Thinking = ""
+
+	return o
+}
+
+// positiveInteger accepts a whole JSON number, or the Go integer that
+// in-process metadata carries, when it is positive.
+func positiveInteger(value any) (int64, bool) {
+	switch number := value.(type) {
+	case int64:
+		return number, number > 0
+	case int:
+		return int64(number), number > 0
+	case float64:
+		if number > 0 && number < math.MaxInt64 && number == math.Trunc(number) {
+			return int64(number), true
+		}
+	}
+
+	return 0, false
+}
+
 // pinRoute refuses moving a started session between a gateway route (a custom
 // endpoint) and the native route. Native routes cannot read gateway summaries,
 // and gateways cannot create native compaction items.
@@ -326,7 +394,14 @@ func pinRoute(stored, requested NanocodexOptions) error {
 	return wire.Unsupported(wire.MetaOptionPath(vendor, metaWebsocketURL))
 }
 
+// inherit applies requested options over stored ones. The base model, context
+// window, and thinking level describe the stored model, so a model change drops
+// them unless the request supplies them again.
 func (m sessionMeta) inherit(options NanocodexOptions) NanocodexOptions {
+	if m.present["model"] && m.options.Model != options.Model {
+		options = options.forModelChange()
+	}
+
 	base := options.values()
 	maps.Copy(base, m.options.values())
 

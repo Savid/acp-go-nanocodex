@@ -18,7 +18,7 @@ func WithSessionRawEvents(enabled bool) wire.SessionRequestOption {
 	})
 }
 
-// SetModelRequest constructs a model selector update by native model ID.
+// SetModelRequest constructs a model selector update.
 func SetModelRequest(sessionID acp.SessionId, model string) acp.SetSessionConfigOptionRequest {
 	return wire.SetConfigOptionRequest(sessionID, configModel, acp.SessionConfigValueId(model))
 }

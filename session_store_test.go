@@ -445,6 +445,24 @@ func TestCheckpointMetadataMirrorsAndRehydratesWithoutAddingNativeRows(t *testin
 	require.JSONEq(t, string(checkpoint), string(hydrated))
 }
 
+func TestStoredOptionsAreValidatedOnLoad(t *testing.T) {
+	t.Parallel()
+
+	store := acpcore.NewInMemorySessionStore()
+	agent, _, _, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, agent, workspace)
+	_, err := agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	record.Options.ContextWindow = -1
+	require.NoError(t, sessionlog.Commit(t.Context(), store, string(created.SessionId), rows, record))
+	_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.Equal(t, wire.RestoreFailed(vendor), err)
+}
+
 func TestStartedSessionsKeepTheirRouteClass(t *testing.T) {
 	t.Parallel()
 

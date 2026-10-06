@@ -1,6 +1,6 @@
 use crate::{
     checkpoint,
-    gateway::{GatewayConfig, GatewayEvent, GatewayLayer},
+    gateway::{GatewayConfig, GatewayEvent, GatewayLayer, gateway_identity},
 };
 use nanocodex::{
     AgentEvents, Model, Nanocodex, NanocodexError, OpenAi, Thinking, Turn,
@@ -237,6 +237,8 @@ impl SessionError {
 struct Config {
     session_id: String,
     model: Option<String>,
+    base_model: Option<String>,
+    context_window: Option<u64>,
     thinking: Option<String>,
     api_base_url: Option<String>,
     websocket_url: Option<String>,
@@ -257,7 +259,13 @@ pub struct Session {
     pub agent: Nanocodex,
     pub events: AgentEvents,
     pub gateway_events: tokio::sync::mpsc::Receiver<GatewayEvent>,
+    /// The selected native model, or the base model whose settings a gateway
+    /// model uses.
     model: Model,
+    gateway_model: Option<String>,
+    /// The configured window; without one the native runtime uses the
+    /// model's default window.
+    context_window: Option<u64>,
     thinking: Thinking,
     text_events: bool,
     replaced_native_session_id: Option<String>,
@@ -270,6 +278,11 @@ fn context_window(model: Model) -> u64 {
     nanocodex::oai::tower::ResponsesServiceConfig::default()
         .context_window_tokens
         .min(model.max_context_window_tokens())
+}
+
+fn has_space_or_control(text: &str) -> bool {
+    text.chars()
+        .any(|character| character.is_whitespace() || character.is_control())
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -410,16 +423,46 @@ impl Session {
         config.api_key_env = config
             .api_key_env
             .or_else(|| env_value("NANOCODEX_API_KEY_ENV"));
+        if config.context_window.is_none() {
+            config.context_window = env_value("NANOCODEX_CONTEXT_WINDOW")
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(|_| SessionError::config("contextWindow"))?;
+        }
         let workspace = env::current_dir().map_err(|_| SessionError::invalid_config())?;
         let home = native_home(&workspace)?;
         let writer_locks = writer_locks(&home, &config)?;
-        let mut model = config
-            .model
+        // A model outside the native catalog is a gateway model, which runs
+        // with the settings of a native base model.
+        let mut model = Model::default();
+        let mut gateway_model = None;
+        if let Some(id) = config.model.as_deref() {
+            match Model::from_str(id) {
+                Ok(native) => model = native,
+                Err(_) if id.is_empty() || has_space_or_control(id) => {
+                    return Err(SessionError::config("model"));
+                }
+                Err(_) => gateway_model = Some(id.to_owned()),
+            }
+        }
+        let transport = config
+            .transport
             .as_deref()
-            .map(Model::from_str)
-            .transpose()
-            .map_err(|_| SessionError::config("model"))?
-            .unwrap_or_default();
+            .unwrap_or("https")
+            .parse::<ResponsesTransport>()
+            .map_err(|_| SessionError::config("transport"))?;
+        // Only an HTTPS route with a configured endpoint can serve a gateway
+        // model.
+        if gateway_model.is_some()
+            && (config.api_base_url.is_none() || transport != ResponsesTransport::Https)
+        {
+            return Err(SessionError::config("model"));
+        }
+        let base_model = match config.base_model.as_deref() {
+            Some(_) if gateway_model.is_none() => return Err(SessionError::config("baseModel")),
+            Some(id) => Some(Model::from_str(id).map_err(|_| SessionError::config("baseModel"))?),
+            None => None,
+        };
         let mut replaced_native_session_id = None;
         let resume = if let Some(id) = config.resume_session_id.as_deref() {
             match RolloutConfig::new(&home).load_session(id) {
@@ -440,8 +483,11 @@ impl Session {
             None
         };
         if let Some(resume) = &resume {
-            if config.model.is_some() && model != resume.model() {
+            if gateway_model.is_none() && config.model.is_some() && model != resume.model() {
                 return Err(SessionError::config("model"));
+            }
+            if base_model.is_some_and(|base| base != resume.model()) {
+                return Err(SessionError::config("baseModel"));
             }
             if Path::new(resume.workspace()) != workspace {
                 return Err(SessionError::restore(
@@ -449,6 +495,16 @@ impl Session {
                 ));
             }
             model = resume.model();
+        } else if gateway_model.is_some() {
+            model = match base_model {
+                Some(base) => base,
+                None => env_value("NANOCODEX_BASE_MODEL")
+                    .as_deref()
+                    .map(Model::from_str)
+                    .transpose()
+                    .map_err(|_| SessionError::config("baseModel"))?
+                    .unwrap_or(Model::Luna),
+            };
         }
         if replaced_native_session_id.as_deref() == Some(config.session_id.as_str()) {
             return Err(SessionError::config("sessionId"));
@@ -473,6 +529,22 @@ impl Session {
         if !model.supports_thinking(thinking) {
             return Err(SessionError::config("thinking"));
         }
+        // The native runtime caps a larger window silently, so refuse it instead.
+        if config
+            .context_window
+            .is_some_and(|tokens| tokens == 0 || tokens > model.max_context_window_tokens())
+        {
+            return Err(SessionError::config("contextWindow"));
+        }
+        if let Some(gateway_model) = &gateway_model {
+            let config = nanocodex::oai::tower::ResponsesServiceConfig {
+                model,
+                ..Default::default()
+            };
+            if gateway_identity(&config.system_prompt(), gateway_model).is_none() {
+                return Err(SessionError::config("baseModel"));
+            }
+        }
         let api_key_env = config.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
         if api_key_env.is_empty() || api_key_env.contains(['=', '\0']) {
             return Err(SessionError::config("apiKeyEnv"));
@@ -494,6 +566,9 @@ impl Session {
             })?,
         };
         if auth.mode() == OpenAiAuthMode::ChatGpt {
+            if gateway_model.is_some() {
+                return Err(SessionError::config("model"));
+            }
             if config.api_base_url.is_some() {
                 return Err(SessionError {
                     message: "ChatGPT authentication refuses custom API endpoints; remove apiBaseUrl and OPENAI_BASE_URL or configure an API key",
@@ -513,18 +588,10 @@ impl Session {
         if let Some(url) = &config.websocket_url {
             endpoint(url, true, "websocketUrl")?;
         }
-        let transport = config
-            .transport
-            .as_deref()
-            .unwrap_or("https")
-            .parse::<ResponsesTransport>()
-            .map_err(|_| SessionError::config("transport"))?;
         if let Some(prefix) = config.model_id_prefix.as_deref()
             && (prefix.is_empty()
                 || prefix.split('/').any(str::is_empty)
-                || prefix
-                    .chars()
-                    .any(|character| character.is_whitespace() || character.is_control())
+                || has_space_or_control(prefix)
                 || auth.mode() != OpenAiAuthMode::ApiKey
                 || transport != ResponsesTransport::Https)
         {
@@ -536,6 +603,7 @@ impl Session {
                     auth: auth.clone(),
                     session_id: session_id.to_string(),
                     base_url: base_url.clone(),
+                    model: gateway_model.clone(),
                     model_id_prefix: config
                         .model_id_prefix
                         .as_ref()
@@ -550,7 +618,11 @@ impl Session {
         let mut openai = OpenAi::builder(auth)
             .model(model)
             .thinking(thinking)
-            .context_window_tokens(context_window(model))
+            .context_window_tokens(
+                config
+                    .context_window
+                    .unwrap_or_else(|| context_window(model)),
+            )
             .transport(transport)
             .store(false)
             .websocket_warmup(false)
@@ -603,6 +675,8 @@ impl Session {
             events,
             gateway_events,
             model,
+            gateway_model,
+            context_window: config.context_window,
             thinking,
             text_events,
             replaced_native_session_id,
@@ -610,6 +684,22 @@ impl Session {
             compact_next,
             _writer_locks: writer_locks,
         })
+    }
+
+    /// Reports a gateway model in place of its base model in a native event
+    /// payload and drops the cost estimates priced at the base model's rates.
+    pub fn report_gateway_model(&self, payload: &mut serde_json::Map<String, Value>) {
+        let Some(gateway_model) = &self.gateway_model else {
+            return;
+        };
+        if let Some(model) = payload.get_mut("model")
+            && model.as_str() == Some(self.model.as_str())
+        {
+            *model = json!(gateway_model);
+        }
+        for name in ["estimated_cost", "cost_usd", "cost_status"] {
+            payload.remove(name);
+        }
     }
 
     pub fn rollout_state(&self) -> Value {
@@ -625,18 +715,48 @@ impl Session {
         if let Some(id) = &self.replaced_native_session_id {
             state["replacedNativeSessionId"] = json!(id);
         }
-        state["model"] = json!(self.model.as_str());
         state["textEvents"] = json!(self.text_events);
         state["thinking"] = json!(self.thinking.as_str());
-        let mut models = Model::ALL.to_vec();
-        if !models.contains(&self.model) {
-            models.push(self.model);
+        let row = |id: &str, model: Model, window: Option<u64>| {
+            let mut row = json!({
+                "id": id, "name": id, "defaultThinking": model.default_thinking().as_str(),
+                "thinking": Thinking::ALL.iter().filter(|thinking| model.supports_thinking(**thinking)).map(|thinking| thinking.as_str()).collect::<Vec<_>>()
+            });
+            if let Some(window) = window {
+                row["contextWindow"] = json!(window);
+            }
+            row
+        };
+        let native_window = |model: Model| {
+            let selected = self.gateway_model.is_none() && model == self.model;
+            Some(
+                self.context_window
+                    .filter(|_| selected)
+                    .unwrap_or_else(|| context_window(model)),
+            )
+        };
+        let mut models = Model::ALL
+            .iter()
+            .map(|model| row(model.as_str(), *model, native_window(*model)))
+            .collect::<Vec<_>>();
+        // The selected row is the gateway model when there is one, else the
+        // native model. A gateway model's row carries its base model's
+        // efforts and reports only a configured window, since its real window
+        // is unknown.
+        if let Some(id) = &self.gateway_model {
+            state["model"] = json!(id);
+            models.push(row(id, self.model, self.context_window));
+        } else {
+            state["model"] = json!(self.model.as_str());
+            if !Model::ALL.contains(&self.model) {
+                models.push(row(
+                    self.model.as_str(),
+                    self.model,
+                    native_window(self.model),
+                ));
+            }
         }
-        state["models"] = json!(models.iter().map(|model| json!({
-            "id": model.as_str(), "name": model.as_str(), "defaultThinking": model.default_thinking().as_str(),
-            "contextWindow": context_window(*model),
-            "thinking": Thinking::ALL.iter().filter(|thinking| model.supports_thinking(**thinking)).map(|thinking| thinking.as_str()).collect::<Vec<_>>()
-        })).collect::<Vec<_>>());
+        state["models"] = json!(models);
         state
     }
 

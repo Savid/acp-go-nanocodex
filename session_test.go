@@ -38,6 +38,32 @@ func TestLaunchRefusesRolloutPathDriftBeforePrompt(t *testing.T) {
 	require.Empty(t, notifications)
 }
 
+func TestNativeOptionRefusalsNameOnlySuppliedMetadata(t *testing.T) {
+	t.Parallel()
+
+	agent, _, _, workspace := fixtureAgent(t)
+	gateway := NewNanocodexOptions(WithNanocodexModel("opencode-go/qwen3.8-flash"), WithNanocodexBaseModel("kimi-k3"), WithNanocodexContextWindow(262144))
+	created := fixtureSession(t, agent, workspace, WithSessionNanocodexOptions(gateway))
+	_, err := agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	for _, field := range []string{metaBaseModel, metaContextWindow} {
+		model := "refuse-" + field
+		supplied := NewNanocodexOptions(WithNanocodexModel(model), WithNanocodexBaseModel("kimi-k3"), WithNanocodexContextWindow(262144))
+		_, err = agent.NewSession(t.Context(), wire.NewSessionRequest(workspace, WithSessionNanocodexOptions(supplied)))
+		require.Equal(t, wire.Unsupported(wire.MetaOptionPath(vendor, field)), err)
+		_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace, WithSessionNanocodexOptions(supplied)))
+		require.Equal(t, wire.Unsupported(wire.MetaOptionPath(vendor, field)), err)
+
+		// Without the field in session metadata, the helper's refusal concerns
+		// its environment default and is internal.
+		defaulted := NewNanocodexOptions(WithNanocodexModel(model))
+		_, err = agent.NewSession(t.Context(), wire.NewSessionRequest(workspace, WithSessionNanocodexOptions(defaulted)))
+		require.Equal(t, wire.InternalFailure(vendor, "native_start"), err)
+		_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace, WithSessionNanocodexOptions(defaulted)))
+		require.Equal(t, wire.InternalFailure(vendor, "native_start"), err)
+	}
+}
+
 func TestHelperIdentityMismatchFailsBeforeSessionBinding(t *testing.T) {
 	t.Parallel()
 	for _, field := range []string{"NANOCODEX_TEST_HELPER_VERSION", "NANOCODEX_TEST_HELPER_FINGERPRINT"} {

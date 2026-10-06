@@ -98,7 +98,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		}
 
 		if value != candidate.Model {
-			candidate.Thinking = ""
+			candidate = candidate.forModelChange()
 		}
 
 		candidate.Model = value

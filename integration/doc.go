@@ -5,6 +5,8 @@
 // ACP_GO_NANOCODEX_RUN_LIVE_TOKENS=1 additionally enables a live sentinel prompt.
 // Live requires an explicit API key or ACP_GO_NANOCODEX_HOME, whose auth.json
 // is copied to a temporary native home. ACP_GO_NANOCODEX_MODEL overrides its model.
+// ACP_GO_NANOCODEX_GATEWAY_MODEL additionally enables a gateway-model journey
+// through the inherited OPENAI_BASE_URL route and selected API key.
 //
 // ACP_GO_NANOCODEX_HARNESS_PATH selects the helper binary, which otherwise
 // defaults to bin/acp-go-nanocodex-native in the checkout.

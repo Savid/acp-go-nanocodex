@@ -31,7 +31,10 @@ A `native` event contains the upstream typed `AgentEvent` JSON object,
 including `type`, `seq`, `request_id`, and `payload`. Failure-event messages
 are sanitized to exclude provider response bodies. Zero cache-write counts
 are omitted because the upstream type loses whether the provider reported
-them. Native `run.completed` and
+them. In a gateway-model session, a payload `model` naming the base model
+reports the gateway model instead, and `estimated_cost`, `cost_usd`, and
+`cost_status`, which are priced at the base model's rates, are removed.
+Native-model events are unchanged. Native `run.completed` and
 `run.failed` events do not terminate the RPC: the prompt reply is authoritative
 and follows event draining and the durable rollout flush.
 
@@ -59,6 +62,16 @@ limited to 4 MiB before parsing; accumulated event data for one response also
 has a 4 MiB bound. Successful HTTP responses require `text/event-stream`.
 Non-SSE success responses fail without retrying. Incomplete events never reach
 native tools.
+
+A gateway model is sent verbatim as the request `model`. The first sentence of
+the first developer message must start with `You are ` followed by an agent
+name and a comma; generation and summary requests replace it with
+``You are <name>, a coding agent running `<model>`.``, keeping that name. A
+sentence ends at the first period followed by whitespace or the end of the
+text. Initialization refuses a base model whose prompt lacks that sentence as
+an invalid `baseModel`, and a request without it fails as `transport_error`
+before it is sent. Native state keeps the base model's prompt, and native
+models send their prompt unchanged.
 
 Gateway compaction uses the native automatic threshold and builds a local
 summary; gateway requests never carry `compaction_trigger`. The summary request
@@ -107,16 +120,32 @@ requests and retry delays.
 
 ## Methods
 
-- `initialize`: `{sessionId, model?, thinking?, apiBaseUrl?, websocketUrl?, modelIdPrefix?,
-  transport?, apiKeyEnv?, authFile?, resumeSessionId?}`. Model IDs are native
-  Nanocodex IDs; an optional prefix changes only the provider wire identifier.
+- `initialize`: `{sessionId, model?, baseModel?, contextWindow?, thinking?,
+  apiBaseUrl?, websocketUrl?, modelIdPrefix?, transport?, apiKeyEnv?, authFile?,
+  resumeSessionId?}`.
   `sessionId` is a caller-generated UUIDv7 reserved under the native session
   lock. All six upstream model IDs are accepted, including those omitted
   from its default three-model picker. Native aliases such as `sol`, `luna`,
-  and `astra` are accepted and returned as canonical model IDs.
+  and `astra` are accepted and returned as canonical model IDs. An optional
+  prefix changes only a native model's provider wire identifier. On a
+  configured API-key HTTPS gateway route, any other nonempty `model` without
+  whitespace or control characters is a gateway model. A gateway model fails
+  as `model` when no gateway route is possible: a route without an endpoint or
+  with WebSocket transport refuses it before authentication, and ChatGPT
+  authentication refuses it before its endpoint checks.
+  A gateway model runs with the settings of `baseModel`, a native model ID that
+  defaults to `gpt-6-luna`: its efforts, default effort, maximum context window,
+  and automatic compaction. A `baseModel` with a native model is refused. Resume
+  takes the base model from the rollout and refuses a different explicit
+  `baseModel`. `contextWindow` sets the positive token window for context
+  accounting and any native automatic compaction threshold, at most the native
+  or base model's maximum; without it the window is 272000 or that smaller
+  maximum. Resume accepts a changed `contextWindow`.
   Explicit parameters override inherited `OPENAI_BASE_URL`,
-  `NANOCODEX_MODEL_ID_PREFIX`, `NANOCODEX_TRANSPORT`, and
-  `NANOCODEX_API_KEY_ENV` for their corresponding fields.
+  `NANOCODEX_MODEL_ID_PREFIX`, `NANOCODEX_TRANSPORT`, `NANOCODEX_API_KEY_ENV`,
+  `NANOCODEX_BASE_MODEL`, and `NANOCODEX_CONTEXT_WINDOW` for their
+  corresponding fields. `NANOCODEX_BASE_MODEL` applies whenever no rollout
+  supplies the base model and is ignored for native models.
   The default transport is `https`; `websocket` is opt-in. HTTPS always uses
   full history replay and `store:false`. `apiKeyEnv` defaults to
   `OPENAI_API_KEY`. When neither `apiKeyEnv` nor `NANOCODEX_API_KEY_ENV`
@@ -130,12 +159,17 @@ requests and retry delays.
   the workspace. The Go adapter resolves home symlinks before launching.
   The result is `{protocolVersion:1, helperVersion, helperFingerprint,
   nativeSessionId, rolloutPath, committedBytes, model, thinking, models,
-  textEvents}`. `models` entries contain
-  `{id, name, thinking: [string], defaultThinking, contextWindow}`
+  textEvents}`. `model` is the gateway model or the canonical native ID; the
+  base model is never reported. `models` entries contain
+  `{id, name, thinking: [string], defaultThinking, contextWindow?}`
   from the native catalog, followed by the selected model if it is outside
-  the default picker. `helperVersion` and `helperFingerprint` must match the
-  Go adapter build. The fingerprint is SHA-256 over sorted repository-relative
-  paths, each followed by NUL, file bytes, and NUL. Its inputs are
+  the default picker. Native entries report their default `contextWindow`, and
+  the selected native entry reports the configured one. A gateway model's entry
+  carries its base model's efforts and default effort, and reports
+  `contextWindow` only when one is configured. `helperVersion` and
+  `helperFingerprint` must match the Go adapter build. The fingerprint is
+  SHA-256 over sorted repository-relative paths, each followed by NUL, file
+  bytes, and NUL. Its inputs are
   `native/src/*.rs`, `native/Cargo.toml`, `native/Cargo.lock`,
   `native/rust-toolchain.toml`, `native/build.rs`,
   `internal/nanocodex/protocol.go`, and `internal/nanocodex/client.go`.

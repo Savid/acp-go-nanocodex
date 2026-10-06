@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -113,8 +114,8 @@ func (f *fakeNative) initialize(req fakeRequest) error {
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return err
 	}
-	if params.Model == "invalid-model" || params.Thinking == "invalid-effort" {
-		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "invalid_config", "field": "model", "message": "fixture model rejected"}})
+	if field, refused := fakeRefusedField(params); refused {
+		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "invalid_config", "field": field, "message": "fixture option rejected"}})
 	}
 	home := os.Getenv("CODEX_HOME")
 	if home == "" {
@@ -159,9 +160,9 @@ func (f *fakeNative) initialize(req fakeRequest) error {
 	}
 	thinking := params.Thinking
 	if thinking == "" {
-		thinking = "medium"
+		thinking = fakeDefaultThinking(model)
 	}
-	f.state = nanocodex.State{ProtocolVersion: 1, HelperVersion: nanocodex.HelperVersion, HelperFingerprint: nativeHelperFingerprint, NativeSessionID: id, ReplacedNativeSessionID: replaced, RolloutPath: filepath.Join(home, "sessions", id+".jsonl"), Model: model, Thinking: thinking, TextEvents: os.Getenv("NANOCODEX_TEST_NATIVE_TEXT") != "1", Models: []nanocodex.Model{{ID: "gpt-6.1-sol", Name: "GPT 6.1 Sol", Thinking: []string{"low", "medium", "high"}, DefaultThinking: "medium", ContextWindow: 128000}}}
+	f.state = nanocodex.State{ProtocolVersion: 1, HelperVersion: nanocodex.HelperVersion, HelperFingerprint: nativeHelperFingerprint, NativeSessionID: id, ReplacedNativeSessionID: replaced, RolloutPath: filepath.Join(home, "sessions", id+".jsonl"), Model: model, Thinking: thinking, TextEvents: os.Getenv("NANOCODEX_TEST_NATIVE_TEXT") != "1", Models: fakeCatalog(model, params.ContextWindow)}
 	if os.Getenv("NANOCODEX_TEST_SELF_REPLACEMENT") == "1" {
 		f.state.ReplacedNativeSessionID = id
 	}
@@ -202,6 +203,44 @@ func (f *fakeNative) initialize(req fakeRequest) error {
 	}
 
 	return nil
+}
+
+// fakeRefusedField names the option a fixture initialization refuses: the
+// field a "refuse-<field>" model names, or an effort kimi-k3 does not accept.
+func fakeRefusedField(params nanocodex.Initialize) (string, bool) {
+	if field, refused := strings.CutPrefix(params.Model, "refuse-"); refused {
+		return field, true
+	}
+	if params.Model == "kimi-k3" && params.Thinking != "" && params.Thinking != "low" && params.Thinking != "high" {
+		return metaThinking, true
+	}
+
+	return "", false
+}
+
+// fakeDefaultThinking is kimi-k3's default effort, low, or medium for any
+// other model.
+func fakeDefaultThinking(model string) string {
+	if model == "kimi-k3" {
+		return "low"
+	}
+
+	return "medium"
+}
+
+// fakeCatalog lists one native model, then the selected model when it is
+// another, as a gateway model with no known window. The selected row reports
+// a configured context window.
+func fakeCatalog(model string, window int64) []nanocodex.Model {
+	models := []nanocodex.Model{{ID: "gpt-6.1-sol", Name: "GPT 6.1 Sol", Thinking: []string{"low", "medium", "high"}, DefaultThinking: "medium", ContextWindow: 128000}}
+	if model != models[0].ID {
+		models = append(models, nanocodex.Model{ID: model, Name: model, Thinking: []string{"low", "medium", "high"}, DefaultThinking: "medium"})
+	}
+	if window > 0 {
+		models[len(models)-1].ContextWindow = window
+	}
+
+	return models
 }
 
 func (f *fakeNative) refresh() error {

@@ -63,6 +63,8 @@ impl Helper {
             .env_remove("NANOCODEX_MODEL_ID_PREFIX")
             .env_remove("NANOCODEX_TRANSPORT")
             .env_remove("NANOCODEX_API_KEY_ENV")
+            .env_remove("NANOCODEX_BASE_MODEL")
+            .env_remove("NANOCODEX_CONTEXT_WINDOW")
             .env(key_env, "fixture-bearer-token")
             .envs(extra.iter().copied())
             .stdin(Stdio::piped())
@@ -1073,9 +1075,497 @@ async fn configured_native_models_outside_the_picker_can_complete_turns() {
         );
         let result = helper.call(2, "prompt", prompt("hello")).await;
         assert_eq!(result["finalMessage"], "selected model completed");
+        let payloads = native_payloads(&helper.events);
+        assert!(
+            payloads
+                .iter()
+                .any(|(kind, payload)| kind == "model.call.started" && payload["model"] == model)
+        );
+        assert!(
+            payloads
+                .iter()
+                .any(|(kind, payload)| kind == "run.completed"
+                    && payload["model"] == model
+                    && payload.get("cost_status").is_some())
+        );
         helper.shutdown(3).await;
-        assert_stateless(&provider.requests()[0], &format!("provider/{model}"));
+        let request = &provider.requests()[0];
+        assert_stateless(request, &format!("provider/{model}"));
+        assert!(
+            developer_prompt(request)
+                .starts_with("You are Nanocodex, a coding assistant powered by "),
+            "native models keep their native identity"
+        );
     }
+}
+
+const GATEWAY_MODEL: &str = "opencode-go/qwen3.8-flash";
+
+fn gateway_initialize(provider: &Provider) -> Value {
+    let mut config = initialize(provider, "FIXTURE_API_KEY", "provider");
+    config["model"] = json!(GATEWAY_MODEL);
+    config.as_object_mut().unwrap().remove("thinking");
+    config
+}
+
+fn developer_prompt(request: &ObservedRequest) -> String {
+    request.body["input"]
+        .as_array()
+        .expect("request input")
+        .iter()
+        .find(|item| item["type"] == "message" && item["role"] == "developer")
+        .and_then(|item| item["content"][0]["text"].as_str())
+        .expect("developer prompt")
+        .to_owned()
+}
+
+fn assert_gateway_identity(request: &ObservedRequest, name: &str) {
+    let prompt = developer_prompt(request);
+    assert!(
+        prompt.starts_with(&format!(
+            "You are {name}, a coding agent running `{GATEWAY_MODEL}`. You and the user share one workspace"
+        )),
+        "{}",
+        &prompt[..prompt.len().min(200)]
+    );
+}
+
+/// Returns each native event's type and payload.
+fn native_payloads(events: &[Value]) -> Vec<(String, Value)> {
+    events
+        .iter()
+        .filter(|event| event["event"] == "native")
+        .map(|event| {
+            (
+                event["data"]["type"]
+                    .as_str()
+                    .expect("native event type")
+                    .to_owned(),
+                event["data"]["payload"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// Checks that a gateway session's raw events report the gateway model and
+/// never its base model or the base model's cost estimates.
+fn assert_gateway_events(events: &[Value], base: &str) {
+    let payloads = native_payloads(events);
+    for kind in [
+        "run.started",
+        "model.call.started",
+        "model.call.completed",
+        "run.completed",
+    ] {
+        assert!(
+            payloads
+                .iter()
+                .any(|(seen, payload)| seen == kind && payload["model"] == GATEWAY_MODEL),
+            "{kind}"
+        );
+    }
+    for event in events {
+        let encoded = event.to_string();
+        assert!(!encoded.contains(&format!("\"{base}\"")), "{encoded}");
+        for cost in ["estimated_cost", "cost_usd", "cost_status"] {
+            assert!(!encoded.contains(cost), "{encoded}");
+        }
+    }
+}
+
+async fn refused_field(
+    workspace: &Path,
+    native_home: &Path,
+    env: &[(&str, &str)],
+    config: Value,
+) -> Value {
+    let mut helper = Helper::start_with_env(workspace, native_home, "FIXTURE_API_KEY", env);
+    helper.send(1, "initialize", config).await;
+    let refused = helper.reply(1).await;
+    helper.shutdown(2).await;
+    assert_eq!(refused["error"]["code"], "invalid_config", "{refused}");
+    refused["error"]["field"].clone()
+}
+
+#[tokio::test]
+async fn gateway_model_is_sent_verbatim_with_its_identity_and_base_settings() {
+    for (base, base_id, name, thinking, efforts, native_identity) in [
+        (
+            None,
+            "gpt-6-luna",
+            "Codex",
+            "medium",
+            json!(["none", "low", "medium", "high", "xhigh", "max"]),
+            "an agent based on GPT-6.",
+        ),
+        (
+            Some("kimi-k3"),
+            "kimi-k3",
+            "Nanocodex",
+            "low",
+            json!(["low", "high"]),
+            "powered by kimi-k3",
+        ),
+        (
+            Some("glm-5.3"),
+            "@cf/zai-org/glm-5.3",
+            "Nanocodex",
+            "low",
+            json!(["low", "medium", "high"]),
+            "powered by Z.ai GLM-5.3",
+        ),
+    ] {
+        let provider =
+            Provider::start([Reply::Shell, Reply::Text("gateway model completed")]).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        let mut config = gateway_initialize(&provider);
+        if let Some(base) = base {
+            config["baseModel"] = json!(base);
+        }
+        let state = helper.call(1, "initialize", config).await;
+        assert_eq!(state["model"], GATEWAY_MODEL);
+        assert_eq!(state["thinking"], thinking);
+        let catalog = state["models"].as_array().unwrap();
+        let ids = catalog
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", GATEWAY_MODEL]
+        );
+        assert_eq!(
+            catalog[3],
+            json!({"id":GATEWAY_MODEL, "name":GATEWAY_MODEL, "defaultThinking":thinking,
+                "thinking":efforts}),
+            "a gateway model without a configured window reports none"
+        );
+        let result = helper
+            .call(2, "prompt", prompt("create a file then report completion"))
+            .await;
+        assert_eq!(result["finalMessage"], "gateway model completed");
+        assert_gateway_events(&helper.events, base_id);
+        helper.shutdown(3).await;
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_stateless(request, GATEWAY_MODEL);
+            assert_eq!(request.body["reasoning"]["effort"], thinking);
+            assert_gateway_identity(request, name);
+            assert!(!developer_prompt(request).contains(native_identity));
+        }
+        assert!(requests[1].body.to_string().contains("fixture-tool-output"));
+    }
+}
+
+#[tokio::test]
+async fn gateway_model_configuration_errors_name_their_field() {
+    let provider = Provider::start([]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let gateway = gateway_initialize(&provider);
+    let native = initialize(&provider, "FIXTURE_API_KEY", "provider");
+    let with = |base: &Value, field: &str, value: Value| {
+        let mut config = base.clone();
+        config[field] = value;
+        config
+    };
+    let mut without_route = gateway.clone();
+    without_route.as_object_mut().unwrap().remove("apiBaseUrl");
+    let mut websocket = with(&gateway, "transport", json!("websocket"));
+    websocket.as_object_mut().unwrap().remove("modelIdPrefix");
+    for (field, env, config) in [
+        ("model", vec![], without_route),
+        ("model", vec![], websocket),
+        (
+            "model",
+            vec![],
+            with(&gateway, "model", json!("qwen flash")),
+        ),
+        (
+            "baseModel",
+            vec![],
+            with(&native, "baseModel", json!("gpt-6-luna")),
+        ),
+        (
+            "baseModel",
+            vec![],
+            with(&gateway, "baseModel", json!("gpt-4o")),
+        ),
+        (
+            "baseModel",
+            vec![("NANOCODEX_BASE_MODEL", "gpt-4o")],
+            gateway.clone(),
+        ),
+        (
+            "contextWindow",
+            vec![],
+            with(&gateway, "contextWindow", json!(0)),
+        ),
+        (
+            "contextWindow",
+            vec![],
+            with(&gateway, "contextWindow", json!(872_001)),
+        ),
+        (
+            "contextWindow",
+            vec![],
+            with(&native, "contextWindow", json!(872_001)),
+        ),
+        (
+            "contextWindow",
+            vec![("NANOCODEX_CONTEXT_WINDOW", "wide")],
+            gateway.clone(),
+        ),
+        (
+            "thinking",
+            vec![],
+            with(
+                &with(&gateway, "baseModel", json!("kimi-k3")),
+                "thinking",
+                json!("medium"),
+            ),
+        ),
+    ] {
+        let refused = refused_field(workspace.path(), native_home.path(), &env, config).await;
+        assert_eq!(refused, field, "{env:?}");
+    }
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn gateway_model_on_a_native_route_is_refused_before_authentication() {
+    let provider = Provider::start([]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut native_route = gateway_initialize(&provider);
+    for field in ["apiBaseUrl", "apiKeyEnv", "modelIdPrefix"] {
+        native_route.as_object_mut().unwrap().remove(field);
+    }
+    let mut websocket = gateway_initialize(&provider);
+    for field in ["apiKeyEnv", "modelIdPrefix"] {
+        websocket.as_object_mut().unwrap().remove(field);
+    }
+    websocket["transport"] = json!("websocket");
+    for (env, config) in [
+        (vec![], native_route.clone()),
+        (vec![], websocket.clone()),
+        (vec![("NANOCODEX_TRANSPORT", "websocket")], {
+            let mut config = websocket;
+            config.as_object_mut().unwrap().remove("transport");
+            config
+        }),
+    ] {
+        // No credential variable is set and the native home has no auth file.
+        let mut helper = Helper::start_with_env(
+            workspace.path(),
+            native_home.path(),
+            "UNUSED_FIXTURE_KEY",
+            &env,
+        );
+        helper.send(1, "initialize", config).await;
+        let refused = helper.reply(1).await;
+        helper.shutdown(2).await;
+        assert_eq!(refused["error"]["code"], "invalid_config", "{refused}");
+        assert_eq!(refused["error"]["field"], "model", "{refused}");
+    }
+    let mut helper = Helper::start_with_env(
+        workspace.path(),
+        native_home.path(),
+        "UNUSED_FIXTURE_KEY",
+        &[],
+    );
+    native_route["model"] = json!("gpt-6.1-sol");
+    helper.send(1, "initialize", native_route).await;
+    let refused = helper.reply(1).await;
+    helper.shutdown(2).await;
+    assert_eq!(refused["error"]["code"], "authentication", "{refused}");
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn gateway_model_under_chatgpt_authentication_is_refused_as_model() {
+    let provider = Provider::start([]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    std::fs::write(
+        native_home.path().join("auth.json"),
+        br#"{"personal_access_token":"at-fixture-token"}"#,
+    )
+    .unwrap();
+    let mut config = gateway_initialize(&provider);
+    for field in ["apiBaseUrl", "apiKeyEnv", "modelIdPrefix"] {
+        config.as_object_mut().unwrap().remove(field);
+    }
+    // No credential variable is set, so the native home's auth file applies.
+    let mut helper = Helper::start_with_env(
+        workspace.path(),
+        native_home.path(),
+        "UNUSED_FIXTURE_KEY",
+        &[("OPENAI_BASE_URL", provider.base_url.as_str())],
+    );
+    helper.send(1, "initialize", config).await;
+    let refused = helper.reply(1).await;
+    helper.shutdown(2).await;
+    assert_eq!(refused["error"]["code"], "invalid_config", "{refused}");
+    assert_eq!(refused["error"]["field"], "model", "{refused}");
+    assert!(!refused.to_string().contains("at-fixture-token"));
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn gateway_model_accepts_routes_completed_by_the_environment() {
+    // An inherited endpoint completes the route, and an explicit HTTPS
+    // transport overrides an inherited WebSocket one.
+    for inherit_endpoint in [true, false] {
+        let provider = Provider::start([Reply::Text("environment route completed")]).await;
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut config = gateway_initialize(&provider);
+        let env = if inherit_endpoint {
+            config.as_object_mut().unwrap().remove("apiBaseUrl");
+            vec![("OPENAI_BASE_URL", provider.base_url.as_str())]
+        } else {
+            vec![("NANOCODEX_TRANSPORT", "websocket")]
+        };
+        let mut helper = Helper::start_with_env(
+            workspace.path(),
+            native_home.path(),
+            "FIXTURE_API_KEY",
+            &env,
+        );
+        let state = helper.call(1, "initialize", config).await;
+        assert_eq!(state["model"], GATEWAY_MODEL);
+        let result = helper
+            .call(2, "prompt", prompt("use the inherited route"))
+            .await;
+        assert_eq!(result["finalMessage"], "environment route completed");
+        helper.shutdown(3).await;
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_stateless(&requests[0], GATEWAY_MODEL);
+    }
+}
+
+#[tokio::test]
+async fn gateway_model_settings_follow_the_base_model_and_configured_window() {
+    let provider = Provider::start([]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let gateway = gateway_initialize(&provider);
+    let mut effortless = gateway.clone();
+    effortless["thinking"] = json!("none");
+    let mut widest = gateway.clone();
+    widest["contextWindow"] = json!(872_000);
+    let mut native = initialize(&provider, "FIXTURE_API_KEY", "provider");
+    native["contextWindow"] = json!(100_000);
+    for (env, mut config, selected, thinking, efforts, window) in [
+        (vec![], effortless, GATEWAY_MODEL, "none", 6, None),
+        (
+            vec![("NANOCODEX_BASE_MODEL", "kimi-k3")],
+            gateway.clone(),
+            GATEWAY_MODEL,
+            "low",
+            2,
+            None,
+        ),
+        (vec![], widest, GATEWAY_MODEL, "medium", 6, Some(872_000)),
+        (
+            vec![("NANOCODEX_CONTEXT_WINDOW", "262144")],
+            gateway,
+            GATEWAY_MODEL,
+            "medium",
+            6,
+            Some(262_144),
+        ),
+        (vec![], native, "gpt-6.1-sol", "low", 5, Some(100_000)),
+    ] {
+        let mut helper = Helper::start_with_env(
+            workspace.path(),
+            native_home.path(),
+            "FIXTURE_API_KEY",
+            &env,
+        );
+        config["sessionId"] = json!(uuid::Uuid::now_v7().to_string());
+        let state = helper.call(1, "initialize", config).await;
+        helper.shutdown(2).await;
+        assert_eq!(state["model"], selected);
+        assert_eq!(state["thinking"], thinking);
+        for row in state["models"].as_array().unwrap() {
+            if row["id"] == selected {
+                assert_eq!(
+                    row.get("contextWindow"),
+                    window.map(|window| json!(window)).as_ref(),
+                    "{env:?}"
+                );
+                assert_eq!(row["thinking"].as_array().unwrap().len(), efforts);
+            } else {
+                assert_eq!(row["contextWindow"], 272_000, "{row}");
+            }
+        }
+    }
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn gateway_model_resume_adopts_the_rollout_base_model() {
+    let provider = Provider::start([
+        Reply::Text("first gateway turn"),
+        Reply::Text("resumed gateway turn"),
+    ])
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut config = gateway_initialize(&provider);
+    config["baseModel"] = json!("kimi-k3");
+    // Larger than the GPT models' maximum, so only the Kimi base accepts it.
+    config["contextWindow"] = json!(900_000);
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    let initialized = helper.call(1, "initialize", config.clone()).await;
+    helper
+        .call(2, "prompt", prompt("remember the gateway turn"))
+        .await;
+    helper.shutdown(3).await;
+
+    config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+    let mut mismatched = config.clone();
+    mismatched["baseModel"] = json!("gpt-6-luna");
+    let refused = refused_field(workspace.path(), native_home.path(), &[], mismatched).await;
+    assert_eq!(refused, "baseModel");
+
+    let mut resume = config;
+    resume.as_object_mut().unwrap().remove("baseModel");
+    resume["contextWindow"] = json!(950_000);
+    let mut helper = Helper::start_with_env(
+        workspace.path(),
+        native_home.path(),
+        "FIXTURE_API_KEY",
+        &[("NANOCODEX_BASE_MODEL", "gpt-6.1-sol")],
+    );
+    let resumed = helper.call(1, "initialize", resume).await;
+    assert_eq!(resumed["nativeSessionId"], initialized["nativeSessionId"]);
+    assert_eq!(resumed["model"], GATEWAY_MODEL);
+    let row = resumed["models"].as_array().unwrap().last().unwrap();
+    assert_eq!(row["id"], GATEWAY_MODEL);
+    assert_eq!(row["thinking"], json!(["low", "high"]));
+    assert_eq!(row["contextWindow"], 950_000);
+    let next = helper
+        .call(2, "prompt", prompt("continue the gateway turn"))
+        .await;
+    assert_eq!(next["finalMessage"], "resumed gateway turn");
+    helper.shutdown(3).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_stateless(request, GATEWAY_MODEL);
+        assert_gateway_identity(request, "Nanocodex");
+    }
+    let continued = requests[1].body.to_string();
+    assert!(continued.contains("remember the gateway turn"));
+    assert!(continued.contains("first gateway turn"));
 }
 
 #[tokio::test]

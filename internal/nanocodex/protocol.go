@@ -9,6 +9,8 @@ const HelperVersion = "0.2.0"
 type Initialize struct {
 	SessionID       string `json:"sessionId"`
 	Model           string `json:"model,omitempty"`
+	BaseModel       string `json:"baseModel,omitempty"`
+	ContextWindow   int64  `json:"contextWindow,omitempty"`
 	Thinking        string `json:"thinking,omitempty"`
 	APIBaseURL      string `json:"apiBaseUrl,omitempty"`
 	WebsocketURL    string `json:"websocketUrl,omitempty"`
@@ -34,7 +36,7 @@ type State struct {
 	Models                  []Model `json:"models"`
 }
 
-// Model is one invokable native model and its supported thinking levels.
+// Model is one invokable model and its supported thinking levels.
 type Model struct {
 	ContextWindow   int64    `json:"contextWindow"`
 	ID              string   `json:"id"`

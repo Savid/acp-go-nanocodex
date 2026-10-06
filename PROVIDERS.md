@@ -22,8 +22,8 @@ export NANOCODEX_TRANSPORT=https
 ```
 
 This sends the provider model ID `openai/gpt-6.1-sol`. The selected model must
-exist in OpenRouter's catalog and be available to your account. The adapter
-does not expand Nanocodex's model catalog to every OpenRouter model.
+exist in OpenRouter's catalog and be available to your account. Other
+OpenRouter models run as [gateway models](#gateway-models).
 
 OpenRouter requires complete conversation history and rejects stored
 continuation requests. The gateway transport sends `store:false`, the full
@@ -76,10 +76,81 @@ export NANOCODEX_TRANSPORT=https
   -model gpt-6-luna
 ```
 
-The model must be supported by both the provider and native runtime. Requests
+A native model must be supported by both the provider and the native runtime;
+other provider models run as [gateway models](#gateway-models). Requests
 to the OpenCode Go endpoint identify this adapter in `User-Agent` and send the native conversation ID in
 `x-opencode-session`, as required by [OpenCode Go](https://opencode.ai/docs/go/#where-can-i-use-it).
 The session header stays stable across tool calls and restored prompts.
+
+## Gateway models
+
+On a configured API-key HTTPS route (`apiBaseUrl` or `OPENAI_BASE_URL`), a
+`model` that is not a native ID is a gateway model:
+
+```sh
+export OPENAI_BASE_URL=http://127.0.0.1:4000/v1
+export NANOCODEX_API_KEY_ENV=OMP_AUTH_GATEWAY_TOKEN
+export NANOCODEX_TRANSPORT=https
+export NANOCODEX_CONTEXT_WINDOW=262144
+
+./bin/acp-go-nanocodex \
+  -path ./bin/acp-go-nanocodex-native \
+  -model opencode-go/qwen3.8-flash
+```
+
+The native aliases `sol`, `luna`, `astra`, `glm-5.3`, `glm53`, `kimi`, and
+`mimo` are native IDs, not gateway models. Load and the model selector compare
+`model` as spelled, so a different spelling of the same model, such as `luna`
+against a stored `gpt-6-luna`, counts as a model change. The helper sends a
+gateway model verbatim as the Responses `model` for generation and compaction
+summaries; `modelIdPrefix` applies only to native IDs. A non-native `model`
+fails with a `model` configuration error when no gateway route is possible:
+without an endpoint or with WebSocket transport before authentication, and
+under ChatGPT authentication. On a gateway route, a misspelt native ID is sent
+as a gateway model, and the gateway's `model_not_found` fails the turn.
+
+A gateway model runs with the settings of a native base model: its efforts and
+default effort, maximum context window, and compaction behavior. `baseModel`
+(`WithNanocodexBaseModel`) selects it, falling back to `NANOCODEX_BASE_MODEL`
+and then `gpt-6-luna`. Luna accepts every effort from `none` to `max` and
+defaults to `medium`; the gateway and its model must still accept the selected
+effort. A `baseModel` that is not a native ID, or that accompanies a native
+`model`, is a configuration error. `NANOCODEX_BASE_MODEL` applies whenever no
+native rollout supplies the base model and is ignored for native models. Load
+and resume take the base model from the rollout and refuse an explicit
+`baseModel` that differs from it.
+
+`contextWindow` (`WithNanocodexContextWindow`, env `NANOCODEX_CONTEXT_WINDOW`)
+sets the session's context window for native and gateway models alike. It must
+be a positive integer no greater than the native or base model's maximum.
+Without it the session uses 272000, or the model's smaller maximum. Load and
+resume accept a changed `contextWindow`. A request that changes `model` before
+the first turn drops the stored `baseModel`, `contextWindow`, and `thinking`
+unless it supplies them again.
+
+The GPT models compact automatically when the context reaches 90% of the
+window. GLM, Kimi, and MiMo, as native models or as bases, never compact
+automatically: for them `contextWindow` affects only usage `size` and
+summary-request trimming, and compaction runs before the prompt that follows a
+context overflow. A model whose real window is smaller than the session's
+window overflows the same way: the turn fails, and the next prompt compacts
+first.
+
+The ACP model selector and stored session options report the gateway model,
+and its selector row carries the base model's efforts. Usage `size` is the
+configured window, else a native model's default window. Without a configured
+window, a gateway model's usage `size` is 0 and its selector row has no
+`contextWindow`, because its real window is unknown. The
+base model is never reported; raw events name the gateway model and omit the
+base model's cost estimates.
+
+The first sentence of the native system prompt, `You are <name>, ...`, names
+the native model. Gateway-model requests replace it with
+``You are <name>, a coding agent running `<model>`.``, keeping the agent name
+(`Codex` for the GPT models, `Nanocodex` for GLM, Kimi, and MiMo) and the rest
+of the prompt. A base model whose prompt lacks that sentence fails session
+setup with a `baseModel` configuration error. Native rollouts and checkpoints
+keep the base model and its prompt, and native-model requests are unchanged.
 
 ## Go embedding
 
@@ -110,10 +181,10 @@ account.
 
 ## Scope
 
-- Model IDs remain Nanocodex's native `gpt-6-astra`, `gpt-6.1-sol`,
+- Native model IDs are Nanocodex's `gpt-6-astra`, `gpt-6.1-sol`,
   `gpt-6-luna`, `@cf/zai-org/glm-5.3`, `kimi-k3`, and `mimo-v2.6-pro`.
   The default picker lists the three GPT models; `WithConfiguredModels`
-  can add the other supported native IDs. Prefixes change provider routing only. Provider support for a
+  can add the other native IDs and gateway models. Provider support for a
   model and its reasoning settings is required independently.
 - Custom API-key HTTP endpoints receive standard Responses requests with
   direct `exec_command`, `write_stdin`, `update_plan`, and `view_image`

@@ -46,8 +46,10 @@ or elicitation surface.
 For **OpenRouter, OMP auth-gateway, and OpenCode Go**, see [provider configuration](PROVIDERS.md).
 Configured API-key HTTPS routes use standard Responses requests with complete
 history, `store:false`, and native function tools. All six model IDs accepted by Nanocodex are supported, including the three
-omitted from its default picker. A gateway namespace is configured separately
-with `NANOCODEX_MODEL_ID_PREFIX`; arbitrary provider models are not supported.
+omitted from its default picker; `NANOCODEX_MODEL_ID_PREFIX` sets a gateway
+namespace for these native IDs. On those routes any other model ID runs as a
+[gateway model](PROVIDERS.md#gateway-models): it is sent verbatim and uses the
+settings of a native base model.
 
 ## Embed
 
@@ -86,8 +88,8 @@ Use `Serve` with caller-supplied streams to receive session updates and replay.
 | `WithHome` | Absolute native root, passed as `CODEX_HOME`. |
 | `WithScratchDir` | Accepted absolute scratch parent; this adapter allocates no scratch state. |
 | `WithInputHandoffRoot` | Absolute read root for verified image handoff files. |
-| `WithDefaultModel` | Default native model ID for new sessions. |
-| `WithConfiguredModels` | Explicit model IDs appended to the native selector. Native validation still applies. |
+| `WithDefaultModel` | Default model ID for new sessions. |
+| `WithConfiguredModels` | Explicit model IDs appended to the model selector. Helper validation still applies. |
 | `WithEnv` | Environment overlay applied after the inherited environment. |
 | `WithSeedFiles` | Relative native-home files written before launch; existing unmanaged files are refused. |
 | `WithSessionStore` | Authoritative `acpcore.SessionStore`; defaults to a fresh in-memory store. |
@@ -107,7 +109,7 @@ adapter. Invalid construction options fail before native launch.
 | `-path` | Helper executable. |
 | `-home` | Native configuration root. |
 | `-scratch-dir` | Absolute scratch parent. |
-| `-model` | Default native model ID. |
+| `-model` | Default model ID. |
 | `-seed-file` | Repeatable `relative/path=/host/file` seed. |
 | `-debug` | Enable diagnostic logging to stderr. |
 | `-version` | Print the adapter version and exit. |
@@ -125,13 +127,15 @@ it with `NewNanocodexOptions`, then attach it using
 
 | Field | Constructor | Meaning |
 |---|---|---|
-| `model` | `WithNanocodexModel` | Native model ID. |
+| `model` | `WithNanocodexModel` | Native model ID, or a gateway model ID on a configured gateway route. |
+| `baseModel` | `WithNanocodexBaseModel` | Native model whose settings a [gateway model](PROVIDERS.md#gateway-models) uses. |
+| `contextWindow` | `WithNanocodexContextWindow` | Token window for usage reporting and context management; see [gateway models](PROVIDERS.md#gateway-models). |
 | `thinking` | `WithNanocodexThinking` | Native reasoning effort. |
 | `env` | `WithNanocodexEnv` | Session environment overlay. |
 | `extraPathDirs` | `WithNanocodexExtraPathDirs` | Ordered absolute directories prepended to `PATH`. |
 | `apiBaseUrl` | `WithNanocodexAPIBaseURL` | Responses API base URL. |
 | `websocketUrl` | `WithNanocodexWebsocketURL` | Native Responses WebSocket endpoint. |
-| `modelIdPrefix` | `WithNanocodexModelIDPrefix` | Provider wire namespace, such as `openai` or `openai-codex`. |
+| `modelIdPrefix` | `WithNanocodexModelIDPrefix` | Provider wire namespace for native model IDs, such as `openai` or `openai-codex`. |
 | `transport` | `WithNanocodexTransport` | `https` (default) or `websocket`. |
 | `apiKeyEnv` | `WithNanocodexAPIKeyEnv` | Environment variable containing the provider key; defaults to `OPENAI_API_KEY`. |
 | `authFile` | `WithNanocodexAuthFile` | Native authentication file. |
@@ -235,7 +239,9 @@ failures may carry one of these `class` values:
 Configured API-key HTTPS gateways expose native function tools, including
 shell execution and file operations through the shell. Freeform patch tools are
 excluded on those routes. Code Mode is disabled on every route. Automatic
-compaction uses the native model's context threshold. On gateway routes the
+compaction follows the native or base model's
+[compaction policy](PROVIDERS.md#gateway-models) within the session's context
+window. On gateway routes the
 helper asks the model for a plain-text summary through an ordinary `/responses`
 request with `tool_choice:"none"`, so no provider-specific compaction support is
 needed; native routes keep remote compaction. The native rollout saves the
@@ -362,7 +368,12 @@ temporary native home. Supply `OPENAI_API_KEY` (or the variable selected by
 `auth.json` can be copied into the temporary home. Provider route environment
 variables are inherited. `ACP_GO_NANOCODEX_MODEL` selects the live model;
 `ACP_GO_NANOCODEX_HARNESS_PATH` and `ACP_GO_NANOCODEX_AGENT_BINARY` select
-prebuilt executables. Explicitly enabled live tests fail on missing prerequisites.
+prebuilt executables. `ACP_GO_NANOCODEX_GATEWAY_MODEL` additionally runs a
+gateway-model journey through a loopback recording proxy in front of the
+inherited `OPENAI_BASE_URL` route. It checks a tool call, the wire model and
+identity line, store-backed load, refused model and base-model changes, and
+compaction at a narrowed context window. Explicitly enabled live tests fail on
+missing prerequisites.
 
 `make audit` runs formatting, lint, both builds, race/coverage checks, module
 tidiness, vulnerability scanning, and modernization checks. Rust formatting,

@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
 	nanocodexacp "github.com/savid/acp-go-nanocodex"
 	"github.com/stretchr/testify/require"
@@ -93,6 +94,27 @@ func newRPC(t *testing.T, reader io.Reader, writer io.Writer, stop func()) *rpcH
 func (h *rpcHarness) call(t *testing.T, method string, params any) map[string]any {
 	t.Helper()
 
+	frame := h.exchange(t, method, params)
+	require.Nil(t, frame["error"], "ACP %s failed: %v", method, frame["error"])
+	result, valid := frame["result"].(map[string]any)
+	require.True(t, valid, "ACP result must be an object")
+
+	return result
+}
+
+func (h *rpcHarness) refusal(t *testing.T, method string, params any) map[string]any {
+	t.Helper()
+
+	frame := h.exchange(t, method, params)
+	refused, ok := frame["error"].(map[string]any)
+	require.True(t, ok, "ACP %s unexpectedly succeeded", method)
+
+	return refused
+}
+
+func (h *rpcHarness) exchange(t *testing.T, method string, params any) map[string]any {
+	t.Helper()
+
 	h.nextID++
 	frame := map[string]any{"id": h.nextID, "method": method, "params": params}
 	if !h.native {
@@ -120,11 +142,8 @@ func (h *rpcHarness) call(t *testing.T, method string, params any) map[string]an
 			}
 
 			require.Equal(t, float64(h.nextID), frame["id"])
-			require.Nil(t, frame["error"], "ACP %s failed: %v", method, frame["error"])
-			result, valid := frame["result"].(map[string]any)
-			require.True(t, valid, "ACP result must be an object")
 
-			return result
+			return frame
 		}
 	}
 }
@@ -169,7 +188,7 @@ func startBinary(t *testing.T, nativeHome, endpoint string) *rpcHarness {
 	command.Env = append(os.Environ(),
 		"OPENAI_API_KEY=fixture-bearer-token", "OPENAI_BASE_URL="+endpoint,
 		"NANOCODEX_MODEL_ID_PREFIX=openai-codex", "NANOCODEX_TRANSPORT=https", "NANOCODEX_API_KEY_ENV=OPENAI_API_KEY",
-		"OTEL_SDK_DISABLED=true")
+		"NANOCODEX_BASE_MODEL=", "NANOCODEX_CONTEXT_WINDOW=", "OTEL_SDK_DISABLED=true")
 
 	return startCommand(t, command)
 }
@@ -180,7 +199,8 @@ func startNative(t *testing.T, nativeHome, workspace string) *rpcHarness {
 	command := exec.CommandContext(t.Context(), binaryPath(t, "ACP_GO_NANOCODEX_HARNESS_PATH", "acp-go-nanocodex-native", false))
 	command.Dir = workspace
 	command.Env = append(os.Environ(), "CODEX_HOME="+nativeHome, "OPENAI_API_KEY=fixture-bearer-token",
-		"OPENAI_BASE_URL=", "NANOCODEX_MODEL_ID_PREFIX=", "NANOCODEX_TRANSPORT=https", "NANOCODEX_API_KEY_ENV=OPENAI_API_KEY")
+		"OPENAI_BASE_URL=", "NANOCODEX_MODEL_ID_PREFIX=", "NANOCODEX_TRANSPORT=https", "NANOCODEX_API_KEY_ENV=OPENAI_API_KEY",
+		"NANOCODEX_BASE_MODEL=", "NANOCODEX_CONTEXT_WINDOW=")
 	h := startCommand(t, command)
 	h.native = true
 
@@ -237,7 +257,8 @@ func startEmbedded(t *testing.T, nativeHome string, store acpcore.SessionStore) 
 			nanocodexacp.WithExecutablePath(helper),
 			nanocodexacp.WithHome(nativeHome), nanocodexacp.WithSessionStore(store),
 			nanocodexacp.WithLogger(slog.New(slog.DiscardHandler)),
-			nanocodexacp.WithEnv(map[string]string{"OPENAI_API_KEY": "fixture-bearer-token", "OPENAI_BASE_URL": "", "NANOCODEX_MODEL_ID_PREFIX": "", "NANOCODEX_TRANSPORT": "https", "NANOCODEX_API_KEY_ENV": "OPENAI_API_KEY"}))
+			nanocodexacp.WithEnv(map[string]string{"OPENAI_API_KEY": "fixture-bearer-token", "OPENAI_BASE_URL": "", "NANOCODEX_MODEL_ID_PREFIX": "", "NANOCODEX_TRANSPORT": "https", "NANOCODEX_API_KEY_ENV": "OPENAI_API_KEY",
+				"NANOCODEX_BASE_MODEL": "", "NANOCODEX_CONTEXT_WINDOW": ""}))
 	}()
 
 	return newRPC(t, reader, writer, func() {
@@ -372,4 +393,75 @@ func (p *providerFixture) history(t *testing.T) []map[string]any {
 	defer p.mu.Unlock()
 
 	return append([]map[string]any(nil), p.requests...)
+}
+
+// developerPrompt returns the first developer message text of a Responses request.
+func developerPrompt(t *testing.T, request map[string]any) string {
+	t.Helper()
+
+	input, ok := request["input"].([]any)
+	require.True(t, ok, "request input must be an array")
+
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		require.True(t, ok)
+
+		if item["type"] != "message" || item["role"] != "developer" {
+			continue
+		}
+
+		content, ok := item["content"].([]any)
+		require.True(t, ok)
+		require.NotEmpty(t, content)
+		part, ok := content[0].(map[string]any)
+		require.True(t, ok)
+		text, ok := part["text"].(string)
+		require.True(t, ok)
+
+		return text
+	}
+
+	t.Fatal("request has no developer prompt")
+
+	return ""
+}
+
+// requireSelectedModel checks the ACP model selector and the selected row's
+// context window; zero requires the row to report none.
+func requireSelectedModel(t *testing.T, result map[string]any, model string, window int) {
+	t.Helper()
+
+	var response struct {
+		ConfigOptions []acp.SessionConfigOption `json:"configOptions"`
+	}
+	require.NoError(t, json.Unmarshal(mustJSON(t, result), &response))
+	require.NotEmpty(t, response.ConfigOptions)
+	selector := response.ConfigOptions[0].Select
+	require.NotNil(t, selector)
+	require.Equal(t, acp.SessionConfigValueId(model), selector.CurrentValue)
+
+	for _, row := range *selector.Options.Ungrouped {
+		if row.Value == acp.SessionConfigValueId(model) {
+			metadata, ok := row.Meta["nanocodex"].(map[string]any)
+			require.True(t, ok)
+			if window == 0 {
+				require.NotContains(t, metadata, "contextWindow")
+			} else {
+				require.Equal(t, float64(window), metadata["contextWindow"])
+			}
+
+			return
+		}
+	}
+
+	t.Fatalf("model selector omits %s", model)
+}
+
+// requireRefusedField checks that an ACP error refuses the named session option.
+func requireRefusedField(t *testing.T, refused map[string]any, option string) {
+	t.Helper()
+
+	data, ok := refused["data"].(map[string]any)
+	require.True(t, ok, "refusal must carry data: %v", refused)
+	require.Equal(t, "_meta.nanocodex.options."+option, data["field"])
 }
