@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use futures_util::{StreamExt, stream};
+use futures_util::{SinkExt, StreamExt, stream};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
@@ -24,6 +24,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+use tokio_tungstenite::tungstenite::Message;
 
 const DEADLINE: Duration = Duration::from_secs(20);
 
@@ -2585,4 +2586,188 @@ async fn exhausted_http_retries_report_the_status_on_each_stderr_line() {
     assert!(lines[0].contains("; retrying in "));
     assert!(lines[4].ends_with("; not retrying: attempt limit reached"));
     assert!(!stderr.contains("fixture-bearer-token"));
+}
+
+fn call_costs(events: &[Value]) -> Vec<f64> {
+    events
+        .iter()
+        .filter(|event| event["event"] == "call_cost")
+        .map(|event| event["data"]["cost"].as_f64().expect("call cost"))
+        .collect()
+}
+
+fn completed_with_usage(id: &str, usage: Value) -> Reply {
+    created_then([json!({"type":"response.completed", "response":{
+        "id":id, "status":"completed", "usage":usage,
+        "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"priced answer"}]}]
+    }})])
+}
+
+fn usage_with(fields: Value) -> Value {
+    let mut usage = json!({"input_tokens":12, "output_tokens":3, "total_tokens":15});
+    for (name, value) in fields.as_object().expect("usage fields") {
+        usage[name] = value.clone();
+    }
+    usage
+}
+
+#[tokio::test]
+async fn gateway_reports_each_billed_attempt_before_its_call_usage() {
+    let (reply, events, requests) = prompt_against(vec![
+        created_then([json!({"type":"response.failed", "response":{
+            "id":"resp_failed", "status":"failed", "error":{"message":"upstream failed"},
+            "usage":usage_with(json!({"cost":0.125}))
+        }})]),
+        created_then([json!({"type":"response.incomplete", "response":{
+            "id":"resp_incomplete", "status":"incomplete", "incomplete_details":null,
+            "usage":usage_with(json!({"cost":0.25}))
+        }})]),
+        completed_with_usage(
+            "resp_priced",
+            usage_with(json!({"cost":0.5, "is_byok":false,
+                "cost_details":{"upstream_inference_cost":0}})),
+        ),
+    ])
+    .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(call_costs(&events), [0.125, 0.25, 0.5]);
+    let completed = events
+        .iter()
+        .position(|event| event["data"]["type"] == "model.call.completed")
+        .expect("native call usage");
+    assert_eq!(
+        events[completed]["data"]["payload"]["response_id"],
+        "resp_priced"
+    );
+    let last_cost = events
+        .iter()
+        .rposition(|event| event["event"] == "call_cost")
+        .unwrap();
+    assert!(last_cost < completed, "a call's cost precedes its usage");
+    assert!(events.iter().all(|event| event["requestId"] == 2));
+}
+
+#[tokio::test]
+async fn gateway_reports_the_usage_cost_field_of_priced_calls() {
+    for (name, usage, cost) in [
+        (
+            "cost beside a different estimate",
+            usage_with(json!({"cost":0.5, "estimated_cost":0.75})),
+            0.5,
+        ),
+        (
+            "explicitly not bring your own key",
+            usage_with(json!({"cost":0.25, "is_byok":false})),
+            0.25,
+        ),
+        (
+            "string bring your own key",
+            usage_with(json!({"cost":0.25, "is_byok":"false"})),
+            0.25,
+        ),
+        (
+            "null bring your own key",
+            usage_with(json!({"cost":0.25, "is_byok":null})),
+            0.25,
+        ),
+        (
+            "numeric bring your own key",
+            usage_with(json!({"cost":0.25, "is_byok":0})),
+            0.25,
+        ),
+        ("negative zero", usage_with(json!({"cost":-0.0})), 0.0),
+    ] {
+        let (reply, events, _) =
+            prompt_against(vec![completed_with_usage("resp_priced", usage)]).await;
+        assert!(reply.get("error").is_none(), "{name}: {reply}");
+        let costs = call_costs(&events);
+        assert_eq!(costs, [cost], "{name}");
+        assert!(costs[0].is_sign_positive(), "{name}: {costs:?}");
+    }
+}
+
+#[tokio::test]
+async fn gateway_reports_no_cost_for_unpriced_calls() {
+    for (name, usage) in [
+        ("missing cost", usage_with(json!({}))),
+        ("null cost", usage_with(json!({"cost":null}))),
+        ("string cost", usage_with(json!({"cost":"0.5"}))),
+        ("negative cost", usage_with(json!({"cost":-0.5}))),
+        (
+            "estimated cost only",
+            usage_with(json!({"estimated_cost":0.5})),
+        ),
+        (
+            "bring your own key",
+            usage_with(json!({"cost":0.5, "is_byok":true})),
+        ),
+    ] {
+        let (reply, events, _) =
+            prompt_against(vec![completed_with_usage("resp_unpriced", usage)]).await;
+        assert!(reply.get("error").is_none(), "{name}: {reply}");
+        assert!(call_costs(&events).is_empty(), "{name}: {events:?}");
+    }
+}
+
+#[tokio::test]
+async fn gateway_rejects_an_event_whose_cost_is_out_of_range() {
+    let unrepresentable = Bytes::from(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_overflow\",\"status\":\"completed\",\"output\":[],\"usage\":{\"total_tokens\":15,\"cost\":1e999}}}\n\n",
+    );
+    let (reply, events, requests) = prompt_against(vec![Reply::RawSse(unrepresentable)]).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(reply["error"]["code"], "transport_error", "{reply}");
+    assert_eq!(
+        reply["error"]["message"], "invalid gateway event JSON",
+        "{reply}"
+    );
+    assert!(call_costs(&events).is_empty(), "{events:?}");
+}
+
+#[tokio::test]
+async fn native_routes_report_no_cost_even_when_usage_carries_one() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_url = format!("ws://{}/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(_))) => break,
+                Some(Ok(_)) => {}
+                other => panic!("native route sent no request: {other:?}"),
+            }
+        }
+        let completed = json!({"type":"response.completed", "response":{
+            "id":"resp_native", "status":"completed", "usage":usage_with(json!({"cost":0.5})),
+            "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"native answer"}]}]
+        }});
+        socket
+            .send(Message::Text(completed.to_string().into()))
+            .await
+            .unwrap();
+        while let Some(Ok(_)) = socket.next().await {}
+    });
+    let provider = Provider::start([]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    let mut config = initialize(&provider, "FIXTURE_API_KEY", "openai");
+    config["transport"] = json!("websocket");
+    config.as_object_mut().unwrap().remove("modelIdPrefix");
+    config["websocketUrl"] = json!(websocket_url);
+    helper.call(1, "initialize", config).await;
+    let completed = helper.call(2, "prompt", prompt("native turn")).await;
+    assert_eq!(completed["finalMessage"], "native answer");
+    assert!(
+        helper
+            .events
+            .iter()
+            .any(|event| event["data"]["type"] == "model.call.completed")
+    );
+    assert!(call_costs(&helper.events).is_empty(), "{:?}", helper.events);
+    helper.shutdown(3).await;
+    timeout(DEADLINE, server).await.unwrap().unwrap();
+    assert!(provider.requests().is_empty());
 }

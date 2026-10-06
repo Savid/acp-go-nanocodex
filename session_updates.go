@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
@@ -13,6 +15,9 @@ import (
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
 )
+
+// costCurrency is the currency of the gateways' usage.cost.
+const costCurrency = "USD"
 
 func observerPromptResult(response acp.PromptResponse, err error, model string) observer.PromptResult {
 	return observer.PromptResultFrom(response, err, model, "openai")
@@ -212,7 +217,50 @@ func (s *session) callUsage(ctx context.Context, data json.RawMessage) error {
 		}
 	}
 
-	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{SessionUpdate: "usage_update", Used: payload.Usage.Total, Size: size, Meta: call.Apply(nil)}})
+	update := &acp.SessionUsageUpdate{SessionUpdate: "usage_update", Used: payload.Usage.Total, Size: size, Meta: call.Apply(nil)}
+
+	s.mu.Lock()
+	if s.cost != nil {
+		update.Cost = &acp.Cost{Amount: *s.cost, Currency: costCurrency}
+	}
+	s.mu.Unlock()
+
+	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: update})
+}
+
+// callCost adds one provider-priced gateway call to the session's cumulative
+// cost. A charge that would make the total non-finite is dropped so the
+// reported total stays representable.
+func (s *session) callCost(ctx context.Context, data json.RawMessage) error {
+	var payload struct {
+		Cost *float64 `json:"cost"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+
+	if payload.Cost == nil || *payload.Cost < 0 {
+		return errors.New("helper call cost requires a non-negative cost")
+	}
+
+	s.mu.Lock()
+
+	total := *payload.Cost
+	if s.cost != nil {
+		total += *s.cost
+	}
+
+	overflow := math.IsInf(total, 0)
+	if !overflow {
+		s.cost = &total
+	}
+	s.mu.Unlock()
+
+	if overflow {
+		s.agent.log.WarnContext(ctx, "native call cost ignored; session total would overflow", slog.Float64("cost", *payload.Cost))
+	}
+
+	return nil
 }
 
 func nativeToolContent(raw json.RawMessage) ([]acp.ToolCallContent, error) {

@@ -515,6 +515,7 @@ func TestSmokeCheckpointStoreRestoreAndCompactedReplay(t *testing.T) {
 	created := first.call(t, "session/new", wire.NewSessionRequest(workspace, nanocodexacp.WithSessionNanocodexOptions(options)))
 	id := sessionID(t, created)
 	first.call(t, "session/prompt", wire.TextPromptRequest(id, "first user input"))
+	require.Equal(t, []*acp.Cost{{Amount: 0.125, Currency: "USD"}}, usageCosts(t, first))
 	first.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
 	first.stop()
 	var config map[string]any
@@ -533,6 +534,7 @@ func TestSmokeCheckpointStoreRestoreAndCompactedReplay(t *testing.T) {
 	restored.notices = nil
 	restored.call(t, "session/prompt", wire.TextPromptRequest(id, "second user input"))
 	require.Equal(t, "answer-3", restored.text(t))
+	require.Equal(t, []*acp.Cost{{Amount: 0.75, Currency: "USD"}}, usageCosts(t, restored), "generation and summary charges accumulate after restore")
 	for _, notice := range restored.notices {
 		if notice["method"] != "session/update" {
 			continue

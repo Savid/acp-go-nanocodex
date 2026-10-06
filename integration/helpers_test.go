@@ -180,6 +180,27 @@ func (h *rpcHarness) text(t *testing.T) string {
 	return text.String()
 }
 
+func usageCosts(t *testing.T, h *rpcHarness) []*acp.Cost {
+	t.Helper()
+
+	var costs []*acp.Cost
+
+	for _, notice := range h.notices {
+		if notice["method"] != "session/update" {
+			continue
+		}
+
+		var notification acp.SessionNotification
+		require.NoError(t, json.Unmarshal(mustJSON(t, notice["params"]), &notification))
+
+		if usage := notification.Update.UsageUpdate; usage != nil {
+			costs = append(costs, usage.Cost)
+		}
+	}
+
+	return costs
+}
+
 func startBinary(t *testing.T, nativeHome, endpoint string) *rpcHarness {
 	t.Helper()
 
@@ -372,9 +393,12 @@ func newProviderWithResponseMode(t *testing.T, shell bool, mode string) *provide
 		if mode == "compaction" && number == 1 {
 			inputTokens, totalTokens = 1_000_000, 1_000_003
 		}
+		usage := map[string]any{"input_tokens": inputTokens, "output_tokens": 3, "total_tokens": totalTokens}
+		if mode == "compaction" {
+			usage["cost"] = float64(number) / 8
+		}
 		writeEvent(map[string]any{"type": "response.completed", "response": map[string]any{
-			"id": id, "status": "completed", "output": output,
-			"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 3, "total_tokens": totalTokens},
+			"id": id, "status": "completed", "output": output, "usage": usage,
 		}})
 	}))
 	t.Cleanup(provider.server.Close)

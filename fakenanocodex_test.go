@@ -3,11 +3,13 @@ package nanocodexacp
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -40,6 +42,7 @@ type fakeNative struct {
 	state        nanocodex.State
 	waiting      uint64
 	ignoreCancel bool
+	billed       bool
 }
 
 func runFakeNanocodex() error {
@@ -89,6 +92,15 @@ func (f *fakeNative) handle(req fakeRequest) (bool, error) {
 		}
 		cancelled := f.waiting != 0
 		if cancelled {
+			if f.billed {
+				// A call that completes while the cancel is processed is still billed.
+				if err := f.callCost(f.waiting, "0.25"); err != nil {
+					return false, err
+				}
+				if err := f.event(f.waiting, "native", callCompleted(1)); err != nil {
+					return false, err
+				}
+			}
 			if err := f.reply(f.waiting, f.result("cancelled")); err != nil {
 				return false, err
 			}
@@ -280,12 +292,86 @@ func (f *fakeNative) result(stop string) nanocodex.Result {
 	return nanocodex.Result{StopReason: stop, FinalMessage: "Second answer.", NativeSessionID: nativeID, RolloutPath: f.state.RolloutPath, CommittedBytes: f.state.CommittedBytes, Usage: &nanocodex.Usage{InputTokens: 12, CachedInputTokens: 2, OutputTokens: 8, ReasoningOutputTokens: 3, TotalTokens: 20}}
 }
 
+// fixtureFailures are the native errors fixture commands reply with after
+// acceptance.
+var fixtureFailures = map[string]map[string]any{
+	"fail":            {"code": "native_error", "message": "fixture native failure"},
+	"rate-limit":      {"code": "native_error", "message": "provider rate limit exceeded", "providerCode": "rate_limit_exceeded"},
+	"provider-failed": {"code": "native_error", "message": "provider response did not complete", "providerCode": "upstream_error"},
+	"connection-lost": {"code": "connection_error", "message": "gateway connection ended before completion"},
+	"invalid-stream":  {"code": "transport_error", "message": "invalid gateway event stream"},
+	"http-rate-limit": {"code": "native_error", "message": "provider rate limit exceeded", "statusCode": 429, "providerCode": "rate_limit_exceeded"},
+}
+
+// waitCommands are the fixture commands that stay active until cancelled.
+var waitCommands = map[string]bool{"wait": true, "wait-billed": true, "ignore-cancel": true}
+
+// callCost reports one priced gateway call for the prompt request id.
+func (f *fakeNative) callCost(id uint64, amount string) error {
+	cost, err := strconv.ParseFloat(amount, 64)
+	if err != nil {
+		return err
+	}
+
+	return f.event(id, "call_cost", map[string]any{"cost": cost})
+}
+
+// nativeEvent is one native agent event of the fixture turn.
+func nativeEvent(seq int, kind string, payload any) map[string]any {
+	return map[string]any{"type": kind, "seq": seq, "request_id": "fixture-turn", "payload": payload}
+}
+
+// callCompleted is the native usage event that closes the fixture's model call.
+func callCompleted(seq int) map[string]any {
+	return nativeEvent(seq, "model.call.completed", map[string]any{"response_id": "response-one", "usage": map[string]any{"input_tokens": 12, "output_tokens": 8, "total_tokens": 20, "input_tokens_details": map[string]any{"cached_tokens": 2, "cache_write_tokens": 0}}})
+}
+
+// refuse prices a compaction that runs before acceptance and then refuses
+// the input, as the helper does when compacting prior history fails.
+func (f *fakeNative) refuse(id uint64, amount string) error {
+	raw, err := os.ReadFile(f.state.RolloutPath)
+	if err != nil {
+		return err
+	}
+	if !bytes.Contains(raw, []byte(`"input_accepted"`)) {
+		return errors.New("compaction requires prior accepted history")
+	}
+	if err := f.callCost(id, amount); err != nil {
+		return err
+	}
+
+	return f.failure(id, "native_error")
+}
+
+// charge reports the priced work an accepted fixture command starts with:
+// "wait-billed" prices a call before waiting and another while the cancel is
+// processed, and "bad-cost" sends a malformed charge and then stalls.
+func (f *fakeNative) charge(id uint64, command string) (bool, error) {
+	switch command {
+	case "wait-billed":
+		f.billed = true
+
+		return false, f.callCost(id, "0.5")
+	case "bad-cost":
+		return true, f.event(id, "call_cost", map[string]any{"cost": "0.5"})
+	default:
+		return false, nil
+	}
+}
+
 func (f *fakeNative) prompt(req fakeRequest) error {
 	var params struct {
 		Content []nanocodex.Content `json:"content"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return err
+	}
+	command := ""
+	if len(params.Content) > 0 {
+		command = params.Content[0].Text
+	}
+	if amount, ok := strings.CutPrefix(command, "refused-cost:"); ok {
+		return f.refuse(req.ID, amount)
 	}
 	if err := f.appendRow("event_msg", map[string]any{"type": "input_accepted", "input": params.Content}); err != nil {
 		return err
@@ -311,33 +397,17 @@ func (f *fakeNative) prompt(req fakeRequest) error {
 	if err := f.event(req.ID, "accepted", map[string]any{"turnId": "fixture-turn"}); err != nil {
 		return err
 	}
-	command := ""
-	if len(params.Content) > 0 {
-		command = params.Content[0].Text
+	if done, err := f.charge(req.ID, command); done || err != nil {
+		return err
 	}
-	if command == "fail" {
-		return f.failure(req.ID, "native_error")
-	}
-	if command == "rate-limit" {
-		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "native_error", "message": "provider rate limit exceeded", "providerCode": "rate_limit_exceeded"}})
-	}
-	if command == "provider-failed" {
-		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "native_error", "message": "provider response did not complete", "providerCode": "upstream_error"}})
-	}
-	if command == "connection-lost" {
-		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "connection_error", "message": "gateway connection ended before completion"}})
-	}
-	if command == "invalid-stream" {
-		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "transport_error", "message": "invalid gateway event stream"}})
-	}
-	if command == "http-rate-limit" {
-		return f.writer.Encode(map[string]any{"id": req.ID, "error": map[string]any{"code": "native_error", "message": "provider rate limit exceeded", "statusCode": 429, "providerCode": "rate_limit_exceeded"}})
+	if failure, ok := fixtureFailures[command]; ok {
+		return f.writer.Encode(map[string]any{"id": req.ID, "error": failure})
 	}
 	if command == "exit" {
 		_, _ = fmt.Fprintln(os.Stderr, "fixture native crash")
 		os.Exit(37)
 	}
-	if command == "wait" || command == "ignore-cancel" {
+	if waitCommands[command] {
 		if command == "ignore-cancel" {
 			f.ignoreCancel = true
 			signal.Ignore(syscall.SIGTERM)
@@ -364,18 +434,22 @@ func (f *fakeNative) prompt(req fakeRequest) error {
 			return err
 		}
 	}
-	native := []struct {
-		kind    string
-		payload any
-	}{
-		{"tool.call", map[string]any{"call_id": "call-one", "tool": "exec_command", "arguments": map[string]any{"cmd": "printf fixture"}}},
-		{"tool.result", map[string]any{"call_id": "call-one", "status": "completed", "result": "fixture", "structured_result": map[string]any{"exit_code": 0}}},
-		{"assistant.message", map[string]any{"text": "Second answer.", "item_id": "two"}},
-		{"model.call.completed", map[string]any{"response_id": "response-one", "usage": map[string]any{"input_tokens": 12, "output_tokens": 8, "total_tokens": 20, "input_tokens_details": map[string]any{"cached_tokens": 2, "cache_write_tokens": 0}}}},
-		{"run.completed", map[string]any{}},
+	native := []map[string]any{
+		nativeEvent(1, "tool.call", map[string]any{"call_id": "call-one", "tool": "exec_command", "arguments": map[string]any{"cmd": "printf fixture"}}),
+		nativeEvent(2, "tool.result", map[string]any{"call_id": "call-one", "status": "completed", "result": "fixture", "structured_result": map[string]any{"exit_code": 0}}),
+		nativeEvent(3, "assistant.message", map[string]any{"text": "Second answer.", "item_id": "two"}),
+		callCompleted(4),
+		nativeEvent(5, "run.completed", map[string]any{}),
 	}
-	for index, event := range native {
-		if err := f.event(req.ID, "native", map[string]any{"type": event.kind, "seq": index + 1, "request_id": "fixture-turn", "payload": event.payload}); err != nil {
+	amount, priced := strings.CutPrefix(command, "cost:")
+	for _, event := range native {
+		// The helper delivers a call's charge just before its usage.
+		if priced && event["type"] == "model.call.completed" {
+			if err := f.callCost(req.ID, amount); err != nil {
+				return err
+			}
+		}
+		if err := f.event(req.ID, "native", event); err != nil {
 			return err
 		}
 	}

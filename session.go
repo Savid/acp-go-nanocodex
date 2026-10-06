@@ -64,6 +64,8 @@ type session struct {
 	turn       *turn
 	lc         lifecycle.Publisher
 	raw        *wire.RawEvents
+	// cost is the cumulative provider-reported USD charge; nil until a call is priced.
+	cost *float64
 }
 
 func (a *Agent) environment(options NanocodexOptions) process.Environment {

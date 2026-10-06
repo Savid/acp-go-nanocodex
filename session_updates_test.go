@@ -2,10 +2,14 @@ package nanocodexacp
 
 import (
 	"encoding/json"
+	"errors"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
 	"github.com/stretchr/testify/require"
@@ -170,4 +174,115 @@ func TestOversizedPromptIsRejectedBeforeAdmissionAndSessionRemainsUsable(t *test
 	require.Empty(t, notices)
 	fixturePrompt(t, a, created.SessionId, "small valid prompt")
 	require.NotEmpty(t, client.text())
+}
+
+func TestGatewayCostSumsPricedCallsAcrossPromptsAndResume(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a, client, _, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, a, workspace)
+	require.Nil(t, storedCost(t, store, created.SessionId))
+	fixturePrompt(t, a, created.SessionId, "unpriced call")
+	_, raw := client.snapshot()
+	for _, row := range raw {
+		require.NotContains(t, string(row), `"cost"`)
+	}
+	require.Nil(t, storedCost(t, store, created.SessionId))
+	fixturePrompt(t, a, created.SessionId, "cost:0")
+	require.Equal(t, new(0.0), storedCost(t, store, created.SessionId))
+	for _, text := range []string{"cost:0.5", "unpriced call", "cost:0.25"} {
+		fixturePrompt(t, a, created.SessionId, text)
+	}
+	require.Equal(t, []*acp.Cost{nil, usd(0), usd(0.5), usd(0.5), usd(0.75)}, usageCosts(client))
+	require.Equal(t, new(0.75), storedCost(t, store, created.SessionId))
+
+	_, err := a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	_, err = a.ResumeSession(t.Context(), acp.ResumeSessionRequest{SessionId: created.SessionId, Cwd: workspace})
+	require.NoError(t, err)
+	client.reset()
+	for _, text := range []string{"unpriced call", "cost:0.125"} {
+		fixturePrompt(t, a, created.SessionId, text)
+	}
+	require.Equal(t, []*acp.Cost{usd(0.75), usd(0.875)}, usageCosts(client))
+	require.Equal(t, new(0.875), storedCost(t, store, created.SessionId))
+}
+
+func TestCallCostThatWouldOverflowTheTotalIsIgnored(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	logger, logs := captureLogs()
+	a, client, _, workspace := fixtureAgent(t, WithSessionStore(store), WithLogger(logger))
+	created := fixtureSession(t, a, workspace)
+	priced := "cost:" + strconv.FormatFloat(math.MaxFloat64, 'g', -1, 64)
+	fixturePrompt(t, a, created.SessionId, priced)
+	require.NotContains(t, logs.String(), "overflow")
+	fixturePrompt(t, a, created.SessionId, priced)
+	require.Contains(t, logs.String(), `level=WARN msg="native call cost ignored; session total would overflow"`)
+	require.Equal(t, []*acp.Cost{usd(math.MaxFloat64), usd(math.MaxFloat64)}, usageCosts(client))
+	require.Equal(t, new(math.MaxFloat64), storedCost(t, store, created.SessionId))
+}
+
+func TestMalformedCallCostFailsThePromptWithoutCharging(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	logger, logs := captureLogs()
+	a, client, _, workspace := fixtureAgent(t, WithSessionStore(store), WithLogger(logger))
+	created := fixtureSession(t, a, workspace)
+	_, err := a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "bad-cost"))
+	requestErr, ok := errors.AsType[*acp.RequestError](err)
+	require.True(t, ok, "%v", err)
+	data, ok := requestErr.Data.(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, vendor+"_"+wire.TokenTurnFailed, data[wire.FieldError])
+	require.Equal(t, wire.CauseTransport, data[wire.FieldCause])
+	require.Contains(t, logs.String(), `level=WARN msg="native prompt event rejected"`)
+	require.Empty(t, usageCosts(client))
+	require.Nil(t, storedCost(t, store, created.SessionId))
+}
+
+func TestCompactionCostBeforeRefusedInputIsKept(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a, client, _, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, a, workspace)
+	fixturePrompt(t, a, created.SessionId, "unpriced call")
+	client.reset()
+	_, err := a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "refused-cost:0.5"))
+	require.Error(t, err)
+	require.Empty(t, usageCosts(client))
+	require.Equal(t, new(0.5), storedCost(t, store, created.SessionId))
+	fixturePrompt(t, a, created.SessionId, "cost:0.25")
+	require.Equal(t, []*acp.Cost{usd(0.75)}, usageCosts(client))
+}
+
+func TestCancelledPromptKeepsBilledCostWithoutUsageUpdates(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a, client, _, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, a, workspace)
+	result := make(chan error, 1)
+	go func() {
+		response, promptErr := a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "wait-billed"))
+		if promptErr == nil && response.StopReason != acp.StopReasonCancelled {
+			promptErr = errors.New("prompt was not cancelled")
+		}
+		result <- promptErr
+	}()
+	waitForText(t, client, "waiting")
+	require.NoError(t, a.Cancel(t.Context(), acp.CancelNotification{SessionId: created.SessionId}))
+	require.NoError(t, awaitAgentResult(t, result))
+	require.Empty(t, usageCosts(client))
+	require.Equal(t, new(0.75), storedCost(t, store, created.SessionId))
+	fixturePrompt(t, a, created.SessionId, "unpriced call")
+	require.Equal(t, []*acp.Cost{usd(0.75)}, usageCosts(client))
+}
+
+func TestHelperCallCostRequiresANonNegativeCost(t *testing.T) {
+	t.Parallel()
+	var s session
+	for _, data := range []string{`{}`, `{"cost":null}`, `{"cost":-0.5}`} {
+		require.Error(t, s.callCost(t.Context(), json.RawMessage(data)), data)
+	}
+	require.Nil(t, s.cost)
 }

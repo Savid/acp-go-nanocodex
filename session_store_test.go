@@ -500,3 +500,33 @@ func TestStartedSessionsKeepTheirRouteClass(t *testing.T) {
 	require.Equal(t, wire.Unsupported("_meta.nanocodex.options.apiBaseUrl"), pinRoute(gateway("https://one.example/v1", "one", "ONE_KEY"), NanocodexOptions{}))
 	require.Equal(t, wire.Unsupported("_meta.nanocodex.options.websocketUrl"), pinRoute(websocket, NanocodexOptions{}))
 }
+
+func TestStoredCostMustBeFiniteAndNonNegative(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a, _, _, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, a, workspace)
+	fixturePrompt(t, a, created.SessionId, "cost:0.5")
+	_, err := a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	generation, err := store.Load(t.Context(), string(created.SessionId))
+	require.NoError(t, err)
+	var config map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(generation[sessionlog.ConfigSubpath][0], &config))
+	main := acpcore.SessionKey{SessionID: string(created.SessionId)}
+	for _, cost := range []string{
+		"-0.5",
+		// Decoding rejects a total beyond float64 range before validation runs.
+		"1e999",
+	} {
+		config["costUsd"] = json.RawMessage(cost)
+		encoded, err := json.Marshal(config)
+		require.NoError(t, err)
+		require.NoError(t, store.Replace(t.Context(), main, []acpcore.SessionStoreReplacement{
+			{Key: main, Entries: generation[acpcore.SessionStoreMainSubpath]},
+			{Key: acpcore.SessionKey{SessionID: main.SessionID, Subpath: sessionlog.ConfigSubpath}, Entries: []acpcore.SessionStoreEntry{encoded}},
+		}))
+		_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+		require.Equal(t, wire.RestoreFailed(vendor), err, cost)
+	}
+}
