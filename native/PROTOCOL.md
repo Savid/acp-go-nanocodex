@@ -26,7 +26,14 @@ IDs must not be reused during a process lifetime. Error messages are fixed
 summaries; provider response bodies and credentials are never returned as errors.
 
 Events have `event`, `requestId` (the active prompt's integer ID), and `data`.
-`accepted` contains `{turnId}` and precedes every `native` event for its prompt.
+`accepted` contains `{turnId}` and precedes native generation events. Recovery
+compaction publishes `model.compaction.started`, `model.compaction.completed`,
+and `model.compaction.failed` before acceptance, including on a refused prompt.
+During recovery, these are the only upstream native events forwarded. Other
+recovery events, including `run.*`, are discarded rather than buffered for
+delivery after acceptance. Gateway cost events are forwarded separately.
+A native compaction cancellation adds `cancelled: true` to the failed payload
+before its error message is sanitized.
 A `native` event contains the upstream typed `AgentEvent` JSON object,
 including `type`, `seq`, `request_id`, and `payload`. Failure-event messages
 are sanitized to exclude provider response bodies. Gateway `model.call.completed`
@@ -87,8 +94,8 @@ Generation and compaction summary responses report alike, including attempts
 that are retried and summaries the helper rejects. A call's `call_cost`
 precedes its native `model.call.completed`, and every `call_cost` precedes the
 reply of the prompt whose work produced it. Compaction that runs before
-`accepted` delivers its `call_cost` events after `accepted`, or before the
-prompt's error reply when the prompt is not accepted. Native routes produce no
+`accepted` delivers its `call_cost` events as they arrive, before acceptance or
+the prompt's error reply. Native routes produce no
 `call_cost`.
 
 Gateway compaction uses the native automatic threshold and builds a local

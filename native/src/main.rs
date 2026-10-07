@@ -101,6 +101,11 @@ impl Server {
             self.gateway_drain(id).await?;
         }
         let mut value = serde_json::to_value(&data)?;
+        if data.kind == AgentEventKind::ModelCompactionFailed
+            && value["payload"]["error"] == "compaction cancelled"
+        {
+            value["payload"]["cancelled"] = json!(true);
+        }
         if matches!(
             data.kind,
             AgentEventKind::RunError
@@ -191,6 +196,81 @@ impl Server {
         Ok(result.map(|()| json!({})))
     }
 
+    async fn recovery_event(
+        &mut self,
+        id: u64,
+        event: nanocodex::agent::events::AgentEvent,
+    ) -> io::Result<()> {
+        use nanocodex::agent::events::AgentEventKind;
+        if matches!(
+            event.kind,
+            AgentEventKind::ModelCompactionStarted
+                | AgentEventKind::ModelCompactionCompleted
+                | AgentEventKind::ModelCompactionFailed
+        ) {
+            self.native_event(id, event).await?;
+        }
+        Ok(())
+    }
+
+    async fn drain_recovery(&mut self, id: u64) -> io::Result<()> {
+        loop {
+            let event = self
+                .session
+                .as_mut()
+                .and_then(|s| s.events.try_recv_timed());
+            let Some(event) = event else { return Ok(()) };
+            self.recovery_event(id, event.event).await?;
+        }
+    }
+
+    async fn start_prompt(
+        &mut self,
+        id: u64,
+        params: Value,
+    ) -> io::Result<Result<Turn, SessionError>> {
+        let prompt = match Session::prepare_prompt(params) {
+            Ok(prompt) => prompt,
+            Err(error) => return Ok(Err(error)),
+        };
+        let agent = self
+            .session
+            .as_mut()
+            .expect("initialized session")
+            .compaction_agent();
+        if let Some(agent) = agent {
+            let compact = agent.compact();
+            tokio::pin!(compact);
+            let result = loop {
+                let session = self.session.as_mut().expect("initialized session");
+                tokio::select! {
+                    result = &mut compact => break result,
+                    event = session.events.recv() => {
+                        if let Some(event) = event { self.recovery_event(id, event).await?; }
+                    }
+                    event = session.gateway_events.recv(), if !session.gateway_events.is_closed() => {
+                        if let Some(event) = event { self.gateway_write(id, event).await?; }
+                    }
+                }
+            };
+            self.drain_recovery(id).await?;
+            self.gateway_drain(id).await?;
+            if let Err(error) = result {
+                return Ok(Err(SessionError::native(error)));
+            }
+            self.session
+                .as_mut()
+                .expect("initialized session")
+                .compaction_finished();
+        }
+        Ok(self
+            .session
+            .as_mut()
+            .expect("initialized session")
+            .prompt(prompt)
+            .await)
+    }
+
     async fn request(&mut self, request: Request) -> io::Result<bool> {
         if request.id == 0 || !self.seen.insert(request.id) || !request.params.is_object() {
             self.reply(request.id, Err(SessionError::invalid_request()))
@@ -223,11 +303,8 @@ impl Server {
             "prompt" => {
                 if self.active.is_some() {
                     Err(SessionError::busy())
-                } else if let Some(session) = &mut self.session {
-                    // Nothing reads the gateway channel while a compaction runs
-                    // before acceptance, so the events it produces must stay well
-                    // below the channel capacity.
-                    match session.prompt(request.params).await {
+                } else if self.session.is_some() {
+                    match self.start_prompt(request.id, request.params).await? {
                         Ok(turn) => {
                             self.write(json!({"event":"accepted", "requestId":request.id,
                                 "data":{"turnId":turn.id()}}))
@@ -239,11 +316,7 @@ impl Server {
                             });
                             return Ok(true);
                         }
-                        Err(error) => {
-                            // Compaction before acceptance may have billed summary calls.
-                            self.gateway_drain(request.id).await?;
-                            Err(error)
-                        }
+                        Err(error) => Err(error),
                     }
                 } else {
                     Err(SessionError::not_initialized())

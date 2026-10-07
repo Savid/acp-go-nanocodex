@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -17,19 +18,21 @@ import (
 )
 
 type turn struct {
-	done       chan struct{}
-	cancelled  atomic.Bool
-	cancelOnce sync.Once
-	abortOnce  sync.Once
-	accepted   atomic.Bool
-	submission lifecycle.Submission
-	cycle      lifecycle.Cycle
-	response   acp.PromptResponse
-	err        error
-	cleanupErr error
-	texts      map[string]string
-	hasText    bool
-	nativeSeq  uint64
+	done           chan struct{}
+	cancelled      atomic.Bool
+	cancelOnce     sync.Once
+	abortOnce      sync.Once
+	accepted       atomic.Bool
+	submission     lifecycle.Submission
+	cycle          lifecycle.Cycle
+	response       acp.PromptResponse
+	err            error
+	cleanupErr     error
+	texts          map[string]string
+	hasText        bool
+	nativeSeq      uint64
+	compactions    wire.Compactions
+	compactionKeys map[string]string
 }
 
 // Prompt retains foreground ownership through persistence and terminal publication.
@@ -352,42 +355,47 @@ func (s *session) promptEvent(ctx context.Context, t *turn, frame nanocodex.Fram
 		return nil
 	}
 
-	if !t.accepted.Load() {
-		return errors.New("native content preceded acceptance")
-	}
-
-	if t.cancelled.Load() {
-		return nil
-	}
-
 	if frame.Event == "native" {
 		var event nanocodex.Event
 		if err := json.Unmarshal(frame.Data, &event); err != nil {
 			return err
 		}
 
+		compaction := strings.HasPrefix(event.Type, "model.compaction.")
+		if !compaction && !t.accepted.Load() {
+			return errors.New("native content preceded acceptance")
+		}
+
+		if t.cancelled.Load() && !compaction {
+			return nil
+		}
+
 		if event.Seq <= t.nativeSeq {
+			if compaction {
+				// Deduplicate compaction delivery by its native sequence.
+				return nil
+			}
+
 			return errors.New("native event sequence regressed")
 		}
 
 		t.nativeSeq = event.Seq
 
-		if conn := s.agent.connection(); conn != nil {
-			var raw map[string]any
-			if err := json.Unmarshal(frame.Data, &raw); err != nil {
-				return err
-			}
+		s.emitNativeRaw(ctx, frame.Data)
 
-			omitRawImages(raw)
-
-			if err := s.raw.Emit(ctx, func(ctx context.Context, method string, params map[string]any) error {
-				return conn.NotifyExtension(ctx, method, params)
-			}, raw); err != nil {
-				s.agent.observe.RecordRawMessageEmitFailure(ctx, err)
-			}
+		if compaction {
+			return s.projectCompaction(ctx, t, event)
 		}
 
 		return s.nativeUpdate(ctx, t, event)
+	}
+
+	if !t.accepted.Load() {
+		return errors.New("native content preceded acceptance")
+	}
+
+	if t.cancelled.Load() {
+		return nil
 	}
 
 	return s.textUpdate(ctx, t, frame.Event, frame.Data)
@@ -434,4 +442,24 @@ func (s *session) sendCancel(t *turn) {
 			}
 		}()
 	})
+}
+
+func (s *session) emitNativeRaw(ctx context.Context, data json.RawMessage) {
+	conn := s.agent.connection()
+	if conn == nil || s.raw == nil {
+		return
+	}
+
+	var raw map[string]any
+	if json.Unmarshal(data, &raw) != nil {
+		return
+	}
+
+	omitRawImages(raw)
+
+	if err := s.raw.Emit(ctx, func(ctx context.Context, method string, params map[string]any) error {
+		return conn.NotifyExtension(ctx, method, params)
+	}, raw); err != nil {
+		s.agent.observe.RecordRawMessageEmitFailure(ctx, err)
+	}
 }

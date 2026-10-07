@@ -869,6 +869,7 @@ async fn cancellation_interrupts_compaction_and_keeps_history_for_restart() {
             while !cancelled || !completed {
                 let frame = helper.next().await;
                 if frame.get("event").is_some() {
+                    helper.events.push(frame);
                     continue;
                 }
                 assert!(frame.get("error").is_none(), "cancel failed: {frame}");
@@ -892,6 +893,20 @@ async fn cancellation_interrupts_compaction_and_keeps_history_for_restart() {
         })
         .await
         .expect("cancellation must interrupt the summary promptly");
+        let compactions = helper
+            .events
+            .iter()
+            .filter(|event| {
+                event["event"] == "native"
+                    && event["data"]["type"]
+                        .as_str()
+                        .is_some_and(|kind| kind.starts_with("model.compaction."))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(compactions.len(), 2);
+        assert_eq!(compactions[0]["data"]["type"], "model.compaction.started");
+        assert_eq!(compactions[1]["data"]["type"], "model.compaction.failed");
+        assert_eq!(compactions[1]["data"]["payload"]["cancelled"], true);
         helper.shutdown(5).await;
         assert_eq!(provider.requests().len(), 2);
         config["resumeSessionId"] = initialized["nativeSessionId"].clone();
@@ -1372,15 +1387,37 @@ async fn compaction_before_acceptance_delivers_summary_costs_with_its_prompt() {
         refused["error"]["message"],
         "gateway compaction summary was empty"
     );
-    assert!(helper.events.iter().all(|event| event["requestId"] == 4
-        && event["event"] != "accepted"
-        && event["event"] != "native"));
+    assert!(
+        helper
+            .events
+            .iter()
+            .all(|event| event["requestId"] == 4 && event["event"] != "accepted")
+    );
+    let kinds = |events: &[Value]| {
+        events
+            .iter()
+            .filter(|event| event["event"] == "native")
+            .map(|event| event["data"]["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kinds(&helper.events),
+        ["model.compaction.started", "model.compaction.failed"]
+    );
     assert_eq!(call_costs(&helper.events), [cost(3)]);
 
     helper.events.clear();
     let completed = helper.call(5, "prompt", prompt("accepted input")).await;
     assert_eq!(completed["finalMessage"], "continued after compaction");
-    assert_eq!(helper.events[0]["event"], "accepted");
+    let accepted = helper
+        .events
+        .iter()
+        .position(|event| event["event"] == "accepted")
+        .unwrap();
+    assert_eq!(
+        kinds(&helper.events[..accepted]),
+        ["model.compaction.started", "model.compaction.completed"]
+    );
     assert!(helper.events.iter().all(|event| event["requestId"] == 5));
     assert_eq!(call_costs(&helper.events), [cost(4), cost(5)]);
     helper.shutdown(6).await;

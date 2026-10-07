@@ -373,6 +373,11 @@ func (f *fakeNative) prompt(req fakeRequest) error {
 	if amount, ok := strings.CutPrefix(command, "refused-cost:"); ok {
 		return f.refuse(req.ID, amount)
 	}
+	offset, err := f.compact(req.ID, command)
+	if err != nil {
+		return err
+	}
+
 	if err := f.appendRow("event_msg", map[string]any{"type": "input_accepted", "input": params.Content}); err != nil {
 		return err
 	}
@@ -443,6 +448,8 @@ func (f *fakeNative) prompt(req fakeRequest) error {
 	}
 	amount, priced := strings.CutPrefix(command, "cost:")
 	for _, event := range native {
+		seq, _ := event["seq"].(int)
+		event["seq"] = seq + offset
 		// The helper delivers a call's charge just before its usage.
 		if priced && event["type"] == "model.call.completed" {
 			if err := f.callCost(req.ID, amount); err != nil {
@@ -463,4 +470,17 @@ func (f *fakeNative) prompt(req fakeRequest) error {
 	}
 
 	return f.reply(req.ID, f.result("end_turn"))
+}
+
+func (f *fakeNative) compact(id uint64, command string) (int, error) {
+	if command != "COMPACT" {
+		return 0, nil
+	}
+	for i, kind := range []string{"model.compaction.started", "model.compaction.completed"} {
+		if err := f.event(id, "native", nativeEvent(i+1, kind, map[string]any{"after_model_call_index": 0, "active_context_tokens": 120})); err != nil {
+			return 0, err
+		}
+	}
+
+	return 2, nil
 }

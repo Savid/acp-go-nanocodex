@@ -390,3 +390,17 @@ tidiness, vulnerability scanning, and modernization checks. Rust formatting,
 Clippy, and native tests participate in those gates. `make native-vuln` scans
 Cargo.lock with pinned `cargo-audit`, installed under `.tmp/` on first use.
 CI runs audit and the real-helper integration smoke tests on Linux and macOS.
+
+## Context compaction
+
+Reports native compaction starts, completions, failures, and cancellations,
+including recovery before prompt acceptance. Starts carry the native
+pre-compaction context count; trigger and resulting context counts are
+unavailable.
+
+Notifications carry `acp-go.dev/compaction` on the notification’s `_meta`,
+with an otherwise empty `session_info_update`. The value is `acp-go-core`
+`wire.Compaction`: a required `compactionId` and `status`, and optional
+`trigger`, `contextBefore`, and `contextAfter`. A start and its outcome share
+an ID. Unknown facts are omitted. These are live notifications; historical
+replay emits none. Usage accounting is independent.

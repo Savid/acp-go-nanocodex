@@ -762,7 +762,7 @@ impl Session {
         state
     }
 
-    pub async fn prompt(&mut self, params: Value) -> Result<Turn, SessionError> {
+    pub fn prepare_prompt(params: Value) -> Result<Prompt, SessionError> {
         if serde_json::to_vec(&params)
             .map_err(|_| SessionError::invalid_request())?
             .len()
@@ -786,16 +786,22 @@ impl Session {
         prompt
             .validate()
             .map_err(|_| SessionError::invalid_request())?;
-        if self.compact_next {
-            // Compaction changes native state, so shutdown refreshes the checkpoint.
-            self.prompted = true;
-            if let Err(error) = self.agent.compact().await {
-                // These events precede acceptance, so no prompt can carry them.
-                while self.events.try_recv_timed().is_some() {}
-                return Err(SessionError::native(error));
-            }
-            self.compact_next = false;
+        Ok(prompt)
+    }
+
+    pub fn compaction_agent(&mut self) -> Option<Nanocodex> {
+        if !self.compact_next {
+            return None;
         }
+        self.prompted = true;
+        Some(self.agent.clone())
+    }
+
+    pub fn compaction_finished(&mut self) {
+        self.compact_next = false;
+    }
+
+    pub async fn prompt(&mut self, prompt: Prompt) -> Result<Turn, SessionError> {
         let turn = self
             .agent
             .prompt(prompt)
