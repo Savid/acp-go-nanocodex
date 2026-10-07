@@ -3,7 +3,7 @@ package nanocodex
 import "encoding/json"
 
 // HelperVersion identifies the helper release required by this adapter.
-const HelperVersion = "0.3.0"
+const HelperVersion = "0.4.0"
 
 // Initialize selects native configuration and an optional existing rollout.
 type Initialize struct {
