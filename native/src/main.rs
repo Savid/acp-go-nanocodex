@@ -123,15 +123,7 @@ impl Server {
         }
         if let (Some(session), Some(payload)) = (&self.session, value["payload"].as_object_mut()) {
             session.report_gateway_model(payload);
-        }
-        if let Some(details) = value
-            .get_mut("payload")
-            .and_then(|payload| payload.get_mut("usage"))
-            .and_then(|usage| usage.get_mut("input_tokens_details"))
-            .and_then(Value::as_object_mut)
-            && details.get("cache_write_tokens").and_then(Value::as_u64) == Some(0)
-        {
-            details.remove("cache_write_tokens");
+            session.gateway_layer.report_cache_usage(data.kind, payload);
         }
         self.write(json!({"event": "native", "requestId": id, "data": value}))
             .await

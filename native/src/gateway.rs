@@ -4,6 +4,7 @@ use crate::{
 };
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
+use nanocodex::agent::events::AgentEventKind;
 use nanocodex::oai::{
     ResponseError,
     auth::OpenAiAuth,
@@ -15,10 +16,10 @@ use nanocodex::oai::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -49,6 +50,12 @@ struct GatewayRoute {
     config: GatewayConfig,
     client: reqwest::Client,
     events: mpsc::Sender<GatewayEvent>,
+    cache_usage: Mutex<HashMap<u32, CacheUsage>>,
+}
+
+struct CacheUsage {
+    cached_read_tokens: Option<u64>,
+    cached_write_tokens: Option<u64>,
 }
 
 impl GatewayLayer {
@@ -69,10 +76,60 @@ impl GatewayLayer {
                     config,
                     client,
                     events,
+                    cache_usage: Mutex::default(),
                 }))
             })
             .transpose()?;
         Ok((Self { route }, receiver))
+    }
+
+    /// Preserves the provider's optional cache counts on a native call event.
+    pub fn report_cache_usage(
+        &self,
+        kind: AgentEventKind,
+        payload: &mut serde_json::Map<String, Value>,
+    ) {
+        let reported = if kind == AgentEventKind::ModelCallCompleted {
+            payload
+                .get("call_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| u32::try_from(index).ok())
+                .and_then(|index| {
+                    self.route
+                        .as_ref()?
+                        .cache_usage
+                        .lock()
+                        .unwrap()
+                        .remove(&index)
+                })
+        } else {
+            None
+        };
+        let Some(details) = payload
+            .get_mut("usage")
+            .and_then(|usage| usage.get_mut("input_tokens_details"))
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        if let Some(reported) = reported {
+            for (name, value) in [
+                ("cached_tokens", reported.cached_read_tokens),
+                ("cache_write_tokens", reported.cached_write_tokens),
+            ] {
+                match value {
+                    Some(value) => {
+                        details.insert(name.to_owned(), json!(value));
+                    }
+                    None => {
+                        details.remove(name);
+                    }
+                }
+            }
+        } else if details.get("cache_write_tokens").and_then(Value::as_u64) == Some(0) {
+            // Native usage cannot distinguish absent cache writes from zero.
+            details.remove("cache_write_tokens");
+        }
     }
 }
 
@@ -654,6 +711,11 @@ impl GatewayRoute {
                     }
                     let committed_output =
                         response["output"].as_array().cloned().unwrap_or_default();
+                    let details = &response["usage"]["input_tokens_details"];
+                    let cache_usage = CacheUsage {
+                        cached_read_tokens: details["cached_tokens"].as_u64(),
+                        cached_write_tokens: details["cache_write_tokens"].as_u64(),
+                    };
                     let response: CompletedResponse = serde_json::from_value(response)
                         .map_err(|_| failure("invalid gateway completion"))?;
                     if compacting && response.status == "incomplete" {
@@ -677,6 +739,10 @@ impl GatewayRoute {
                         first_output,
                         pipeline,
                     )?;
+                    self.cache_usage
+                        .lock()
+                        .unwrap()
+                        .insert(model_call_index, cache_usage);
                     return Ok((ResponsesOutput::Generation(output), committed_output));
                 }
                 Some("response.incomplete") if compacting => {

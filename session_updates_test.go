@@ -87,8 +87,10 @@ func TestCallUsageRequiresReportedCacheAccountingForUncachedInput(t *testing.T) 
 		{name: "missing"},
 		{name: "null", details: json.RawMessage(`null`)},
 		{name: "unknown writes", details: json.RawMessage(`{"cached_tokens":4}`), read: new(4)},
+		{name: "unknown reads", details: json.RawMessage(`{"cache_write_tokens":0}`), write: new(0)},
 		{name: "reported zero", details: json.RawMessage(`{"cached_tokens":0,"cache_write_tokens":0}`), input: new(12), read: new(0), write: new(0)},
 		{name: "cache split", details: json.RawMessage(`{"cached_tokens":4,"cache_write_tokens":3}`), input: new(5), read: new(4), write: new(3)},
+		{name: "cache exceeds input", details: json.RawMessage(`{"cached_tokens":10,"cache_write_tokens":3}`), read: new(10), write: new(3)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()

@@ -29,14 +29,19 @@ Events have `event`, `requestId` (the active prompt's integer ID), and `data`.
 `accepted` contains `{turnId}` and precedes every `native` event for its prompt.
 A `native` event contains the upstream typed `AgentEvent` JSON object,
 including `type`, `seq`, `request_id`, and `payload`. Failure-event messages
-are sanitized to exclude provider response bodies. Zero cache-write counts
-are omitted because the upstream type loses whether the provider reported
-them. In a gateway-model session, a payload `model` naming the base model
-reports the gateway model instead, and `estimated_cost`, `cost_usd`, and
-`cost_status`, which are priced at the base model's rates, are removed.
-Native-model events are unchanged. Native `run.completed` and
-`run.failed` events do not terminate the RPC: the prompt reply is authoritative
-and follows event draining and the durable rollout flush.
+are sanitized to exclude provider response bodies. Gateway `model.call.completed`
+usage preserves reported cache reads and writes, including zero, and omits
+absent counts. Native routes omit zero cache-write counts because the upstream
+type loses whether the provider reported them.
+
+In a gateway-model session, a payload `model` naming the base model reports
+the gateway model instead. The `estimated_cost`, `cost_usd`, and `cost_status`
+fields, which are priced at the base model's rates, are removed. Native model
+names are preserved.
+
+Native `run.completed` and `run.failed` events do not terminate the RPC: the
+prompt reply is authoritative and follows event draining and the durable
+rollout flush.
 
 Configured API-key HTTPS endpoints use standard Responses requests through
 an application-owned transport. Its streaming events are `assistant_delta`,

@@ -769,15 +769,6 @@ async fn openrouter_uses_selected_key_namespace_and_full_history_on_followup() {
         .await;
     assert_eq!(response["usage"]["inputTokens"], 12);
     assert_eq!(response["usage"]["cachedInputTokens"], 4);
-    for event in &helper.events {
-        if event["data"]["type"] == "model.call.completed" {
-            assert!(
-                event["data"]["payload"]["usage"]["input_tokens_details"]
-                    .get("cache_write_tokens")
-                    .is_none()
-            );
-        }
-    }
     assert_eq!(response["usage"]["outputTokens"], 3);
     helper.shutdown(4).await;
     let requests = provider.requests();
@@ -2609,6 +2600,48 @@ fn usage_with(fields: Value) -> Value {
         usage[name] = value.clone();
     }
     usage
+}
+
+#[tokio::test]
+async fn gateway_preserves_reported_cache_accounting_in_native_call_usage() {
+    let cache_details = [
+        json!({"cached_tokens":4,"cache_write_tokens":0}),
+        json!({"cached_tokens":4}),
+        json!({"cached_tokens":4,"cache_write_tokens":3}),
+        json!({"cache_write_tokens":0}),
+    ];
+    let provider = Provider::start(cache_details.iter().map(|details| {
+        completed_with_usage(
+            "resp_usage",
+            usage_with(json!({"input_tokens_details":details})),
+        )
+    }))
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    for (id, expected) in (2..).zip(&cache_details) {
+        helper.events.clear();
+        helper.call(id, "prompt", prompt("report usage")).await;
+        let calls: Vec<_> = helper
+            .events
+            .iter()
+            .filter(|event| event["data"]["type"] == "model.call.completed")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        let payload = &calls[0]["data"]["payload"];
+        assert_eq!(payload["response_id"], "resp_usage");
+        assert_eq!(&payload["usage"]["input_tokens_details"], expected);
+    }
+    helper.shutdown(6).await;
+    assert_eq!(provider.requests().len(), cache_details.len());
 }
 
 #[tokio::test]

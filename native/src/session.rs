@@ -259,6 +259,7 @@ pub struct Session {
     pub agent: Nanocodex,
     pub events: AgentEvents,
     pub gateway_events: tokio::sync::mpsc::Receiver<GatewayEvent>,
+    pub gateway_layer: GatewayLayer,
     /// The selected native model, or the base model whose settings a gateway
     /// model uses.
     model: Model,
@@ -640,7 +641,7 @@ impl Session {
             openai = openai.model_id_prefix(prefix);
         }
         let openai = openai
-            .layer(gateway_layer)
+            .layer(gateway_layer.clone())
             .build()
             .map_err(|_| SessionError::invalid_config())?;
         let tools = Tools::builder()
@@ -674,6 +675,7 @@ impl Session {
             agent,
             events,
             gateway_events,
+            gateway_layer,
             model,
             gateway_model,
             context_window: config.context_window,
