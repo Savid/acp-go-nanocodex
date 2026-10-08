@@ -244,7 +244,7 @@ func TestConformanceEnvironmentCaptureScopeAndPathPrecedence(t *testing.T) {
 	env := map[string]string{fakeHelperEnv: "1", "GORACE": "atexit_sleep_ms=0", "PATH": baseDir, "NANOCODEX_TEST_SCOPE": "agent", "NANOCODEX_TEST_CAPTURE": capture}
 	a, _, home, workspace := fixtureAgent(t, WithExecutablePath(name), WithEnv(env))
 	t.Setenv("NANOCODEX_TEST_INHERITED", "after-construction")
-	first := NewNanocodexOptions(WithNanocodexEnv(map[string]string{"NANOCODEX_TEST_SCOPE": "session", "PATH": sessionDir, "CODEX_HOME": t.TempDir()}), WithNanocodexExtraPathDirs(extraDir))
+	first := NewNanocodexOptions(WithNanocodexEnv(map[string]string{"NANOCODEX_TEST_SCOPE": "session", "PATH": sessionDir, "CODEX_HOME": t.TempDir()}), WithNanocodexExtraPathDirs(extraDir), WithNanocodexShellEnv("EXAMPLE_API_TOKEN"))
 	fixtureSession(t, a, workspace, WithSessionNanocodexOptions(first))
 	fixtureSession(t, a, workspace)
 	file, err := os.Open(capture)
@@ -263,6 +263,10 @@ func TestConformanceEnvironmentCaptureScopeAndPathPrecedence(t *testing.T) {
 	require.Equal(t, "agent", captured[1]["scope"])
 	require.Equal(t, extraDir+string(os.PathListSeparator)+sessionDir, captured[0]["path"])
 	require.Equal(t, baseDir, captured[1]["path"])
+	withShellEnv, ok := captured[0]["initialize"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, []any{"EXAMPLE_API_TOKEN"}, withShellEnv["shellEnv"])
+	require.NotContains(t, captured[1]["initialize"], "shellEnv")
 	expectedHome, err := filepath.EvalSymlinks(home)
 	require.NoError(t, err)
 	for _, row := range captured {

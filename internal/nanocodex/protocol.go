@@ -19,6 +19,9 @@ type Initialize struct {
 	APIKeyEnv       string `json:"apiKeyEnv,omitempty"`
 	AuthFile        string `json:"authFile,omitempty"`
 	ResumeSessionID string `json:"resumeSessionId,omitempty"`
+	// ShellEnv names helper environment variables the tool shell receives
+	// even though their names look sensitive.
+	ShellEnv []string `json:"shellEnv,omitempty"`
 }
 
 // State identifies a flushed native rollout and its model catalog.

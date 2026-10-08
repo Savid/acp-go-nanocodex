@@ -209,7 +209,7 @@ func startBinary(t *testing.T, nativeHome, endpoint string) *rpcHarness {
 	command.Env = append(os.Environ(),
 		"OPENAI_API_KEY=fixture-bearer-token", "OPENAI_BASE_URL="+endpoint,
 		"NANOCODEX_MODEL_ID_PREFIX=openai-codex", "NANOCODEX_TRANSPORT=https", "NANOCODEX_API_KEY_ENV=OPENAI_API_KEY",
-		"NANOCODEX_BASE_MODEL=", "NANOCODEX_CONTEXT_WINDOW=", "OTEL_SDK_DISABLED=true")
+		"NANOCODEX_BASE_MODEL=", "NANOCODEX_CONTEXT_WINDOW=", "NANOCODEX_SHELL_ENV=", "OTEL_SDK_DISABLED=true")
 
 	return startCommand(t, command)
 }
@@ -221,7 +221,7 @@ func startNative(t *testing.T, nativeHome, workspace string) *rpcHarness {
 	command.Dir = workspace
 	command.Env = append(os.Environ(), "CODEX_HOME="+nativeHome, "OPENAI_API_KEY=fixture-bearer-token",
 		"OPENAI_BASE_URL=", "NANOCODEX_MODEL_ID_PREFIX=", "NANOCODEX_TRANSPORT=https", "NANOCODEX_API_KEY_ENV=OPENAI_API_KEY",
-		"NANOCODEX_BASE_MODEL=", "NANOCODEX_CONTEXT_WINDOW=")
+		"NANOCODEX_BASE_MODEL=", "NANOCODEX_CONTEXT_WINDOW=", "NANOCODEX_SHELL_ENV=")
 	h := startCommand(t, command)
 	h.native = true
 
@@ -279,7 +279,7 @@ func startEmbedded(t *testing.T, nativeHome string, store acpcore.SessionStore) 
 			nanocodexacp.WithHome(nativeHome), nanocodexacp.WithSessionStore(store),
 			nanocodexacp.WithLogger(slog.New(slog.DiscardHandler)),
 			nanocodexacp.WithEnv(map[string]string{"OPENAI_API_KEY": "fixture-bearer-token", "OPENAI_BASE_URL": "", "NANOCODEX_MODEL_ID_PREFIX": "", "NANOCODEX_TRANSPORT": "https", "NANOCODEX_API_KEY_ENV": "OPENAI_API_KEY",
-				"NANOCODEX_BASE_MODEL": "", "NANOCODEX_CONTEXT_WINDOW": ""}))
+				"NANOCODEX_BASE_MODEL": "", "NANOCODEX_CONTEXT_WINDOW": "", "NANOCODEX_SHELL_ENV": ""}))
 	}()
 
 	return newRPC(t, reader, writer, func() {
@@ -374,6 +374,8 @@ func newProviderWithResponseMode(t *testing.T, shell bool, mode string) *provide
 			writeEvent(map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "Checking"})
 			writeEvent(map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
 			output = []map[string]any{item, providerMessage("Checking complete")}
+		case mode == "shell-env" && number == 1:
+			output = []map[string]any{{"type": "function_call", "call_id": "shell-env-fixture", "name": "exec_command", "arguments": mustString(t, map[string]any{"cmd": shellEnvProbe, "login": false})}}
 		case shell && number == 1:
 			output = []map[string]any{{"type": "function_call", "call_id": "shell-fixture", "name": "exec_command", "arguments": `{"cmd":"printf native-file-value > integration-proof.txt; printf tool-proof","max_output_tokens":100}`}}
 		default:
@@ -404,6 +406,20 @@ func newProviderWithResponseMode(t *testing.T, shell bool, mode string) *provide
 	t.Cleanup(provider.server.Close)
 
 	return provider
+}
+
+// shellEnvProbe reports whether the allowed sensitive variable reached the
+// tool shell without naming its value, prints it for redaction, and reports
+// whether the withheld one was stripped.
+const shellEnvProbe = `test "${#FIXTURE_ALLOWED_TOKEN}" = 22 && printf 'allowed-present '; printf '%s|%s' "$FIXTURE_ALLOWED_TOKEN" "${FIXTURE_DENIED_TOKEN:-denied-absent}"`
+
+func mustString(t *testing.T, value any) string {
+	t.Helper()
+
+	encoded, err := json.Marshal(value)
+	require.NoError(t, err)
+
+	return string(encoded)
 }
 
 func providerMessage(text string) map[string]any {

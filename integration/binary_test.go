@@ -74,6 +74,34 @@ func TestSmokeBinaryUsesGatewayAndNativeTools(t *testing.T) {
 	require.Contains(t, string(mustJSON(t, requests[1])), "tool-proof")
 }
 
+func TestSmokeShellEnvForwardsNamedSensitiveVariablesRedacted(t *testing.T) {
+	requireIntegration(t)
+
+	provider := newProviderWithResponseMode(t, false, "shell-env")
+	h := startBinary(t, t.TempDir(), provider.server.URL+"/v1")
+	initializeACP(t, h)
+	options := nanocodexacp.NewNanocodexOptions(
+		nanocodexacp.WithNanocodexEnv(map[string]string{"FIXTURE_ALLOWED_TOKEN": "fixture-allowed-secret", "FIXTURE_DENIED_TOKEN": "fixture-denied-secret"}),
+		nanocodexacp.WithNanocodexShellEnv("FIXTURE_ALLOWED_TOKEN"),
+	)
+	created := h.call(t, "session/new", wire.NewSessionRequest(t.TempDir(), nanocodexacp.WithSessionNanocodexOptions(options), nanocodexacp.WithSessionRawEvents(true)))
+	id := sessionID(t, created)
+	result := h.call(t, "session/prompt", wire.TextPromptRequest(id, "probe the shell environment"))
+	require.Equal(t, "end_turn", result["stopReason"])
+	h.call(t, "session/close", acp.CloseSessionRequest{SessionId: id})
+	h.stop()
+
+	requests := provider.history(t)
+	require.Len(t, requests, 2)
+	continuation := string(mustJSON(t, requests[1]))
+	require.Contains(t, continuation, "allowed-present [REDACTED]|denied-absent")
+
+	for _, secret := range []string{"fixture-allowed-secret", "fixture-denied-secret"} {
+		require.NotContains(t, continuation, secret)
+		require.NotContains(t, string(mustJSON(t, h.notices)), secret)
+	}
+}
+
 func TestSmokeNativeViewImageDoesNotPublishBinaryData(t *testing.T) {
 	requireIntegration(t)
 	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII="
@@ -693,7 +721,7 @@ func TestLiveGatewayModelJourney(t *testing.T) {
 	command := exec.CommandContext(t.Context(), binaryPath(t, "ACP_GO_NANOCODEX_AGENT_BINARY", "acp-go-nanocodex", true),
 		"--path", binaryPath(t, "ACP_GO_NANOCODEX_HARNESS_PATH", "acp-go-nanocodex-native", true), "--home", t.TempDir(), "--model", model)
 	command.Env = append(os.Environ(), "OTEL_SDK_DISABLED=true", "OPENAI_BASE_URL="+recorder.URL, "NANOCODEX_TRANSPORT=https",
-		"NANOCODEX_BASE_MODEL=", "NANOCODEX_CONTEXT_WINDOW=")
+		"NANOCODEX_BASE_MODEL=", "NANOCODEX_CONTEXT_WINDOW=", "NANOCODEX_SHELL_ENV=")
 	h := startCommand(t, command)
 	h.timeout = 2 * time.Minute
 	initializeACP(t, h)

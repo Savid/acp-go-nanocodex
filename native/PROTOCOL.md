@@ -147,7 +147,7 @@ requests and retry delays.
 
 - `initialize`: `{sessionId, model?, baseModel?, contextWindow?, thinking?,
   apiBaseUrl?, websocketUrl?, modelIdPrefix?, transport?, apiKeyEnv?, authFile?,
-  resumeSessionId?}`.
+  resumeSessionId?, shellEnv?}`.
   `sessionId` is a caller-generated UUIDv7 reserved under the native session
   lock. All six upstream model IDs are accepted, including those omitted
   from its default three-model picker. Native aliases such as `sol`, `luna`,
@@ -168,9 +168,18 @@ requests and retry delays.
   maximum. Resume accepts a changed `contextWindow`.
   Explicit parameters override inherited `OPENAI_BASE_URL`,
   `NANOCODEX_MODEL_ID_PREFIX`, `NANOCODEX_TRANSPORT`, `NANOCODEX_API_KEY_ENV`,
-  `NANOCODEX_BASE_MODEL`, and `NANOCODEX_CONTEXT_WINDOW` for their
-  corresponding fields. `NANOCODEX_BASE_MODEL` applies whenever no rollout
+  `NANOCODEX_BASE_MODEL`, `NANOCODEX_CONTEXT_WINDOW`, and
+  `NANOCODEX_SHELL_ENV` for their corresponding fields. `NANOCODEX_BASE_MODEL` applies whenever no rollout
   supplies the base model and is ignored for native models.
+  `shellEnv` is an array of environment variable names, each an ASCII letter
+  or underscore followed by ASCII letters, digits, or underscores; without it,
+  `NANOCODEX_SHELL_ENV` supplies a comma-separated list. Any other name,
+  including an empty list entry, fails as `shellEnv`. The helper reads the
+  named variables from its environment during initialization, skips unset
+  ones, and passes them to the native tool shell as explicit overrides. The
+  shell otherwise strips inherited variables with sensitive name parts; these
+  values reach its commands and, at eight UTF-8 bytes or longer, are redacted
+  from tool output.
   The default transport is `https`; `websocket` is opt-in. HTTPS always uses
   full history replay and `store:false`. `apiKeyEnv` defaults to
   `OPENAI_API_KEY`. When neither `apiKeyEnv` nor `NANOCODEX_API_KEY_ENV`

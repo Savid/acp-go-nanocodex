@@ -13,10 +13,10 @@ import (
 func TestNanocodexOptionsMetaRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	options := NewNanocodexOptions(WithNanocodexModel("opencode-go/qwen3.8-flash"), WithNanocodexBaseModel("kimi-k3"), WithNanocodexContextWindow(262144))
+	options := NewNanocodexOptions(WithNanocodexModel("opencode-go/qwen3.8-flash"), WithNanocodexBaseModel("kimi-k3"), WithNanocodexContextWindow(262144), WithNanocodexShellEnv("EXAMPLE_API_TOKEN", "_ALT_KEY2"))
 	encoded, err := json.Marshal(options.Meta())
 	require.NoError(t, err)
-	require.JSONEq(t, `{"nanocodex":{"options":{"model":"opencode-go/qwen3.8-flash","baseModel":"kimi-k3","contextWindow":262144}}}`, string(encoded))
+	require.JSONEq(t, `{"nanocodex":{"options":{"model":"opencode-go/qwen3.8-flash","baseModel":"kimi-k3","contextWindow":262144,"shellEnv":["EXAMPLE_API_TOKEN","_ALT_KEY2"]}}}`, string(encoded))
 
 	var decoded map[string]any
 	require.NoError(t, json.Unmarshal(encoded, &decoded))
@@ -29,7 +29,9 @@ func TestNanocodexOptionsMetaRoundTrip(t *testing.T) {
 	require.Equal(t, nanocodex.Initialize{
 		SessionID: "session", ResumeSessionID: "native",
 		Model: "opencode-go/qwen3.8-flash", BaseModel: "kimi-k3", ContextWindow: 262144,
+		ShellEnv: []string{"EXAMPLE_API_TOKEN", "_ALT_KEY2"},
 	}, options.initialize("session", "native"))
+	require.Nil(t, NewNanocodexOptions().initialize("session", "").ShellEnv)
 }
 
 func TestValidateNanocodexSessionMeta(t *testing.T) {
@@ -41,6 +43,8 @@ func TestValidateNanocodexSessionMeta(t *testing.T) {
 	require.NoError(t, ValidateNanocodexSessionMeta(nil))
 	require.NoError(t, ValidateNanocodexSessionMeta(options(metaContextWindow, 262144)))
 	require.NoError(t, ValidateNanocodexSessionMeta(options(metaContextWindow, 262144.0)))
+	require.NoError(t, ValidateNanocodexSessionMeta(options(metaShellEnv, []any{"EXAMPLE_API_TOKEN", "_X1"})))
+	require.NoError(t, ValidateNanocodexSessionMeta(options(metaShellEnv, []any{})))
 
 	for _, test := range []struct {
 		name   string
@@ -60,6 +64,14 @@ func TestValidateNanocodexSessionMeta(t *testing.T) {
 		{"padded base model", metaBaseModel, " kimi-k3"},
 		{"spaced base model", metaBaseModel, "kimi k3"},
 		{"numeric base model", metaBaseModel, 5},
+		{"string shell env", metaShellEnv, "EXAMPLE_API_TOKEN"},
+		{"empty shell env name", metaShellEnv, []any{""}},
+		{"digit-led shell env name", metaShellEnv, []any{"1TOKEN"}},
+		{"spaced shell env name", metaShellEnv, []any{"EXAMPLE API_TOKEN"}},
+		{"assignment shell env name", metaShellEnv, []any{"A=B"}},
+		{"hyphenated shell env name", metaShellEnv, []any{"EXAMPLE-API-TOKEN"}},
+		{"non-ASCII shell env name", metaShellEnv, []any{"TOKÉN"}},
+		{"NUL shell env name", metaShellEnv, []any{"TOKEN\x00"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()

@@ -20,6 +20,7 @@ const (
 	metaAPIBaseURL                        = "apiBaseUrl"
 	metaWebsocketURL                      = "websocketUrl"
 	metaAPIKeyEnv                         = "apiKeyEnv"
+	metaShellEnv                          = "shellEnv"
 	metaOptionsKey                        = "options"
 	metaRawEventKey                       = "rawEvent"
 	metaEnabledKey                        = "enabled"
@@ -45,6 +46,10 @@ type NanocodexOptions struct {
 	Transport     string `json:"transport,omitempty"`
 	APIKeyEnv     string `json:"apiKeyEnv,omitempty"`
 	AuthFile      string `json:"authFile,omitempty"`
+	// ShellEnv names variables of the helper's environment that the tool
+	// shell receives even though their names look sensitive. Their values
+	// stay redacted in tool output. Nil leaves NANOCODEX_SHELL_ENV in effect.
+	ShellEnv []string `json:"shellEnv,omitempty"`
 }
 
 // NanocodexOption configures per-session native options.
@@ -126,9 +131,29 @@ func WithNanocodexAuthFile(path string) NanocodexOption {
 	return func(o *NanocodexOptions) { o.AuthFile = path }
 }
 
+// WithNanocodexShellEnv names variables of the helper's environment that the
+// tool shell receives even though the shell's sensitive-name filter would
+// strip them. Values are read when the helper starts and stay redacted in
+// tool output; unset names are skipped.
+func WithNanocodexShellEnv(names ...string) NanocodexOption {
+	copied := slices.Clone(names)
+
+	return func(o *NanocodexOptions) { o.ShellEnv = slices.Clone(copied) }
+}
+
+// list returns the ordered-list option stored under the metadata name.
+func (o *NanocodexOptions) list(name string) *[]string {
+	if name == metaShellEnv {
+		return &o.ShellEnv
+	}
+
+	return &o.ExtraPathDirs
+}
+
 func (o NanocodexOptions) clone() NanocodexOptions {
 	o.Env = maps.Clone(o.Env)
 	o.ExtraPathDirs = slices.Clone(o.ExtraPathDirs)
+	o.ShellEnv = slices.Clone(o.ShellEnv)
 
 	return o
 }
@@ -155,6 +180,10 @@ func (o NanocodexOptions) values() map[string]any {
 		values["extraPathDirs"] = slices.Clone(o.ExtraPathDirs)
 	}
 
+	if o.ShellEnv != nil {
+		values[metaShellEnv] = slices.Clone(o.ShellEnv)
+	}
+
 	if o.ContextWindow != 0 {
 		values[metaContextWindow] = o.ContextWindow
 	}
@@ -173,6 +202,7 @@ func (o NanocodexOptions) initialize(sessionID, nativeID string) nanocodex.Initi
 	return nanocodex.Initialize{
 		Model: o.Model, BaseModel: o.BaseModel, ContextWindow: o.ContextWindow, Thinking: o.Thinking, APIBaseURL: o.APIBaseURL, WebsocketURL: o.WebsocketURL,
 		ModelIDPrefix: o.ModelIDPrefix, Transport: o.Transport, APIKeyEnv: o.APIKeyEnv, AuthFile: o.AuthFile, SessionID: sessionID, ResumeSessionID: nativeID,
+		ShellEnv: slices.Clone(o.ShellEnv),
 	}
 }
 
@@ -239,13 +269,13 @@ func parseSessionMeta(meta map[string]any) (sessionMeta, error) {
 					}
 
 					parsed.options.Env = env
-				case "extraPathDirs":
-					dirs, err := wire.StringSliceOption(value, path)
+				case "extraPathDirs", metaShellEnv:
+					list, err := wire.StringSliceOption(value, path)
 					if err != nil {
 						return parsed, err
 					}
 
-					parsed.options.ExtraPathDirs = dirs
+					*parsed.options.list(name) = list
 				case metaContextWindow:
 					tokens, ok := positiveInteger(value)
 					if !ok {
@@ -349,7 +379,24 @@ func validateNativeOptions(o NanocodexOptions) error {
 		return wire.Unsupported(wire.MetaOptionPath(vendor, metaAPIKeyEnv))
 	}
 
+	if slices.ContainsFunc(o.ShellEnv, func(name string) bool { return !validEnvName(name) }) {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaShellEnv))
+	}
+
 	return nil
+}
+
+// validEnvName accepts a portable environment variable name: an ASCII letter
+// or underscore followed by ASCII letters, digits, or underscores.
+func validEnvName(name string) bool {
+	for i, r := range name {
+		letter := r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')
+		if !letter && (i == 0 || r < '0' || r > '9') {
+			return false
+		}
+	}
+
+	return name != ""
 }
 
 // forModelChange drops the settings that describe the previously selected model.
@@ -411,6 +458,10 @@ func (m sessionMeta) inherit(options NanocodexOptions) NanocodexOptions {
 
 	if m.present["extraPathDirs"] {
 		base["extraPathDirs"] = slices.Clone(m.options.ExtraPathDirs)
+	}
+
+	if m.present[metaShellEnv] {
+		base[metaShellEnv] = slices.Clone(m.options.ShellEnv)
 	}
 
 	parsed, _ := parseSessionMeta(map[string]any{vendor: map[string]any{metaOptionsKey: base}})

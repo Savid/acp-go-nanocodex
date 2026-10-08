@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::{
     env,
     error::Error,
+    ffi::OsString,
     fmt,
     fs::File,
     io::{BufRead, BufReader},
@@ -247,6 +248,7 @@ struct Config {
     api_key_env: Option<String>,
     auth_file: Option<PathBuf>,
     resume_session_id: Option<String>,
+    shell_env: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -288,6 +290,39 @@ fn has_space_or_control(text: &str) -> bool {
 
 fn env_value(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Accepts a portable environment variable name: an ASCII letter or
+/// underscore followed by ASCII letters, digits, or underscores.
+fn valid_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Reads the named variables from the helper's environment for the tool
+/// shell. The shell withholds inherited variables whose names look sensitive;
+/// explicit overrides are restored and their values stay redacted in tool
+/// output. Unset names are skipped.
+fn shell_environment(names: &[String]) -> Result<Vec<(OsString, OsString)>, SessionError> {
+    if !names.iter().all(|name| valid_env_name(name)) {
+        return Err(SessionError::config("shellEnv"));
+    }
+    let mut environment: Vec<(OsString, OsString)> = Vec::new();
+    for name in names {
+        if environment
+            .iter()
+            .any(|(existing, _)| existing == name.as_str())
+        {
+            continue;
+        }
+        if let Some(value) = env::var_os(name) {
+            environment.push((name.into(), value));
+        }
+    }
+    Ok(environment)
 }
 
 fn native_home(workspace: &Path) -> Result<PathBuf, SessionError> {
@@ -430,6 +465,13 @@ impl Session {
                 .transpose()
                 .map_err(|_| SessionError::config("contextWindow"))?;
         }
+        let shell_env = match config.shell_env.take() {
+            Some(names) => names,
+            None => env_value("NANOCODEX_SHELL_ENV")
+                .map(|names| names.split(',').map(str::to_owned).collect())
+                .unwrap_or_default(),
+        };
+        let shell_environment = shell_environment(&shell_env)?;
         let workspace = env::current_dir().map_err(|_| SessionError::invalid_config())?;
         let home = native_home(&workspace)?;
         let writer_locks = writer_locks(&home, &config)?;
@@ -648,6 +690,7 @@ impl Session {
             .exposure(ToolExposure::DirectOnly)
             .web_search(false)
             .image_generation(false)
+            .process_environment(shell_environment)
             .build()
             .map_err(|_| SessionError::invalid_config())?;
         let mut builder = Nanocodex::builder(openai)

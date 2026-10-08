@@ -66,6 +66,7 @@ impl Helper {
             .env_remove("NANOCODEX_API_KEY_ENV")
             .env_remove("NANOCODEX_BASE_MODEL")
             .env_remove("NANOCODEX_CONTEXT_WINDOW")
+            .env_remove("NANOCODEX_SHELL_ENV")
             .env(key_env, "fixture-bearer-token")
             .envs(extra.iter().copied())
             .stdin(Stdio::piped())
@@ -148,6 +149,7 @@ enum Reply {
         streamed: bool,
     },
     Shell,
+    ShellCommand(&'static str),
     Hang,
     Rejected,
     HttpError {
@@ -430,6 +432,17 @@ async fn respond(
                     "id":"fc_shell", "type":"function_call", "call_id":"call_shell",
                     "name":"exec_command", "status":"completed",
                     "arguments":json!({"cmd":"printf 'fixture-file-value' > provider-tool.txt; printf 'fixture-tool-output'", "login":false}).to_string()
+                }]),
+            )),
+        ],
+        Reply::ShellCommand(command) => vec![
+            created,
+            sse(complete(
+                &id,
+                json!([{
+                    "id":"fc_command", "type":"function_call", "call_id":"call_command",
+                    "name":"exec_command", "status":"completed",
+                    "arguments":json!({"cmd":command, "login":false}).to_string()
                 }]),
             )),
         ],
@@ -741,6 +754,140 @@ async fn gateway_shell_tool_and_restored_rollout_continue_the_same_conversation(
             resumed.contains(retained),
             "restored provider history lost {retained}"
         );
+    }
+}
+
+const SHELL_ENV_PROBE: &str = "test \"${#FIXTURE_ALLOWED_TOKEN}\" = 22 && printf 'allowed-present '; printf '%s|%s|%s' \"$FIXTURE_ALLOWED_TOKEN\" \"${FIXTURE_DENIED_TOKEN:-denied-absent}\" \"${FIXTURE_UNSET_TOKEN:-unset-absent}\"";
+
+/// Runs one shell tool call with an allowed and a withheld sensitive variable
+/// and returns the provider continuation carrying the tool output, plus the
+/// helper events.
+async fn shell_env_probe(config_names: Option<Value>, inherited: Option<&str>) -> (String, String) {
+    let provider =
+        Provider::start([Reply::ShellCommand(SHELL_ENV_PROBE), Reply::Text("probed")]).await;
+    let workspace = TempDir::new().expect("workspace");
+    let native_home = TempDir::new().expect("native home");
+    let mut extra = vec![
+        ("FIXTURE_ALLOWED_TOKEN", "fixture-allowed-secret"),
+        ("FIXTURE_DENIED_TOKEN", "fixture-denied-secret"),
+    ];
+    if let Some(names) = inherited {
+        extra.push(("NANOCODEX_SHELL_ENV", names));
+    }
+    let mut helper = Helper::start_with_env(
+        workspace.path(),
+        native_home.path(),
+        "OMP_AUTH_GATEWAY_TOKEN",
+        &extra,
+    );
+    let mut config = initialize(&provider, "OMP_AUTH_GATEWAY_TOKEN", "openai-codex");
+    if let Some(names) = config_names {
+        config["shellEnv"] = names;
+    }
+    helper.call(1, "initialize", config).await;
+    let completed = helper.call(2, "prompt", prompt("probe the shell")).await;
+    assert_eq!(completed["finalMessage"], "probed");
+    let events = serde_json::to_string(&helper.events).expect("encode events");
+    helper.shutdown(3).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let output = requests[1].body["input"]
+        .as_array()
+        .expect("continuation input")
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .expect("shell tool output")
+        .to_string();
+    (output, events)
+}
+
+#[tokio::test]
+async fn shell_env_restores_named_sensitive_variables_with_redacted_values() {
+    for (names, inherited) in [
+        (
+            Some(json!(["FIXTURE_ALLOWED_TOKEN", "FIXTURE_UNSET_TOKEN"])),
+            None,
+        ),
+        (None, Some("FIXTURE_ALLOWED_TOKEN,FIXTURE_UNSET_TOKEN")),
+        // An explicit parameter replaces the inherited selection.
+        (
+            Some(json!(["FIXTURE_ALLOWED_TOKEN"])),
+            Some("FIXTURE_DENIED_TOKEN"),
+        ),
+    ] {
+        let (output, events) = shell_env_probe(names, inherited).await;
+        assert!(
+            output.contains("allowed-present [REDACTED]|denied-absent|unset-absent"),
+            "{output}"
+        );
+        for secret in ["fixture-allowed-secret", "fixture-denied-secret"] {
+            assert!(!output.contains(secret), "tool output leaked {secret}");
+            assert!(!events.contains(secret), "events leaked {secret}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn shell_env_defaults_to_withholding_sensitive_variables() {
+    for (names, inherited) in [
+        (None, None),
+        (Some(json!([])), Some("FIXTURE_ALLOWED_TOKEN")),
+    ] {
+        let (output, _) = shell_env_probe(names, inherited).await;
+        assert!(!output.contains("allowed-present"), "{output}");
+        assert!(!output.contains("fixture-allowed-secret"), "{output}");
+        assert!(output.contains("denied-absent"), "{output}");
+    }
+}
+
+#[tokio::test]
+async fn shell_env_refuses_invalid_variable_names() {
+    let provider = Provider::start([]).await;
+    for names in [
+        json!([""]),
+        json!(["1TOKEN"]),
+        json!(["EXAMPLE API_TOKEN"]),
+        json!(["A=B"]),
+        json!(["TOKEN-NAME"]),
+        json!("EXAMPLE_API_TOKEN"),
+    ] {
+        let workspace = TempDir::new().expect("workspace");
+        let native_home = TempDir::new().expect("native home");
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENAI_API_KEY");
+        let mut config = initialize(&provider, "OPENAI_API_KEY", "openai-codex");
+        config["shellEnv"] = names.clone();
+        helper.send(1, "initialize", config).await;
+        let reply = helper.reply(1).await;
+        if names.is_string() {
+            assert_eq!(reply["error"]["code"], "invalid_request", "{names}");
+        } else {
+            assert_eq!(reply["error"]["code"], "invalid_config", "{names}");
+            assert_eq!(reply["error"]["field"], "shellEnv", "{names}");
+        }
+    }
+    for inherited in [
+        "FIXTURE_TOKEN,",
+        ",FIXTURE_TOKEN",
+        "FIXTURE_TOKEN, OTHER_TOKEN",
+    ] {
+        let workspace = TempDir::new().expect("workspace");
+        let native_home = TempDir::new().expect("native home");
+        let mut helper = Helper::start_with_env(
+            workspace.path(),
+            native_home.path(),
+            "OPENAI_API_KEY",
+            &[("NANOCODEX_SHELL_ENV", inherited)],
+        );
+        helper
+            .send(
+                1,
+                "initialize",
+                initialize(&provider, "OPENAI_API_KEY", "openai-codex"),
+            )
+            .await;
+        let reply = helper.reply(1).await;
+        assert_eq!(reply["error"]["code"], "invalid_config", "{inherited}");
+        assert_eq!(reply["error"]["field"], "shellEnv", "{inherited}");
     }
 }
 

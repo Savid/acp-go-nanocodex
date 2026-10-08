@@ -40,8 +40,11 @@ Configure authentication through `OPENAI_API_KEY` or native `auth.json` in
 `CODEX_HOME` (default `$HOME/.codex`). Rollouts therefore use the caller's real
 `~/.codex/sessions` by default; use `-home` or `WithHome` for a separate root.
 The helper runs tools with the caller's
-identity, environment, and session working directory. There is no ACP approval
-or elicitation surface.
+identity, environment, and session working directory. Nanocodex's tool shell
+strips inherited variables whose `_`-separated name parts look sensitive, such
+as `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `AUTH`, or `CREDENTIAL`; the session
+`shellEnv` option restores named ones. There is no ACP approval or elicitation
+surface.
 
 For **OpenRouter, OMP auth-gateway, and OpenCode Go**, see [provider configuration](PROVIDERS.md).
 Configured API-key HTTPS routes use standard Responses requests with complete
@@ -139,11 +142,34 @@ it with `NewNanocodexOptions`, then attach it using
 | `transport` | `WithNanocodexTransport` | `https` (default) or `websocket`. |
 | `apiKeyEnv` | `WithNanocodexAPIKeyEnv` | Environment variable containing the provider key; defaults to `OPENAI_API_KEY`. |
 | `authFile` | `WithNanocodexAuthFile` | Native authentication file. |
+| `shellEnv` | `WithNanocodexShellEnv` | Helper environment variables the tool shell receives despite the sensitive-name filter; see [tool shell environment](#tool-shell-environment). |
 
 `ValidateNanocodexSessionMeta` validates this namespace without launching a
 helper. Unknown own-namespace fields are refused. Environment and path values
 are copied and stored with the session. Explicit session options override
 native environment defaults.
+
+### Tool shell environment
+
+`shellEnv` names variables that the tool shell receives even though their
+names would be stripped as sensitive, for a credential that commands
+legitimately need:
+
+```go
+nanocodexacp.NewNanocodexOptions(nanocodexacp.WithNanocodexShellEnv("EXAMPLE_API_TOKEN"))
+```
+
+Each name must be an ASCII letter or underscore followed by ASCII letters,
+digits, or underscores. The helper reads the values from its own environment,
+including the agent and session overlays, when the session's helper starts;
+unset names are skipped. A listed name replaces the shell's value for that
+variable, including the normalized `TERM`, `PAGER`, and locale settings.
+Values of at least eight UTF-8 bytes stay in the shell's redaction list, so
+tool output shows `[REDACTED]` in their place; shorter values are not
+redacted. Unlisted sensitive variables remain stripped. Without the option the
+helper reads a comma-separated list from `NANOCODEX_SHELL_ENV`; an empty
+option list also leaves that variable in effect. Every tool command can read
+these values, so name only credentials that tool commands are meant to use.
 
 ACP config selectors are `model` (category `model`) and `thought_level`
 (category `thought_level`). The model can change before the first committed
