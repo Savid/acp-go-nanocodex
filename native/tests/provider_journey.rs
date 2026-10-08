@@ -757,7 +757,7 @@ async fn gateway_shell_tool_and_restored_rollout_continue_the_same_conversation(
     }
 }
 
-const SHELL_ENV_PROBE: &str = "test \"${#FIXTURE_ALLOWED_TOKEN}\" = 22 && printf 'allowed-present '; printf '%s|%s|%s' \"$FIXTURE_ALLOWED_TOKEN\" \"${FIXTURE_DENIED_TOKEN:-denied-absent}\" \"${FIXTURE_UNSET_TOKEN:-unset-absent}\"";
+const SHELL_ENV_PROBE: &str = "test \"${#FIXTURE_ALLOWED_TOKEN}\" = 22 && printf 'allowed-present '; printf '%s|%s|%s|%s' \"$FIXTURE_ALLOWED_TOKEN\" \"${FIXTURE_DENIED_TOKEN:-denied-absent}\" \"${FIXTURE_UNSET_TOKEN:-unset-absent}\" \"${FIXTURE_SHORT_TOKEN:-short-absent}\"";
 
 /// Runs one shell tool call with an allowed and a withheld sensitive variable
 /// and returns the provider continuation carrying the tool output, plus the
@@ -770,6 +770,7 @@ async fn shell_env_probe(config_names: Option<Value>, inherited: Option<&str>) -
     let mut extra = vec![
         ("FIXTURE_ALLOWED_TOKEN", "fixture-allowed-secret"),
         ("FIXTURE_DENIED_TOKEN", "fixture-denied-secret"),
+        ("FIXTURE_SHORT_TOKEN", "short"),
     ];
     if let Some(names) = inherited {
         extra.push(("NANOCODEX_SHELL_ENV", names));
@@ -803,23 +804,32 @@ async fn shell_env_probe(config_names: Option<Value>, inherited: Option<&str>) -
 
 #[tokio::test]
 async fn shell_env_restores_named_sensitive_variables_with_redacted_values() {
-    for (names, inherited) in [
+    // Values shorter than eight bytes are forwarded without redaction.
+    for (names, inherited, short) in [
         (
-            Some(json!(["FIXTURE_ALLOWED_TOKEN", "FIXTURE_UNSET_TOKEN"])),
+            Some(json!([
+                "FIXTURE_ALLOWED_TOKEN",
+                "FIXTURE_UNSET_TOKEN",
+                "FIXTURE_SHORT_TOKEN"
+            ])),
             None,
+            "short",
         ),
-        (None, Some("FIXTURE_ALLOWED_TOKEN,FIXTURE_UNSET_TOKEN")),
+        (
+            None,
+            Some("FIXTURE_ALLOWED_TOKEN,FIXTURE_UNSET_TOKEN,FIXTURE_SHORT_TOKEN"),
+            "short",
+        ),
         // An explicit parameter replaces the inherited selection.
         (
             Some(json!(["FIXTURE_ALLOWED_TOKEN"])),
             Some("FIXTURE_DENIED_TOKEN"),
+            "short-absent",
         ),
     ] {
         let (output, events) = shell_env_probe(names, inherited).await;
-        assert!(
-            output.contains("allowed-present [REDACTED]|denied-absent|unset-absent"),
-            "{output}"
-        );
+        let expected = format!("allowed-present [REDACTED]|denied-absent|unset-absent|{short}");
+        assert!(output.contains(&expected), "{output}");
         for secret in ["fixture-allowed-secret", "fixture-denied-secret"] {
             assert!(!output.contains(secret), "tool output leaked {secret}");
             assert!(!events.contains(secret), "events leaked {secret}");
@@ -835,8 +845,10 @@ async fn shell_env_defaults_to_withholding_sensitive_variables() {
     ] {
         let (output, _) = shell_env_probe(names, inherited).await;
         assert!(!output.contains("allowed-present"), "{output}");
-        assert!(!output.contains("fixture-allowed-secret"), "{output}");
-        assert!(output.contains("denied-absent"), "{output}");
+        assert!(
+            output.contains("|denied-absent|unset-absent|short-absent"),
+            "{output}"
+        );
     }
 }
 

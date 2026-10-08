@@ -169,17 +169,19 @@ requests and retry delays.
   Explicit parameters override inherited `OPENAI_BASE_URL`,
   `NANOCODEX_MODEL_ID_PREFIX`, `NANOCODEX_TRANSPORT`, `NANOCODEX_API_KEY_ENV`,
   `NANOCODEX_BASE_MODEL`, `NANOCODEX_CONTEXT_WINDOW`, and
-  `NANOCODEX_SHELL_ENV` for their corresponding fields. `NANOCODEX_BASE_MODEL` applies whenever no rollout
-  supplies the base model and is ignored for native models.
+  `NANOCODEX_SHELL_ENV` for their corresponding fields.
+  `NANOCODEX_BASE_MODEL` applies whenever no rollout supplies the base model
+  and is ignored for native models.
   `shellEnv` is an array of environment variable names, each an ASCII letter
   or underscore followed by ASCII letters, digits, or underscores; without it,
-  `NANOCODEX_SHELL_ENV` supplies a comma-separated list. Any other name,
-  including an empty list entry, fails as `shellEnv`. The helper reads the
-  named variables from its environment during initialization, skips unset
-  ones, and passes them to the native tool shell as explicit overrides. The
-  shell otherwise strips inherited variables with sensitive name parts; these
-  values reach its commands and, at eight UTF-8 bytes or longer, are redacted
-  from tool output.
+  `NANOCODEX_SHELL_ENV` supplies a comma-separated list, and an empty array
+  selects no names. Any other name, including an empty list entry, fails as
+  `shellEnv`. The helper reads the named variables from its environment
+  during initialization, skips unset or non-UTF-8 values, and passes them to
+  the native tool shell as explicit overrides. The shell otherwise strips
+  inherited variables with sensitive name parts; these values reach its
+  commands and are redacted from tool output only when the name has a
+  sensitive part and the value is at least eight UTF-8 bytes.
   The default transport is `https`; `websocket` is opt-in. HTTPS always uses
   full history replay and `store:false`. `apiKeyEnv` defaults to
   `OPENAI_API_KEY`. When neither `apiKeyEnv` nor `NANOCODEX_API_KEY_ENV`

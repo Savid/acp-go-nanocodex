@@ -121,7 +121,7 @@ adapter. Invalid construction options fail before native launch.
 The command configures telemetry through `OTEL_*` environment variables.
 Library use does not change global telemetry providers.
 
-## Sessions and configuration
+### Session options
 
 `NanocodexOptions` is the typed `_meta.nanocodex.options` namespace. Construct
 it with `NewNanocodexOptions`, then attach it using
@@ -149,7 +149,7 @@ helper. Unknown own-namespace fields are refused. Environment and path values
 are copied and stored with the session. Explicit session options override
 native environment defaults.
 
-### Tool shell environment
+#### Tool shell environment
 
 `shellEnv` names variables that the tool shell receives even though their
 names would be stripped as sensitive, for a credential that commands
@@ -160,16 +160,19 @@ nanocodexacp.NewNanocodexOptions(nanocodexacp.WithNanocodexShellEnv("EXAMPLE_API
 ```
 
 Each name must be an ASCII letter or underscore followed by ASCII letters,
-digits, or underscores. The helper reads the values from its own environment,
-including the agent and session overlays, when the session's helper starts;
-unset names are skipped. A listed name replaces the shell's value for that
-variable, including the normalized `TERM`, `PAGER`, and locale settings.
-Values of at least eight UTF-8 bytes stay in the shell's redaction list, so
-tool output shows `[REDACTED]` in their place; shorter values are not
-redacted. Unlisted sensitive variables remain stripped. Without the option the
-helper reads a comma-separated list from `NANOCODEX_SHELL_ENV`; an empty
-option list also leaves that variable in effect. Every tool command can read
-these values, so name only credentials that tool commands are meant to use.
+digits, or underscores. Each helper launch reads the values from its own
+environment, including the agent and session overlays, and skips unset or
+non-UTF-8 values. Session `env` values are stored with the session, so prefer
+the process environment or `WithEnv` for credentials. A listed name replaces
+the shell's value for that variable, including the normalized `TERM`, `PAGER`,
+and locale settings. Tool output shows `[REDACTED]` in place of a value only
+when its name has a sensitive part and the value is at least eight UTF-8
+bytes; redaction matches the exact value, so commands that transform it reveal
+it. Unlisted sensitive variables remain stripped. Without the option the
+helper reads a comma-separated list from `NANOCODEX_SHELL_ENV`; an explicit
+empty list withholds every name. Every tool command can read these values,
+including the provider key if `shellEnv` names it, so a host that relays
+client `_meta` should restrict which names it accepts.
 
 ACP config selectors are `model` (category `model`) and `thought_level`
 (category `thought_level`). The model can change before the first committed

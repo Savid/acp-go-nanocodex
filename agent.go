@@ -369,22 +369,14 @@ func (a *Agent) Initialize(ctx context.Context, p acp.InitializeRequest) (resp a
 	return resp, nil
 }
 
-func rejectLifecycle(meta map[string]any) error {
-	if refusal := lifecycle.RejectKey(meta); refusal != nil {
-		return wire.ParamRefusal(refusal)
-	}
-
-	return nil
-}
-
 // Authenticate leaves native credential management outside ACP.
 func (a *Agent) Authenticate(_ context.Context, p acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
 	if err := a.ensureOpen(); err != nil {
 		return acp.AuthenticateResponse{}, err
 	}
 
-	if err := rejectLifecycle(p.Meta); err != nil {
-		return acp.AuthenticateResponse{}, err
+	if refusal := lifecycle.RejectKey(p.Meta); refusal != nil {
+		return acp.AuthenticateResponse{}, wire.ParamRefusal(refusal)
 	}
 
 	return acp.AuthenticateResponse{}, acp.NewInvalidParams(map[string]any{"methodId": p.MethodId})
@@ -396,8 +388,8 @@ func (a *Agent) Logout(_ context.Context, p acp.LogoutRequest) (acp.LogoutRespon
 		return acp.LogoutResponse{}, err
 	}
 
-	if err := rejectLifecycle(p.Meta); err != nil {
-		return acp.LogoutResponse{}, err
+	if refusal := lifecycle.RejectKey(p.Meta); refusal != nil {
+		return acp.LogoutResponse{}, wire.ParamRefusal(refusal)
 	}
 
 	return acp.LogoutResponse{}, acp.NewMethodNotFound(acp.AgentMethodLogout)
@@ -413,8 +405,8 @@ func (a *Agent) SetSessionMode(_ context.Context, p acp.SetSessionModeRequest) (
 		return acp.SetSessionModeResponse{}, err
 	}
 
-	if err := rejectLifecycle(p.Meta); err != nil {
-		return acp.SetSessionModeResponse{}, err
+	if refusal := lifecycle.RejectKey(p.Meta); refusal != nil {
+		return acp.SetSessionModeResponse{}, wire.ParamRefusal(refusal)
 	}
 
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)

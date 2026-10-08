@@ -74,7 +74,7 @@ func (a *Agent) environment(options NanocodexOptions) process.Environment {
 		owned["CODEX_HOME"] = a.options.Home
 	}
 
-	return process.Environment{Process: a.processEnv, Agent: a.options.Env, Session: options.Env, Owned: owned, ExtraPathDirs: options.ExtraPathDirs, InternalPrefix: "ACP_GO_NANOCODEX_INTERNAL_"}
+	return process.Environment{Process: a.processEnv, Agent: a.options.Env, Session: options.Env, Owned: owned, ExtraPathDirs: options.ExtraPathDirs, InternalPrefix: nanocodex.InternalEnvPrefix}
 }
 
 func (a *Agent) nativeHome(options NanocodexOptions, cwd string) (string, error) {

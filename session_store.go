@@ -190,7 +190,7 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 		return storedSession{}, errInvalidStoredSession
 	}
 
-	if err := validateNativeOptions(record.Options); err != nil {
+	if err := validateNanocodexOptions(record.Options); err != nil {
 		return storedSession{}, errInvalidStoredSession
 	}
 
@@ -372,9 +372,9 @@ func (a *Agent) restore(ctx context.Context, id acp.SessionId, cwd string, dirs 
 		return nil, wire.UnknownSession()
 	}
 
-	parsed.options = parsed.inherit(stored.record.Options)
+	parsed.options = inheritCarrier(parsed, stored.record)
 	if stored.record.Started && parsed.options.Model != stored.record.Options.Model {
-		return nil, wire.Unsupported(wire.MetaOptionPath(vendor, "model"))
+		return nil, wire.Unsupported(wire.MetaOptionPath(vendor, metaModelKey))
 	}
 
 	if stored.record.Started {

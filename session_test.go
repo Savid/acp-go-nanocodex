@@ -46,7 +46,7 @@ func TestNativeOptionRefusalsNameOnlySuppliedMetadata(t *testing.T) {
 	created := fixtureSession(t, agent, workspace, WithSessionNanocodexOptions(gateway))
 	_, err := agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
 	require.NoError(t, err)
-	for _, field := range []string{metaBaseModel, metaContextWindow} {
+	for _, field := range []string{metaBaseModelKey, metaContextWindowKey} {
 		model := "refuse-" + field
 		supplied := NewNanocodexOptions(WithNanocodexModel(model), WithNanocodexBaseModel("kimi-k3"), WithNanocodexContextWindow(262144))
 		_, err = agent.NewSession(t.Context(), wire.NewSessionRequest(workspace, WithSessionNanocodexOptions(supplied)))

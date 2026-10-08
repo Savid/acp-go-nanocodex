@@ -5,6 +5,9 @@ import "encoding/json"
 // HelperVersion identifies the helper release required by this adapter.
 const HelperVersion = "0.5.0"
 
+// InternalEnvPrefix names the adapter's private child-process markers.
+const InternalEnvPrefix = "ACP_GO_NANOCODEX_INTERNAL_"
+
 // Initialize selects native configuration and an optional existing rollout.
 type Initialize struct {
 	SessionID       string `json:"sessionId"`
@@ -20,8 +23,9 @@ type Initialize struct {
 	AuthFile        string `json:"authFile,omitempty"`
 	ResumeSessionID string `json:"resumeSessionId,omitempty"`
 	// ShellEnv names helper environment variables the tool shell receives
-	// even though their names look sensitive.
-	ShellEnv []string `json:"shellEnv,omitempty"`
+	// even though their names look sensitive; an empty list overrides the
+	// helper's environment selection.
+	ShellEnv []string `json:"shellEnv,omitzero"`
 }
 
 // State identifies a flushed native rollout and its model catalog.

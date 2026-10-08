@@ -1,6 +1,7 @@
 package nanocodexacp
 
 import (
+	"fmt"
 	"maps"
 	"math"
 	"net/netip"
@@ -9,23 +10,33 @@ import (
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
 )
 
 const (
-	metaThinking                          = "thinking"
-	metaBaseModel                         = "baseModel"
-	metaContextWindow                     = "contextWindow"
-	metaAPIBaseURL                        = "apiBaseUrl"
-	metaWebsocketURL                      = "websocketUrl"
-	metaAPIKeyEnv                         = "apiKeyEnv"
-	metaShellEnv                          = "shellEnv"
-	metaOptionsKey                        = "options"
-	metaRawEventKey                       = "rawEvent"
-	metaEnabledKey                        = "enabled"
-	configModel       acp.SessionConfigId = "model"
-	configThinking    acp.SessionConfigId = "thought_level"
+	metaOptionsKey       = "options"
+	metaRawEventKey      = "rawEvent"
+	metaModelKey         = "model"
+	metaEnvKey           = "env"
+	metaExtraPathDirsKey = "extraPathDirs"
+	metaBaseModelKey     = "baseModel"
+	metaContextWindowKey = "contextWindow"
+	metaThinkingKey      = "thinking"
+	metaAPIBaseURLKey    = "apiBaseUrl"
+	metaWebsocketURLKey  = "websocketUrl"
+	metaModelIDPrefixKey = "modelIdPrefix"
+	metaTransportKey     = "transport"
+	metaAPIKeyEnvKey     = "apiKeyEnv"
+	metaAuthFileKey      = "authFile"
+	metaShellEnvKey      = "shellEnv"
+	metaEnabledKey       = "enabled"
+)
+
+const (
+	configModel    acp.SessionConfigId = "model"
+	configThinking acp.SessionConfigId = "thought_level"
 )
 
 // NanocodexOptions selects one native agent's model, route, and environment.
@@ -47,9 +58,9 @@ type NanocodexOptions struct {
 	APIKeyEnv     string `json:"apiKeyEnv,omitempty"`
 	AuthFile      string `json:"authFile,omitempty"`
 	// ShellEnv names variables of the helper's environment that the tool
-	// shell receives even though their names look sensitive. Their values
-	// stay redacted in tool output. Nil leaves NANOCODEX_SHELL_ENV in effect.
-	ShellEnv []string `json:"shellEnv,omitempty"`
+	// shell receives even though their names look sensitive. Nil leaves
+	// NANOCODEX_SHELL_ENV in effect; an empty list withholds every name.
+	ShellEnv []string `json:"shellEnv,omitzero"`
 }
 
 // NanocodexOption configures per-session native options.
@@ -84,16 +95,16 @@ func WithNanocodexContextWindow(tokens int64) NanocodexOption {
 
 // WithNanocodexEnv sets the session environment overlay.
 func WithNanocodexEnv(env map[string]string) NanocodexOption {
-	copied := maps.Clone(env)
+	cloned := maps.Clone(env)
 
-	return func(o *NanocodexOptions) { o.Env = maps.Clone(copied) }
+	return func(o *NanocodexOptions) { o.Env = maps.Clone(cloned) }
 }
 
 // WithNanocodexExtraPathDirs prepends the ordered directories to the session PATH.
 func WithNanocodexExtraPathDirs(dirs ...string) NanocodexOption {
-	copied := slices.Clone(dirs)
+	cloned := slices.Clone(dirs)
 
-	return func(o *NanocodexOptions) { o.ExtraPathDirs = slices.Clone(copied) }
+	return func(o *NanocodexOptions) { o.ExtraPathDirs = slices.Clone(cloned) }
 }
 
 // WithNanocodexThinking selects a native reasoning effort.
@@ -133,222 +144,250 @@ func WithNanocodexAuthFile(path string) NanocodexOption {
 
 // WithNanocodexShellEnv names variables of the helper's environment that the
 // tool shell receives even though the shell's sensitive-name filter would
-// strip them. Values are read when the helper starts and stay redacted in
-// tool output; unset names are skipped.
+// strip them. Each helper launch reads the values and skips unset names.
+// Without names it withholds every sensitive variable and ignores
+// NANOCODEX_SHELL_ENV.
 func WithNanocodexShellEnv(names ...string) NanocodexOption {
-	copied := slices.Clone(names)
+	cloned := append([]string{}, names...)
 
-	return func(o *NanocodexOptions) { o.ShellEnv = slices.Clone(copied) }
+	return func(o *NanocodexOptions) { o.ShellEnv = slices.Clone(cloned) }
 }
 
-// list returns the ordered-list option stored under the metadata name.
-func (o *NanocodexOptions) list(name string) *[]string {
-	if name == metaShellEnv {
-		return &o.ShellEnv
-	}
+func (options NanocodexOptions) clone() NanocodexOptions {
+	options.Env = maps.Clone(options.Env)
+	options.ExtraPathDirs = slices.Clone(options.ExtraPathDirs)
+	options.ShellEnv = slices.Clone(options.ShellEnv)
 
-	return &o.ExtraPathDirs
-}
-
-func (o NanocodexOptions) clone() NanocodexOptions {
-	o.Env = maps.Clone(o.Env)
-	o.ExtraPathDirs = slices.Clone(o.ExtraPathDirs)
-	o.ShellEnv = slices.Clone(o.ShellEnv)
-
-	return o
+	return options
 }
 
 // Meta returns a fresh owned nanocodex options namespace.
-func (o NanocodexOptions) Meta() map[string]any {
-	return map[string]any{vendor: map[string]any{metaOptionsKey: o.values()}}
+func (options NanocodexOptions) Meta() map[string]any {
+	return map[string]any{vendor: map[string]any{metaOptionsKey: options.values()}}
 }
 
-func (o NanocodexOptions) values() map[string]any {
+func (options NanocodexOptions) values() map[string]any {
 	values := make(map[string]any)
 
-	for key, value := range o.strings() {
+	for key, value := range options.strings() {
 		if value != "" {
 			values[key] = value
 		}
 	}
 
-	if o.Env != nil {
-		values["env"] = maps.Clone(o.Env)
+	if options.Env != nil {
+		values[metaEnvKey] = maps.Clone(options.Env)
 	}
 
-	if o.ExtraPathDirs != nil {
-		values["extraPathDirs"] = slices.Clone(o.ExtraPathDirs)
+	if options.ExtraPathDirs != nil {
+		values[metaExtraPathDirsKey] = slices.Clone(options.ExtraPathDirs)
 	}
 
-	if o.ShellEnv != nil {
-		values[metaShellEnv] = slices.Clone(o.ShellEnv)
+	if options.ShellEnv != nil {
+		values[metaShellEnvKey] = slices.Clone(options.ShellEnv)
 	}
 
-	if o.ContextWindow != 0 {
-		values[metaContextWindow] = o.ContextWindow
+	if options.ContextWindow != 0 {
+		values[metaContextWindowKey] = options.ContextWindow
 	}
 
 	return values
 }
 
-func (o NanocodexOptions) strings() map[string]string {
-	return map[string]string{
-		"model": o.Model, metaBaseModel: o.BaseModel, metaThinking: o.Thinking, metaAPIBaseURL: o.APIBaseURL, metaWebsocketURL: o.WebsocketURL,
-		"modelIdPrefix": o.ModelIDPrefix, "transport": o.Transport, metaAPIKeyEnv: o.APIKeyEnv, "authFile": o.AuthFile,
+func (options NanocodexOptions) strings() map[string]string {
+	values := make(map[string]string)
+	for key, field := range stringOptionFields(&options) {
+		values[key] = *field
+	}
+
+	return values
+}
+
+// stringOptionFields maps each string option's metadata key to its field.
+func stringOptionFields(options *NanocodexOptions) map[string]*string {
+	return map[string]*string{
+		metaModelKey: &options.Model, metaBaseModelKey: &options.BaseModel, metaThinkingKey: &options.Thinking,
+		metaAPIBaseURLKey: &options.APIBaseURL, metaWebsocketURLKey: &options.WebsocketURL, metaModelIDPrefixKey: &options.ModelIDPrefix,
+		metaTransportKey: &options.Transport, metaAPIKeyEnvKey: &options.APIKeyEnv, metaAuthFileKey: &options.AuthFile,
 	}
 }
 
-func (o NanocodexOptions) initialize(sessionID, nativeID string) nanocodex.Initialize {
+func (options NanocodexOptions) initialize(sessionID, nativeID string) nanocodex.Initialize {
 	return nanocodex.Initialize{
-		Model: o.Model, BaseModel: o.BaseModel, ContextWindow: o.ContextWindow, Thinking: o.Thinking, APIBaseURL: o.APIBaseURL, WebsocketURL: o.WebsocketURL,
-		ModelIDPrefix: o.ModelIDPrefix, Transport: o.Transport, APIKeyEnv: o.APIKeyEnv, AuthFile: o.AuthFile, SessionID: sessionID, ResumeSessionID: nativeID,
-		ShellEnv: slices.Clone(o.ShellEnv),
+		Model: options.Model, BaseModel: options.BaseModel, ContextWindow: options.ContextWindow, Thinking: options.Thinking,
+		APIBaseURL: options.APIBaseURL, WebsocketURL: options.WebsocketURL, ModelIDPrefix: options.ModelIDPrefix, Transport: options.Transport,
+		APIKeyEnv: options.APIKeyEnv, AuthFile: options.AuthFile, SessionID: sessionID, ResumeSessionID: nativeID,
+		ShellEnv: slices.Clone(options.ShellEnv),
 	}
 }
 
+// ValidateNanocodexSessionMeta runs the owned-namespace parsing of a session
+// lifecycle request's _meta without an Agent and returns the same refusal.
+func ValidateNanocodexSessionMeta(meta map[string]any) error {
+	if _, err := parseSessionMeta(meta); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// sessionMeta is what one session lifecycle request's _meta.nanocodex carried.
 type sessionMeta struct {
 	options   NanocodexOptions
 	rawEvents bool
-	present   map[string]bool
+	// present records which option fields the request named, so a load or
+	// resume inherits the stored value only for fields it left out, and a
+	// native configuration refusal names only a field the request supplied.
+	present map[string]bool
 }
 
-// ValidateNanocodexSessionMeta validates session metadata without launching an agent.
-func ValidateNanocodexSessionMeta(meta map[string]any) error {
-	_, err := parseSessionMeta(meta)
-
-	return err
-}
-
-func parseSessionMeta(meta map[string]any) (sessionMeta, error) {
-	parsed := sessionMeta{present: make(map[string]bool)}
-	if err := rejectLifecycle(meta); err != nil {
-		return parsed, err
+// parseSessionMeta validates the owned _meta.nanocodex namespace of one
+// session lifecycle request. Unknown own-namespace keys fail closed; foreign
+// namespaces are ignored; the lifecycle literal is refused by name.
+func parseSessionMeta(meta map[string]any) (sessionMeta, *acp.RequestError) {
+	if refusal := lifecycle.RejectKey(meta); refusal != nil {
+		return sessionMeta{}, wire.ParamRefusal(refusal)
 	}
 
 	raw, exists := meta[vendor]
 	if !exists {
-		return parsed, nil
+		return sessionMeta{}, nil
 	}
 
-	values, ok := raw.(map[string]any)
+	vendorMeta, ok := raw.(map[string]any)
 	if !ok {
-		return parsed, wire.Unsupported("_meta." + vendor)
+		return sessionMeta{}, wire.Unsupported("_meta." + vendor)
 	}
 
-	for key, item := range values {
+	parsed := sessionMeta{}
+
+	for key := range vendorMeta {
 		switch key {
-		case metaRawEventKey:
-			fields, ok := item.(map[string]any)
-			if !ok {
-				return parsed, wire.Unsupported("_meta." + vendor + ".rawEvent")
-			}
-
-			for name, value := range fields {
-				enabled, ok := value.(bool)
-				if name != metaEnabledKey || !ok {
-					return parsed, wire.Unsupported("_meta." + vendor + ".rawEvent." + name)
-				}
-
-				parsed.rawEvents = enabled
-			}
-		case metaOptionsKey:
-			fields, ok := item.(map[string]any)
-			if !ok {
-				return parsed, wire.Unsupported(wire.MetaOptionPath(vendor, ""))
-			}
-
-			for name, value := range fields {
-				path := wire.MetaOptionPath(vendor, name)
-
-				parsed.present[name] = true
-				switch name {
-				case "env":
-					env, err := wire.StringMapOption(value, path)
-					if err != nil {
-						return parsed, err
-					}
-
-					parsed.options.Env = env
-				case "extraPathDirs", metaShellEnv:
-					list, err := wire.StringSliceOption(value, path)
-					if err != nil {
-						return parsed, err
-					}
-
-					*parsed.options.list(name) = list
-				case metaContextWindow:
-					tokens, ok := positiveInteger(value)
-					if !ok {
-						return parsed, wire.Unsupported(path)
-					}
-
-					parsed.options.ContextWindow = tokens
-				default:
-					text, ok := value.(string)
-					if !ok || text == "" {
-						return parsed, wire.Unsupported(path)
-					}
-
-					switch name {
-					case "model":
-						parsed.options.Model = text
-					case metaBaseModel:
-						parsed.options.BaseModel = text
-					case metaThinking:
-						parsed.options.Thinking = text
-					case metaAPIBaseURL:
-						parsed.options.APIBaseURL = text
-					case metaWebsocketURL:
-						parsed.options.WebsocketURL = text
-					case "modelIdPrefix":
-						parsed.options.ModelIDPrefix = text
-					case "transport":
-						parsed.options.Transport = text
-					case metaAPIKeyEnv:
-						parsed.options.APIKeyEnv = text
-					case "authFile":
-						parsed.options.AuthFile = text
-					default:
-						return parsed, wire.Unsupported(path)
-					}
-				}
-			}
+		case metaOptionsKey, metaRawEventKey:
 		default:
-			return parsed, wire.Unsupported("_meta." + vendor + "." + key)
+			return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + key)
 		}
 	}
 
-	return parsed, validateNativeOptions(parsed.options)
+	if rawEvent, ok := vendorMeta[metaRawEventKey]; ok {
+		values, ok := rawEvent.(map[string]any)
+		if !ok {
+			return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + metaRawEventKey)
+		}
+
+		for key, item := range values {
+			enabled, ok := item.(bool)
+			if key != metaEnabledKey || !ok {
+				return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + metaRawEventKey + "." + key)
+			}
+
+			parsed.rawEvents = enabled
+		}
+	}
+
+	rawOptions, hasOptions := vendorMeta[metaOptionsKey]
+	if !hasOptions {
+		return parsed, nil
+	}
+
+	values, isObject := rawOptions.(map[string]any)
+	if !isObject {
+		return sessionMeta{}, wire.Unsupported(wire.MetaOptionPath(vendor, ""))
+	}
+
+	options, err := parseNanocodexOptions(values)
+	if err != nil {
+		return sessionMeta{}, err
+	}
+
+	parsed.options = options
+	parsed.present = make(map[string]bool, len(values))
+
+	for key := range values {
+		parsed.present[key] = true
+	}
+
+	return parsed, nil
 }
 
-func validateNativeOptions(o NanocodexOptions) error {
-	if err := wire.ValidateSessionEnvironment(o.Env, o.ExtraPathDirs, wire.MetaOptionPath(vendor, "")); err != nil {
+func parseNanocodexOptions(values map[string]any) (NanocodexOptions, *acp.RequestError) {
+	options := NanocodexOptions{}
+
+	for key, item := range values {
+		path := wire.MetaOptionPath(vendor, key)
+
+		switch key {
+		case metaEnvKey:
+			env, err := wire.StringMapOption(item, path)
+			if err != nil {
+				return NanocodexOptions{}, err
+			}
+
+			options.Env = env
+		case metaExtraPathDirsKey:
+			dirs, err := wire.StringSliceOption(item, path)
+			if err != nil {
+				return NanocodexOptions{}, err
+			}
+
+			options.ExtraPathDirs = dirs
+		case metaShellEnvKey:
+			names, err := wire.StringSliceOption(item, path)
+			if err != nil {
+				return NanocodexOptions{}, err
+			}
+
+			options.ShellEnv = names
+		case metaContextWindowKey:
+			tokens, ok := positiveInteger(item)
+			if !ok {
+				return NanocodexOptions{}, wire.Unsupported(path)
+			}
+
+			options.ContextWindow = tokens
+		default:
+			field, known := stringOptionFields(&options)[key]
+			text, ok := item.(string)
+
+			if !known || !ok || text == "" {
+				return NanocodexOptions{}, wire.Unsupported(path)
+			}
+
+			*field = text
+		}
+	}
+
+	return options, validateNanocodexOptions(options)
+}
+
+func validateNanocodexOptions(options NanocodexOptions) *acp.RequestError {
+	if err := wire.ValidateSessionEnvironment(options.Env, options.ExtraPathDirs, wire.MetaOptionPath(vendor, "")); err != nil {
 		return err
 	}
 
-	for name, value := range o.strings() {
+	for name, value := range options.strings() {
 		if strings.ContainsRune(value, 0) {
 			return wire.Unsupported(wire.MetaOptionPath(vendor, name))
 		}
 	}
 
-	if o.Model != "" && !validModel(o.Model) {
-		return wire.Unsupported(wire.MetaOptionPath(vendor, "model"))
+	if options.Model != "" && !validModel(options.Model) {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaModelKey))
 	}
 
-	if o.BaseModel != "" && !validModel(o.BaseModel) {
-		return wire.Unsupported(wire.MetaOptionPath(vendor, metaBaseModel))
+	if options.BaseModel != "" && !validModel(options.BaseModel) {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaBaseModelKey))
 	}
 
-	if o.ContextWindow < 0 {
-		return wire.Unsupported(wire.MetaOptionPath(vendor, metaContextWindow))
+	if options.ContextWindow < 0 {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaContextWindowKey))
 	}
 
-	if o.Transport != "" && o.Transport != "https" && o.Transport != "websocket" {
-		return wire.Unsupported(wire.MetaOptionPath(vendor, "transport"))
+	if options.Transport != "" && options.Transport != "https" && options.Transport != "websocket" {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaTransportKey))
 	}
 
-	for name, value := range map[string]string{metaAPIBaseURL: o.APIBaseURL, metaWebsocketURL: o.WebsocketURL} {
+	for name, value := range map[string]string{metaAPIBaseURLKey: options.APIBaseURL, metaWebsocketURLKey: options.WebsocketURL} {
 		if value == "" {
 			continue
 		}
@@ -359,7 +398,7 @@ func validateNativeOptions(o NanocodexOptions) error {
 		}
 
 		valid := parsed.Scheme == "http" || parsed.Scheme == "https"
-		if name == metaWebsocketURL {
+		if name == metaWebsocketURLKey {
 			valid = parsed.Scheme == "ws" || parsed.Scheme == "wss"
 		}
 
@@ -375,12 +414,12 @@ func validateNativeOptions(o NanocodexOptions) error {
 		}
 	}
 
-	if o.APIKeyEnv != "" && strings.ContainsAny(o.APIKeyEnv, "=\x00") {
-		return wire.Unsupported(wire.MetaOptionPath(vendor, metaAPIKeyEnv))
+	if options.APIKeyEnv != "" && strings.ContainsAny(options.APIKeyEnv, "=\x00") {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaAPIKeyEnvKey))
 	}
 
-	if slices.ContainsFunc(o.ShellEnv, func(name string) bool { return !validEnvName(name) }) {
-		return wire.Unsupported(wire.MetaOptionPath(vendor, metaShellEnv))
+	if index := slices.IndexFunc(options.ShellEnv, func(name string) bool { return !validEnvName(name) }); index >= 0 {
+		return wire.Unsupported(fmt.Sprintf("%s[%d]", wire.MetaOptionPath(vendor, metaShellEnvKey), index))
 	}
 
 	return nil
@@ -400,12 +439,12 @@ func validEnvName(name string) bool {
 }
 
 // forModelChange drops the settings that describe the previously selected model.
-func (o NanocodexOptions) forModelChange() NanocodexOptions {
-	o.BaseModel = ""
-	o.ContextWindow = 0
-	o.Thinking = ""
+func (options NanocodexOptions) forModelChange() NanocodexOptions {
+	options.BaseModel = ""
+	options.ContextWindow = 0
+	options.Thinking = ""
 
-	return o
+	return options
 }
 
 // positiveInteger accepts a whole JSON number, or the Go integer that
@@ -435,36 +474,37 @@ func pinRoute(stored, requested NanocodexOptions) error {
 	}
 
 	if (stored.APIBaseURL == "") != (requested.APIBaseURL == "") {
-		return wire.Unsupported(wire.MetaOptionPath(vendor, metaAPIBaseURL))
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaAPIBaseURLKey))
 	}
 
-	return wire.Unsupported(wire.MetaOptionPath(vendor, metaWebsocketURL))
+	return wire.Unsupported(wire.MetaOptionPath(vendor, metaWebsocketURLKey))
 }
 
-// inherit applies requested options over stored ones. The base model, context
-// window, and thinking level describe the stored model, so a model change drops
-// them unless the request supplies them again.
-func (m sessionMeta) inherit(options NanocodexOptions) NanocodexOptions {
-	if m.present["model"] && m.options.Model != options.Model {
-		options = options.forModelChange()
+// inheritCarrier applies requested options over the stored record's. The base
+// model, context window, and thinking level describe the stored model, so a
+// model change drops them unless the request supplies them again.
+func inheritCarrier(meta sessionMeta, record sessionRecord) NanocodexOptions {
+	stored := record.Options
+	if meta.present[metaModelKey] && meta.options.Model != stored.Model {
+		stored = stored.forModelChange()
 	}
 
-	base := options.values()
-	maps.Copy(base, m.options.values())
+	base := stored.values()
+	maps.Copy(base, meta.options.values())
 
-	if m.present["env"] {
-		base["env"] = maps.Clone(m.options.Env)
+	if meta.present[metaEnvKey] {
+		base[metaEnvKey] = maps.Clone(meta.options.Env)
 	}
 
-	if m.present["extraPathDirs"] {
-		base["extraPathDirs"] = slices.Clone(m.options.ExtraPathDirs)
+	if meta.present[metaExtraPathDirsKey] {
+		base[metaExtraPathDirsKey] = slices.Clone(meta.options.ExtraPathDirs)
 	}
 
-	if m.present[metaShellEnv] {
-		base[metaShellEnv] = slices.Clone(m.options.ShellEnv)
+	if meta.present[metaShellEnvKey] {
+		base[metaShellEnvKey] = slices.Clone(meta.options.ShellEnv)
 	}
 
-	parsed, _ := parseSessionMeta(map[string]any{vendor: map[string]any{metaOptionsKey: base}})
+	options, _ := parseNanocodexOptions(base)
 
-	return parsed.options
+	return options
 }

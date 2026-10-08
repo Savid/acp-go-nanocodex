@@ -224,7 +224,7 @@ func fakeRefusedField(params nanocodex.Initialize) (string, bool) {
 		return field, true
 	}
 	if params.Model == "kimi-k3" && params.Thinking != "" && params.Thinking != "low" && params.Thinking != "high" {
-		return metaThinking, true
+		return metaThinkingKey, true
 	}
 
 	return "", false

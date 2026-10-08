@@ -22,7 +22,7 @@ func TestNanocodexOptionsMetaRoundTrip(t *testing.T) {
 	require.NoError(t, json.Unmarshal(encoded, &decoded))
 	for _, meta := range []map[string]any{options.Meta(), decoded} {
 		parsed, parseErr := parseSessionMeta(meta)
-		require.NoError(t, parseErr)
+		require.Nil(t, parseErr)
 		require.Equal(t, options, parsed.options)
 	}
 
@@ -41,37 +41,30 @@ func TestValidateNanocodexSessionMeta(t *testing.T) {
 		return map[string]any{vendor: map[string]any{metaOptionsKey: map[string]any{name: value}}}
 	}
 	require.NoError(t, ValidateNanocodexSessionMeta(nil))
-	require.NoError(t, ValidateNanocodexSessionMeta(options(metaContextWindow, 262144)))
-	require.NoError(t, ValidateNanocodexSessionMeta(options(metaContextWindow, 262144.0)))
-	require.NoError(t, ValidateNanocodexSessionMeta(options(metaShellEnv, []any{"EXAMPLE_API_TOKEN", "_X1"})))
-	require.NoError(t, ValidateNanocodexSessionMeta(options(metaShellEnv, []any{})))
+	require.NoError(t, ValidateNanocodexSessionMeta(options(metaContextWindowKey, 262144)))
+	require.NoError(t, ValidateNanocodexSessionMeta(options(metaContextWindowKey, 262144.0)))
+	require.NoError(t, ValidateNanocodexSessionMeta(options(metaShellEnvKey, []any{"EXAMPLE_API_TOKEN", "_X1"})))
+	require.NoError(t, ValidateNanocodexSessionMeta(options(metaShellEnvKey, []any{})))
 
 	for _, test := range []struct {
 		name   string
 		option string
 		value  any
 	}{
-		{"zero window", metaContextWindow, 0.0},
-		{"negative window", metaContextWindow, -1.0},
-		{"fractional window", metaContextWindow, 1.5},
-		{"window beyond int64", metaContextWindow, math.Pow(2, 63)},
-		{"string window", metaContextWindow, "262144"},
-		{"boolean window", metaContextWindow, true},
-		{"null window", metaContextWindow, nil},
-		{"zero integer window", metaContextWindow, int64(0)},
-		{"negative integer window", metaContextWindow, -3},
-		{"empty base model", metaBaseModel, ""},
-		{"padded base model", metaBaseModel, " kimi-k3"},
-		{"spaced base model", metaBaseModel, "kimi k3"},
-		{"numeric base model", metaBaseModel, 5},
-		{"string shell env", metaShellEnv, "EXAMPLE_API_TOKEN"},
-		{"empty shell env name", metaShellEnv, []any{""}},
-		{"digit-led shell env name", metaShellEnv, []any{"1TOKEN"}},
-		{"spaced shell env name", metaShellEnv, []any{"EXAMPLE API_TOKEN"}},
-		{"assignment shell env name", metaShellEnv, []any{"A=B"}},
-		{"hyphenated shell env name", metaShellEnv, []any{"EXAMPLE-API-TOKEN"}},
-		{"non-ASCII shell env name", metaShellEnv, []any{"TOKÉN"}},
-		{"NUL shell env name", metaShellEnv, []any{"TOKEN\x00"}},
+		{"zero window", metaContextWindowKey, 0.0},
+		{"negative window", metaContextWindowKey, -1.0},
+		{"fractional window", metaContextWindowKey, 1.5},
+		{"window beyond int64", metaContextWindowKey, math.Pow(2, 63)},
+		{"string window", metaContextWindowKey, "262144"},
+		{"boolean window", metaContextWindowKey, true},
+		{"null window", metaContextWindowKey, nil},
+		{"zero integer window", metaContextWindowKey, int64(0)},
+		{"negative integer window", metaContextWindowKey, -3},
+		{"empty base model", metaBaseModelKey, ""},
+		{"padded base model", metaBaseModelKey, " kimi-k3"},
+		{"spaced base model", metaBaseModelKey, "kimi k3"},
+		{"numeric base model", metaBaseModelKey, 5},
+		{"string shell env", metaShellEnvKey, "EXAMPLE_API_TOKEN"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -79,5 +72,46 @@ func TestValidateNanocodexSessionMeta(t *testing.T) {
 			err := ValidateNanocodexSessionMeta(options(test.option, test.value))
 			require.Equal(t, wire.Unsupported(wire.MetaOptionPath(vendor, test.option)), err)
 		})
+	}
+
+	for _, name := range []string{"", "1TOKEN", "EXAMPLE API_TOKEN", "A=B", "EXAMPLE-API-TOKEN", "TOKÉN", "TOKEN\x00"} {
+		err := ValidateNanocodexSessionMeta(options(metaShellEnvKey, []any{"EXAMPLE_API_TOKEN", name}))
+		require.Equal(t, wire.Unsupported(wire.MetaOptionPath(vendor, metaShellEnvKey)+"[1]"), err, "%q", name)
+	}
+}
+
+func TestShellEnvInheritanceAndExplicitEmptyList(t *testing.T) {
+	t.Parallel()
+
+	stored := sessionRecord{Options: NewNanocodexOptions(WithNanocodexShellEnv("STORED_TOKEN"))}
+	request := func(names ...any) sessionMeta {
+		fields := map[string]any{}
+		if names != nil {
+			fields[metaShellEnvKey] = names
+		}
+
+		meta, err := parseSessionMeta(map[string]any{vendor: map[string]any{metaOptionsKey: fields}})
+		require.Nil(t, err)
+
+		return meta
+	}
+	require.Equal(t, []string{"STORED_TOKEN"}, inheritCarrier(request(), stored).ShellEnv)
+	require.Equal(t, []string{"REQUESTED_TOKEN"}, inheritCarrier(request("REQUESTED_TOKEN"), stored).ShellEnv)
+
+	cleared := inheritCarrier(request([]any{}...), stored)
+	require.NotNil(t, cleared.ShellEnv)
+	require.Empty(t, cleared.ShellEnv)
+
+	for _, options := range []NanocodexOptions{cleared, NewNanocodexOptions(WithNanocodexShellEnv())} {
+		encoded, err := json.Marshal(options.initialize("session", ""))
+		require.NoError(t, err)
+		require.Contains(t, string(encoded), `"shellEnv":[]`)
+
+		record, err := json.Marshal(sessionRecord{Options: options})
+		require.NoError(t, err)
+
+		var decoded sessionRecord
+		require.NoError(t, json.Unmarshal(record, &decoded))
+		require.Equal(t, []string{}, decoded.Options.ShellEnv)
 	}
 }

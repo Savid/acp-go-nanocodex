@@ -31,7 +31,7 @@ history, and no `previous_response_id` on every model call. See the
 [OpenRouter Responses documentation](https://openrouter.ai/docs/api_reference/responses/overview).
 
 OpenRouter responses carry their charge as `usage.cost`, which counts toward
-the session's [cost](README.md#sessions-and-configuration), except on BYOK
+the session's [cost](README.md#session-options), except on BYOK
 calls (`is_byok: true`).
 
 ## OMP auth-gateway
@@ -66,7 +66,7 @@ For a gateway exposing `openrouter/openai/gpt-6-luna`, use
 `NANOCODEX_MODEL_ID_PREFIX=openrouter/openai` and `-model gpt-6-luna`.
 
 An OMP auth gateway whose responses carry `usage.cost` contributes it to the
-session's [cost](README.md#sessions-and-configuration) for non-BYOK calls.
+session's [cost](README.md#session-options) for non-BYOK calls.
 Calls OMP prices from its own catalog carry no `usage.cost`.
 
 ## OpenCode Go

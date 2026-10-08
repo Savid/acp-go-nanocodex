@@ -366,7 +366,7 @@ func TestConfigModelRefusalOfAnEnvironmentDefaultIsInternal(t *testing.T) {
 
 	agent, _, _, workspace := fixtureAgent(t)
 	created := fixtureSession(t, agent, workspace)
-	for _, field := range []string{metaBaseModel, metaContextWindow} {
+	for _, field := range []string{metaBaseModelKey, metaContextWindowKey} {
 		_, err := agent.SetSessionConfigOption(t.Context(), SetModelRequest(created.SessionId, "refuse-"+field))
 		require.Equal(t, wire.InternalFailure(vendor, "native_start"), err)
 	}

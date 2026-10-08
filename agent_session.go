@@ -10,6 +10,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/wire"
 )
 
@@ -34,7 +35,12 @@ func (a *Agent) validateStart(cwd string, dirs []string, mcp []acp.McpServer, me
 		return sessionMeta{}, wire.Unsupported("mcpServers")
 	}
 
-	return parseSessionMeta(meta)
+	parsed, err := parseSessionMeta(meta)
+	if err != nil {
+		return sessionMeta{}, err
+	}
+
+	return parsed, nil
 }
 
 func (a *Agent) reserveSlot() (func(), error) {
@@ -199,7 +205,7 @@ func (a *Agent) Cancel(_ context.Context, p acp.CancelNotification) error {
 		return nil
 	}
 
-	if rejectLifecycle(p.Meta) != nil {
+	if lifecycle.RejectKey(p.Meta) != nil {
 		return nil
 	}
 

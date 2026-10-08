@@ -303,26 +303,17 @@ fn valid_env_name(name: &str) -> bool {
 }
 
 /// Reads the named variables from the helper's environment for the tool
-/// shell. The shell withholds inherited variables whose names look sensitive;
-/// explicit overrides are restored and their values stay redacted in tool
-/// output. Unset names are skipped.
+/// shell, which otherwise withholds inherited variables whose names look
+/// sensitive. Unset and non-UTF-8 values are skipped, since the shell redacts
+/// only UTF-8 values.
 fn shell_environment(names: &[String]) -> Result<Vec<(OsString, OsString)>, SessionError> {
     if !names.iter().all(|name| valid_env_name(name)) {
         return Err(SessionError::config("shellEnv"));
     }
-    let mut environment: Vec<(OsString, OsString)> = Vec::new();
-    for name in names {
-        if environment
-            .iter()
-            .any(|(existing, _)| existing == name.as_str())
-        {
-            continue;
-        }
-        if let Some(value) = env::var_os(name) {
-            environment.push((name.into(), value));
-        }
-    }
-    Ok(environment)
+    Ok(names
+        .iter()
+        .filter_map(|name| env::var(name).ok().map(|value| (name.into(), value.into())))
+        .collect())
 }
 
 fn native_home(workspace: &Path) -> Result<PathBuf, SessionError> {

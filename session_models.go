@@ -132,7 +132,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		rollback()
 
 		if refusal, ok := errors.AsType[*nanocodex.Error](nativeErr); ok && refusal.Code == nanocodex.InvalidConfig {
-			if (p.ConfigId == configModel && refusal.Field == string(configModel)) || (p.ConfigId == configThinking && refusal.Field == metaThinking) {
+			if (p.ConfigId == configModel && refusal.Field == string(configModel)) || (p.ConfigId == configThinking && refusal.Field == metaThinkingKey) {
 				return acp.SetSessionConfigOptionResponse{}, wire.Unsupported("value")
 			}
 		}
