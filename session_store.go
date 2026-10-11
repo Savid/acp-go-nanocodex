@@ -2,9 +2,9 @@ package nanocodexacp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -35,14 +35,34 @@ type storedSession struct {
 	found  bool
 }
 
+// updatedAtLayout formats session update times on the wire.
+const updatedAtLayout = "2006-01-02T15:04:05.000Z"
+
+func formatUpdatedAt(at time.Time) string { return at.UTC().Format(updatedAtLayout) }
+
+func updatedAtMilli(value string) int64 {
+	at, err := time.Parse(updatedAtLayout, value)
+	if err != nil {
+		return time.Now().UnixMilli()
+	}
+
+	return at.UnixMilli()
+}
+
+// commitMirror publishes the native rows appended since the last commit with
+// the current configuration. The update time advances only when the rows or
+// the rest of the record changed, so an unchanged session writes nothing.
 func (s *session) commitMirror(ctx context.Context) (err error) {
 	s.mu.Lock()
 	state := s.state
 	home := s.home
-	prior := s.rows
 	binding := s.binding
 	options := s.options.clone()
 	title := s.title
+	cursor := s.cursor
+	nativeRows := s.nativeRows
+	updatedAt := s.updatedAt
+	recordDigest := s.recordDigest
 
 	var cost *float64
 	if s.cost != nil {
@@ -53,7 +73,10 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 	s.mu.Unlock()
 
 	if binding != nil {
-		prior = nil
+		s.mirror.Reset()
+
+		cursor = sessionlog.Cursor{}
+		nativeRows = 0
 
 		defer func() {
 			if err != nil {
@@ -66,6 +89,111 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 		return nil
 	}
 
+	limit, unlock, err := lockRollout(home, state, rt)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if !s.mirror.Committed() {
+		cursor = sessionlog.Cursor{}
+	}
+
+	read := func(from sessionlog.Cursor) (sessionlog.Tail, error) {
+		tail, readErr := nanocodex.ReadRows(home, state.RolloutPath, from, limit)
+		if readErr != nil {
+			return sessionlog.Tail{}, readErr
+		}
+
+		if tail.Full {
+			return tail, nanocodex.ValidateRows(tail.Rows, state.NativeSessionID)
+		}
+
+		return tail, nanocodex.ValidateTail(tail.Rows)
+	}
+
+	tail, err := read(cursor)
+	if err != nil {
+		return err
+	}
+
+	rows := nativeRows + len(tail.Rows)
+	if tail.Full {
+		rows = len(tail.Rows)
+	}
+
+	rel, err := nanocodex.RolloutRelative(home, state.RolloutPath)
+	if err != nil {
+		return err
+	}
+
+	checkpoint, checkpointErr := nanocodex.ReadCheckpoint(home, state.RolloutPath)
+	if checkpointErr != nil {
+		s.agent.log.WarnContext(ctx, "native checkpoint unavailable; mirroring native history")
+	}
+
+	started := rows != 1
+	record := sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: options, Title: title, Started: started, UpdatedAtUnixMilli: updatedAtMilli(updatedAt), CostUSD: cost}
+
+	digest, err := digestRecord(record)
+	if err != nil {
+		return err
+	}
+
+	if rows != nativeRows || digest != recordDigest {
+		now := time.Now()
+		updatedAt = formatUpdatedAt(now)
+		record.UpdatedAtUnixMilli = now.UnixMilli()
+
+		if digest, err = digestRecord(record); err != nil {
+			return err
+		}
+	}
+
+	if !s.ephemeral {
+		// A Full tail serves any cursor; the mirror reads the whole history
+		// again only when its cursor is not the one the tail continued from.
+		source := func(from sessionlog.Cursor) (sessionlog.Tail, error) {
+			if tail.Full || from == cursor {
+				return tail, nil
+			}
+
+			reread, readErr := read(sessionlog.Cursor{})
+			if readErr == nil {
+				tail = reread
+				rows = len(reread.Rows)
+			}
+
+			return reread, readErr
+		}
+
+		storeCtx, finish := s.agent.observe.StartSessionStore(ctx, "commit")
+		err = s.mirror.Commit(storeCtx, source, record)
+		finish(err)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
+	s.cursor = tail.Next
+	s.nativeRows = rows
+	s.recordDigest = digest
+	s.checkpoint = checkpoint
+	s.binding = nil
+	s.started = started
+	s.updatedAt = updatedAt
+	s.mu.Unlock()
+
+	return nil
+}
+
+// lockRollout returns the byte boundary a commit may read: the helper's
+// committed bytes while it runs, else the whole rollout. A stopped rollout is
+// read under the native session and writer locks after its final record is
+// settled.
+func lockRollout(home string, state nanocodex.State, rt *runtime) (int64, func(), error) {
 	limit := state.CommittedBytes
 	if rt == nil {
 		limit = -1
@@ -77,74 +205,50 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 		}
 	}
 
-	if limit < 0 && (rt == nil || len(rt.locks) == 0 || rt.locksReleased.Load()) {
-		lock, lockErr := process.LockFile(filepath.Join(home, "nanocodex", "acp-locks", state.NativeSessionID+".lock"))
-		if lockErr != nil {
-			return lockErr
-		}
-		defer lock.Close()
+	if limit >= 0 {
+		return limit, func() {}, nil
 	}
 
-	if limit < 0 {
-		lock, lockErr := process.LockFile(filepath.Join(home, "nanocodex", "acp-locks", state.NativeSessionID+".writer.lock"))
-		if lockErr != nil {
-			return lockErr
-		}
-		defer lock.Close()
-	}
+	var locks []*process.FileLock
 
-	rows, err := nanocodex.ReadRows(home, state.RolloutPath, limit)
-	if err != nil {
-		return err
-	}
-
-	if validateErr := nanocodex.ValidateRows(rows, state.NativeSessionID); validateErr != nil {
-		return validateErr
-	}
-
-	if len(prior) > 0 {
-		if _, _, reconcileErr := sessionlog.Reconcile(rows, prior); reconcileErr != nil {
-			return reconcileErr
-		}
-
-		if len(rows) < len(prior) {
-			return errors.New("native rollout shrank")
+	unlock := func() {
+		for _, lock := range locks {
+			_ = lock.Close()
 		}
 	}
 
-	rel, err := nanocodex.RolloutRelative(home, state.RolloutPath)
-	if err != nil {
-		return err
+	names := []string{state.NativeSessionID + ".writer.lock"}
+	if rt == nil || len(rt.locks) == 0 || rt.locksReleased.Load() {
+		names = []string{state.NativeSessionID + ".lock", state.NativeSessionID + ".writer.lock"}
 	}
 
-	updated := time.Now().UnixMilli()
-	started := !nanocodex.EmptyRows(rows)
-
-	checkpoint, checkpointErr := nanocodex.ReadCheckpoint(home, state.RolloutPath)
-	if checkpointErr != nil {
-		s.agent.log.WarnContext(ctx, "native checkpoint unavailable; mirroring native history")
-	}
-
-	record := sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: options, Title: title, Started: started, UpdatedAtUnixMilli: updated, CostUSD: cost}
-	if !s.ephemeral {
-		storeCtx, finish := s.agent.observe.StartSessionStore(ctx, "replace")
-		err = sessionlog.Commit(storeCtx, s.agent.store, string(s.id), rows, record)
-		finish(err)
-
+	for _, name := range names {
+		lock, err := process.LockFile(filepath.Join(home, "nanocodex", "acp-locks", name))
 		if err != nil {
-			return err
+			unlock()
+
+			return 0, nil, err
 		}
+
+		locks = append(locks, lock)
 	}
 
-	s.mu.Lock()
-	s.rows = rows
-	s.checkpoint = checkpoint
-	s.binding = nil
-	s.started = started
-	s.updatedAt = updated
-	s.mu.Unlock()
+	if err := nanocodex.RepairTail(home, state.RolloutPath); err != nil {
+		unlock()
 
-	return nil
+		return 0, nil, err
+	}
+
+	return limit, unlock, nil
+}
+
+func digestRecord(record sessionRecord) ([sha256.Size]byte, error) {
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+
+	return sha256.Sum256(encoded), nil
 }
 
 var errInvalidStoredSession = errors.New("invalid stored session")
@@ -162,6 +266,52 @@ func (s storeLoadBoundary) Load(ctx context.Context, id string) (map[string][]ac
 	return generation, nil
 }
 
+// storedFailure separates a store that failed from a generation that is not
+// a valid session.
+func storedFailure(err error) error {
+	if _, failed := errors.AsType[*storeLoadError](err); failed {
+		return wire.InternalFailure(vendor, "")
+	}
+
+	return errInvalidStoredSession
+}
+
+// loadRecord reads and checks only the configuration of a stored session.
+func (a *Agent) loadRecord(ctx context.Context, id acp.SessionId) (sessionRecord, bool, error) {
+	if err := wire.CheckSessionID(id); err != nil {
+		return sessionRecord{}, false, errInvalidStoredSession
+	}
+
+	var record sessionRecord
+
+	found, err := sessionlog.LoadRecord(ctx, storeLoadBoundary{a.store}, string(id), &record)
+	if err != nil {
+		return sessionRecord{}, false, storedFailure(err)
+	}
+
+	if !found {
+		return sessionRecord{}, false, nil
+	}
+
+	return record, true, validRecord(record, id)
+}
+
+func validRecord(record sessionRecord, id acp.SessionId) error {
+	if record.SessionID != string(id) || !nanocodex.ValidSessionID(record.NativeSessionID) || !filepath.IsAbs(record.Cwd) || record.UpdatedAtUnixMilli <= 0 || !filepath.IsLocal(record.RolloutRelative) {
+		return errInvalidStoredSession
+	}
+
+	if cost := record.CostUSD; cost != nil && *cost < 0 {
+		return errInvalidStoredSession
+	}
+
+	if err := validateNanocodexOptions(record.Options); err != nil {
+		return errInvalidStoredSession
+	}
+
+	return nil
+}
+
 func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession, error) {
 	if err := wire.CheckSessionID(id); err != nil {
 		return storedSession{}, errInvalidStoredSession
@@ -171,41 +321,32 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 
 	rows, found, err := sessionlog.Load(ctx, storeLoadBoundary{a.store}, string(id), &record)
 	if err != nil {
-		if _, failed := errors.AsType[*storeLoadError](err); failed {
-			return storedSession{}, wire.InternalFailure(vendor, "")
-		}
-
-		return storedSession{}, errInvalidStoredSession
+		return storedSession{}, storedFailure(err)
 	}
 
 	if !found {
 		return storedSession{}, nil
 	}
 
-	if record.SessionID != string(id) || !nanocodex.ValidSessionID(record.NativeSessionID) || !filepath.IsAbs(record.Cwd) || record.UpdatedAtUnixMilli <= 0 || !filepath.IsLocal(record.RolloutRelative) {
-		return storedSession{}, errInvalidStoredSession
-	}
-
-	if cost := record.CostUSD; cost != nil && *cost < 0 {
-		return storedSession{}, errInvalidStoredSession
-	}
-
-	if err := validateNanocodexOptions(record.Options); err != nil {
-		return storedSession{}, errInvalidStoredSession
+	if err := validRecord(record, id); err != nil {
+		return storedSession{}, err
 	}
 
 	if err := nanocodex.ValidateRows(rows, record.NativeSessionID); err != nil {
 		return storedSession{}, errInvalidStoredSession
 	}
 
-	if !record.Started && !nanocodex.EmptyRows(rows) {
+	if record.Started == (len(rows) == 1) {
 		return storedSession{}, errInvalidStoredSession
 	}
 
 	return storedSession{rows: rows, record: record, found: true}, nil
 }
 
-func (s *session) hydrate(stored storedSession) error {
+// hydrate reconciles the native rollout with a stored generation: native rows
+// that extend the stored ones win, and a missing or shorter rollout is
+// rewritten from the store. The stored rows are released once reconciled.
+func (s *session) hydrate(ctx context.Context, stored *storedSession) error {
 	if !nanocodex.ValidSessionID(stored.record.NativeSessionID) {
 		return wire.RestoreFailed(vendor)
 	}
@@ -221,61 +362,88 @@ func (s *session) hydrate(stored storedSession) error {
 	}
 	defer lock.Close()
 
-	native, err := nanocodex.ReadRows(s.home, path, -1)
+	if err = nanocodex.RepairTail(s.home, path); err != nil {
+		return wire.RestoreFailed(vendor)
+	}
+
+	storedRows := len(stored.rows)
+
+	rows, err := s.mirror.Hydrate(ctx, path, stored.rows, stored.record, func(rows [][]byte) error {
+		return nanocodex.ValidateRows(rows, stored.record.NativeSessionID)
+	})
+	stored.rows = nil
+
 	if err != nil {
 		return wire.RestoreFailed(vendor)
-	}
-
-	rows, nativeWins, err := sessionlog.Reconcile(native, stored.rows)
-	if err != nil {
-		return wire.RestoreFailed(vendor)
-	}
-
-	if err := nanocodex.ValidateRows(rows, stored.record.NativeSessionID); err != nil {
-		return wire.RestoreFailed(vendor)
-	}
-
-	if nativeWins {
-		info, statErr := os.Stat(path)
-		if statErr != nil {
-			return wire.RestoreFailed(vendor)
-		}
-
-		var completeBytes int64
-		for _, row := range rows {
-			completeBytes += int64(len(row) + 1)
-		}
-
-		nativeWins = info.Size() == completeBytes
-	}
-
-	if !nativeWins {
-		if err := nanocodex.WriteRows(s.home, path, rows); err != nil {
-			return wire.RestoreFailed(vendor)
-		}
 	}
 
 	checkpoint := stored.record.Checkpoint
-	if nativeWins && len(rows) > len(stored.rows) {
+	if len(rows) > storedRows {
 		checkpoint, _ = nanocodex.ReadCheckpoint(s.home, path)
-	} else {
-		if err := nanocodex.WriteCheckpoint(s.home, path, checkpoint); err != nil {
-			s.agent.log.Warn("native checkpoint unavailable; restoring native history")
-		}
+	} else if err := nanocodex.WriteCheckpoint(s.home, path, checkpoint); err != nil {
+		s.agent.log.WarnContext(ctx, "native checkpoint unavailable; restoring native history")
 	}
 
 	s.mu.Lock()
 	s.state.NativeSessionID = stored.record.NativeSessionID
 	s.state.RolloutPath = path
-
 	s.checkpoint = checkpoint
-	s.rows = rows
-	s.started = !nanocodex.EmptyRows(rows)
+	s.nativeRows = len(rows)
+	s.cursor = sessionlog.Cursor{}
+	s.started = len(rows) != 1
 	s.title = stored.record.Title
-	s.updatedAt = stored.record.UpdatedAtUnixMilli
 	s.mu.Unlock()
 
 	return nil
+}
+
+// ensureNative keeps the native rollout of a committed session before a
+// helper launch and returns how many rows it holds. A rollout that still
+// extends the committed rows is used as it is; one that was removed,
+// truncated, or rewritten is hydrated again from the store.
+func (s *session) ensureNative(ctx context.Context) (int, error) {
+	s.mu.Lock()
+	state := s.state
+	cursor := s.cursor
+	committed := s.nativeRows
+	s.mu.Unlock()
+
+	lock, err := process.LockFile(filepath.Join(s.home, "nanocodex", "acp-locks", state.NativeSessionID+".writer.lock"))
+	if err != nil {
+		return 0, wire.RestoreFailed(vendor)
+	}
+
+	if err = nanocodex.RepairTail(s.home, state.RolloutPath); err == nil && cursor.Offset() > 0 {
+		var tail sessionlog.Tail
+
+		tail, err = nanocodex.ReadRows(s.home, state.RolloutPath, cursor, -1)
+		if err == nil && !tail.Full {
+			_ = lock.Close()
+
+			if validateErr := nanocodex.ValidateTail(tail.Rows); validateErr != nil {
+				return 0, wire.RestoreFailed(vendor)
+			}
+
+			return committed + len(tail.Rows), nil
+		}
+	}
+
+	_ = lock.Close()
+
+	if err != nil {
+		return 0, wire.RestoreFailed(vendor)
+	}
+
+	stored, err := s.agent.loadStored(ctx, s.id)
+	if err != nil || !stored.found || stored.record.NativeSessionID != state.NativeSessionID || filepath.Join(s.home, stored.record.RolloutRelative) != state.RolloutPath {
+		return 0, wire.RestoreFailed(vendor)
+	}
+
+	if err := s.hydrate(ctx, &stored); err != nil {
+		return 0, err
+	}
+
+	return s.nativeRows, nil
 }
 
 // LoadSession restores native state and replays the conversation to the client.
@@ -395,11 +563,12 @@ func (a *Agent) restore(ctx context.Context, id acp.SessionId, cwd string, dirs 
 	}
 
 	s.state = nanocodex.State{NativeSessionID: stored.record.NativeSessionID, RolloutPath: filepath.Join(s.home, stored.record.RolloutRelative)}
-	s.rows = stored.rows
+	s.pending = &storedSession{rows: stored.rows, record: stored.record, found: true}
+	stored.rows = nil
 	s.checkpoint = stored.record.Checkpoint
 	s.started = stored.record.Started
 	s.title = stored.record.Title
-	s.updatedAt = stored.record.UpdatedAtUnixMilli
+	s.updatedAt = formatUpdatedAt(time.UnixMilli(stored.record.UpdatedAtUnixMilli))
 	s.cost = stored.record.CostUSD
 
 	if err = s.observeNative(ctx); err != nil {

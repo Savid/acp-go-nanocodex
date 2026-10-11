@@ -17,64 +17,88 @@ type replayTextPart struct {
 	Text string `json:"text"`
 }
 
+// replay streams the committed native rows to the client as history.
 func (s *session) replay(ctx context.Context) error {
-	for _, raw := range s.rows {
-		var row nanocodex.Row
-		if err := json.Unmarshal(raw, &row); err != nil {
+	s.mu.Lock()
+	path := s.state.RolloutPath
+	committed := s.cursor.Offset()
+	s.mu.Unlock()
+
+	var replayErr error
+
+	err := nanocodex.EachRow(s.home, path, committed, func(raw []byte) error {
+		replayErr = s.replayRow(ctx, raw)
+
+		return replayErr
+	})
+
+	if replayErr != nil {
+		return replayErr
+	}
+
+	if err != nil {
+		return wire.RestoreFailed(vendor)
+	}
+
+	return nil
+}
+
+func (s *session) replayRow(ctx context.Context, raw []byte) error {
+	var row nanocodex.Row
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return wire.RestoreFailed(vendor)
+	}
+
+	switch row.Type {
+	case "event_msg":
+		var payload struct {
+			Type  string              `json:"type"`
+			Input []nanocodex.Content `json:"input"`
+		}
+		if err := json.Unmarshal(row.Payload, &payload); err != nil {
 			return wire.RestoreFailed(vendor)
 		}
 
-		switch row.Type {
-		case "event_msg":
-			var payload struct {
-				Type  string              `json:"type"`
-				Input []nanocodex.Content `json:"input"`
-			}
-			if err := json.Unmarshal(row.Payload, &payload); err != nil {
-				return wire.RestoreFailed(vendor)
-			}
-
-			if payload.Type == "input_accepted" {
-				for _, part := range payload.Input {
-					if err := s.replayUserContent(ctx, part); err != nil {
-						return err
-					}
-				}
-			}
-		case "compacted":
-			var payload struct {
-				History []json.RawMessage `json:"replacement_history"` //nolint:tagliatelle // Native protocol field.
-			}
-			if err := json.Unmarshal(row.Payload, &payload); err != nil {
-				return wire.RestoreFailed(vendor)
-			}
-
-			start := len(payload.History)
-			for index, rawItem := range slices.Backward(payload.History) {
-				var item struct {
-					Type string `json:"type"`
-					Role string `json:"role"`
-				}
-				if err := json.Unmarshal(rawItem, &item); err != nil {
-					return wire.RestoreFailed(vendor)
-				}
-
-				if item.Type == "message" && item.Role == "user" {
-					start = index + 1
-
-					break
-				}
-			}
-
-			for _, item := range payload.History[start:] {
-				if err := s.replayResponseItem(ctx, item); err != nil {
+		if payload.Type == "input_accepted" {
+			for _, part := range payload.Input {
+				if err := s.replayUserContent(ctx, part); err != nil {
 					return err
 				}
 			}
-		case "response_item":
-			if err := s.replayResponseItem(ctx, row.Payload); err != nil {
+		}
+	case "compacted":
+		var payload struct {
+			History []json.RawMessage `json:"replacement_history"` //nolint:tagliatelle // Native protocol field.
+		}
+		if err := json.Unmarshal(row.Payload, &payload); err != nil {
+			return wire.RestoreFailed(vendor)
+		}
+
+		start := len(payload.History)
+		for index, rawItem := range slices.Backward(payload.History) {
+			var item struct {
+				Type string `json:"type"`
+				Role string `json:"role"`
+			}
+			if err := json.Unmarshal(rawItem, &item); err != nil {
+				return wire.RestoreFailed(vendor)
+			}
+
+			if item.Type == "message" && item.Role == "user" {
+				start = index + 1
+
+				break
+			}
+		}
+
+		for _, item := range payload.History[start:] {
+			if err := s.replayResponseItem(ctx, item); err != nil {
 				return err
 			}
+		}
+	case "response_item":
+		if err := s.replayResponseItem(ctx, row.Payload); err != nil {
+			return err
 		}
 	}
 

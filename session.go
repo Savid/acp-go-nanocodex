@@ -3,9 +3,9 @@ package nanocodexacp
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -17,11 +17,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
 )
 
 const nativeTimeout = 20 * time.Second
+
+// classNativeState is the internal-failure class of a helper that reported
+// state the adapter cannot accept.
+const classNativeState = "native_state"
 
 type runtime struct {
 	proc          *process.Process
@@ -35,7 +40,8 @@ type sessionBinding struct {
 	checkpoint json.RawMessage
 	state      nanocodex.State
 	options    NanocodexOptions
-	rows       [][]byte
+	cursor     sessionlog.Cursor
+	nativeRows int
 	started    bool
 }
 
@@ -48,22 +54,30 @@ type session struct {
 	gate       chan struct{}
 	mu         sync.Mutex
 	closing    bool
-	closed     chan struct{}
-	closeOnce  sync.Once
+	closeDone  chan struct{}
 	closeErr   error
-	poisoned   bool
+	poison     string
 	options    NanocodexOptions
 	state      nanocodex.State
 	binding    *sessionBinding
 	home       string
 	title      string
-	updatedAt  int64
+	updatedAt  string
 	started    bool
-	rows       [][]byte
-	rt         *runtime
-	turn       *turn
-	lc         lifecycle.Publisher
-	raw        *wire.RawEvents
+	// mirror publishes the native rollout; cursor and nativeRows describe the
+	// rows it last committed, and recordDigest the configuration record.
+	mirror       *sessionlog.Mirror
+	cursor       sessionlog.Cursor
+	nativeRows   int
+	recordDigest [sha256.Size]byte
+	// headerOnly reports that the launched rollout held only its header.
+	headerOnly bool
+	// pending is a stored generation the next launch hydrates.
+	pending   *storedSession
+	rt        *runtime
+	turn      *turn
+	lc        lifecycle.Publisher
+	rawEvents *wire.RawEvents
 	// cost is the cumulative provider-reported USD charge; nil until a call is priced.
 	cost *float64
 }
@@ -109,7 +123,7 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 	if id == "" {
 		generated, generateErr := uuid.NewV7()
 		if generateErr != nil {
-			return nil, wire.InternalFailure(vendor, "native_start")
+			return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 		}
 
 		id = generated.String()
@@ -118,7 +132,7 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 	lock, err := process.LockFile(filepath.Join(s.home, "nanocodex", "acp-locks", id+".lock"))
 	if err != nil {
 		if s.state.NativeSessionID == "" {
-			return nil, wire.InternalFailure(vendor, "native_start")
+			return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 		}
 
 		return nil, wire.RestoreFailed(vendor)
@@ -135,28 +149,39 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 		}
 	}()
 
-	if len(s.rows) > 0 {
-		rel, relErr := nanocodex.RolloutRelative(s.home, s.state.RolloutPath)
-		if relErr != nil {
-			return nil, wire.RestoreFailed(vendor)
+	nativeRows := s.nativeRows
+
+	if pending := s.pending; pending != nil {
+		s.pending = nil
+
+		if hydrateErr := s.hydrate(ctx, pending); hydrateErr != nil {
+			return nil, hydrateErr
 		}
 
-		if hydrateErr := s.hydrate(storedSession{rows: s.rows, record: sessionRecord{NativeSessionID: s.state.NativeSessionID, RolloutRelative: rel, Checkpoint: s.checkpoint, Title: s.title, UpdatedAtUnixMilli: s.updatedAt}}); hydrateErr != nil {
-			return nil, hydrateErr
+		nativeRows = s.nativeRows
+	} else if nativeRows > 0 && !s.ephemeral {
+		if nativeRows, err = s.ensureNative(ctx); err != nil {
+			return nil, err
 		}
 	}
 
-	if nanocodex.EmptyRows(s.rows) {
+	// A rollout holding only its header has no resumable conversation, so
+	// the helper binds a fresh native session in its place.
+	s.mu.Lock()
+	s.headerOnly = nativeRows == 1
+	s.mu.Unlock()
+
+	if nativeRows == 1 {
 		generated, generateErr := uuid.NewV7()
 		if generateErr != nil {
-			return nil, wire.InternalFailure(vendor, "native_start")
+			return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 		}
 
 		id = generated.String()
 
 		lock, err = process.LockFile(filepath.Join(s.home, "nanocodex", "acp-locks", id+".lock"))
 		if err != nil {
-			return nil, wire.InternalFailure(vendor, "native_start")
+			return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 		}
 
 		locks = append(locks, lock)
@@ -164,12 +189,12 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 
 	base, err := s.agent.environment(NanocodexOptions{}).Base()
 	if err != nil {
-		return nil, wire.InternalFailure(vendor, "native_start")
+		return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	executable, err := process.ResolveExecutable(cmp.Or(s.agent.options.ExecutablePath, "acp-go-nanocodex-native"), base)
 	if err != nil {
-		return nil, wire.InternalFailure(vendor, "native_start")
+		return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	environment := s.agent.environment(s.options)
@@ -177,7 +202,7 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 
 	env, err := environment.Build()
 	if err != nil {
-		return nil, wire.InternalFailure(vendor, "native_start")
+		return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	if err = process.WriteSeedFiles(s.home, s.agent.options.SeedFiles); err != nil {
@@ -185,12 +210,12 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 			return nil, refusal
 		}
 
-		return nil, wire.InternalFailure(vendor, "native_start")
+		return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	proc, err := process.Start(ctx, process.Request{Executable: executable, Dir: s.cwd, Env: env})
 	if err != nil {
-		return nil, wire.InternalFailure(vendor, "native_start")
+		return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	rt := &runtime{proc: proc, client: nanocodex.NewClient(proc.Stdin(), proc.Stdout()), locks: locks}
@@ -206,7 +231,7 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 		if nativeErr, ok := errors.AsType[*nanocodex.Error](err); ok {
 			s.agent.log.ErrorContext(ctx, "native initialization refused", slog.String("code", nativeErr.Code), slog.String("field", nativeErr.Field), slog.String("reason", nativeErr.Message))
 		} else {
-			s.agent.log.DebugContext(ctx, "native initialization failed", slog.Any("error", err))
+			s.agent.log.WarnContext(ctx, "native initialization failed", slog.Any("error", process.LaunchFailure(rt.proc, "native helper", err)))
 		}
 
 		if nativeErr, ok := errors.AsType[*nanocodex.Error](err); ok {
@@ -218,13 +243,13 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 			}
 		}
 
-		return nil, wire.InternalFailure(vendor, "native_start")
+		return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	if state.NativeSessionID != id {
 		_ = rt.stop()
 
-		return nil, wire.InternalFailure(vendor, "native_state")
+		return nil, wire.InternalFailure(vendor, classNativeState)
 	}
 
 	if err = s.applyState(state); err != nil {
@@ -302,39 +327,39 @@ func (rt *runtime) stop() error {
 
 func (s *session) applyState(state nanocodex.State) error {
 	if state.ProtocolVersion != 1 || state.HelperVersion != nanocodex.HelperVersion || state.HelperFingerprint != nativeHelperFingerprint || !nanocodex.ValidSessionID(state.NativeSessionID) || state.Model == "" || state.CommittedBytes < 0 || !filepath.IsAbs(state.RolloutPath) {
-		return wire.InternalFailure(vendor, "native_state")
+		return wire.InternalFailure(vendor, classNativeState)
 	}
 
 	if state.ReplacedNativeSessionID != "" && state.ReplacedNativeSessionID == state.NativeSessionID {
-		return wire.InternalFailure(vendor, "native_state")
+		return wire.InternalFailure(vendor, classNativeState)
 	}
 
 	if _, err := nanocodex.RolloutRelative(s.home, state.RolloutPath); err != nil {
-		return wire.InternalFailure(vendor, "native_state")
+		return wire.InternalFailure(vendor, classNativeState)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.state.NativeSessionID == state.NativeSessionID && s.state.RolloutPath != "" && s.state.RolloutPath != state.RolloutPath {
-		s.poisoned = true
+		s.poison = wire.CauseNativeSessionIdentityDrift
 
-		return wire.SessionPoisoned(vendor, "native_session_identity_drift")
+		return wire.SessionPoisoned(vendor, s.poison)
 	}
 
 	if s.state.NativeSessionID != "" && s.state.NativeSessionID != state.NativeSessionID {
-		if s.started || !nanocodex.EmptyRows(s.rows) || state.ReplacedNativeSessionID != s.state.NativeSessionID {
-			s.poisoned = true
+		if s.started || !s.headerOnly || state.ReplacedNativeSessionID != s.state.NativeSessionID {
+			s.poison = wire.CauseNativeSessionIdentityDrift
 
-			return wire.SessionPoisoned(vendor, "native_session_identity_drift")
+			return wire.SessionPoisoned(vendor, s.poison)
 		}
 
-		s.binding = &sessionBinding{checkpoint: s.checkpoint, state: s.state, options: s.options.clone(), rows: s.rows, started: s.started}
+		s.binding = &sessionBinding{checkpoint: s.checkpoint, state: s.state, options: s.options.clone(), cursor: s.cursor, nativeRows: s.nativeRows, started: s.started}
 	}
 
 	s.state = state
 	s.options.Model = state.Model
-	s.options.Thinking = state.Thinking
+	s.options.Effort = state.Thinking
 
 	return nil
 }
@@ -354,7 +379,7 @@ func (s *session) observeNative(ctx context.Context) error {
 	if err != nil {
 		s.rollbackBinding()
 
-		return wire.InternalFailure(vendor, "native_start")
+		return wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	return nil
@@ -367,7 +392,8 @@ func (s *session) rollbackBinding() {
 	if binding := s.binding; binding != nil {
 		s.state = binding.state
 		s.options = binding.options
-		s.rows = binding.rows
+		s.cursor = binding.cursor
+		s.nativeRows = binding.nativeRows
 		s.checkpoint = binding.checkpoint
 		s.started = binding.started
 		s.binding = nil
@@ -383,54 +409,59 @@ func nativeLaunchError(err error, supplied map[string]bool) error {
 		return wire.Unsupported(wire.MetaOptionPath(vendor, nativeErr.Field))
 	}
 
-	return wire.InternalFailure(vendor, "native_start")
+	return wire.InternalFailure(vendor, wire.ClassNativeStart)
 }
 
 func (s *session) close() error {
-	s.closeOnce.Do(func() {
-		s.mu.Lock()
-		s.closing = true
-		t := s.turn
+	s.mu.Lock()
+	if done := s.closeDone; done != nil {
 		s.mu.Unlock()
+		<-done
 
-		if t != nil {
-			s.cancel()
+		return s.closeErr
+	}
 
-			timer := time.NewTimer(nativeTimeout)
-			select {
-			case <-t.done:
-			case <-timer.C:
-				s.mu.Lock()
-				rt := s.rt
-				s.mu.Unlock()
+	s.closeDone = make(chan struct{})
+	s.closing = true
+	t := s.turn
+	s.mu.Unlock()
 
-				if rt != nil {
-					select {
-					case <-rt.proc.Done():
-					default:
-						s.abortTurn(t, rt)
-					}
+	if t != nil {
+		s.cancel()
+
+		timer := time.NewTimer(nativeTimeout)
+		select {
+		case <-t.done:
+		case <-timer.C:
+			s.mu.Lock()
+			rt := s.rt
+			s.mu.Unlock()
+
+			if rt != nil {
+				select {
+				case <-rt.proc.Done():
+				default:
+					s.abortTurn(t, rt)
 				}
 			}
-
-			timer.Stop()
-			<-t.done
-
-			if t.cleanupErr != nil {
-				s.closeErr = wire.InternalFailure(vendor, "")
-			}
 		}
-		// Establishing and config operations own the same foreground gate.
-		s.gate <- struct{}{}
-		defer func() { <-s.gate; close(s.closed) }()
 
-		if err := s.commitMirror(context.Background()); err != nil {
+		timer.Stop()
+		<-t.done
+
+		if t.cleanupErr != nil {
 			s.closeErr = wire.InternalFailure(vendor, "")
 		}
+	}
+	// Establishing and config operations own the same foreground gate.
+	s.gate <- struct{}{}
+	defer func() { <-s.gate; close(s.closeDone) }()
 
-		s.lc.Fence()
-	})
-	<-s.closed
+	if err := s.commitMirror(context.Background()); err != nil {
+		s.closeErr = wire.InternalFailure(vendor, "")
+	}
+
+	s.lc.Fence()
 
 	return s.closeErr
 }
@@ -476,8 +507,8 @@ func (s *session) requireOpen() error {
 		return wire.UnknownSession()
 	}
 
-	if s.poisoned {
-		return wire.SessionPoisoned(vendor, "native_session_identity_drift")
+	if s.poison != "" {
+		return wire.SessionPoisoned(vendor, s.poison)
 	}
 
 	return nil
@@ -500,18 +531,9 @@ func (s *session) processFailure(rt *runtime, err error) error {
 		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: cause, Message: nativeErr.Message, StatusCode: nativeErr.StatusCode, ProviderCode: nativeErr.ProviderCode})
 	}
 
-	cause := wire.CauseTransport
-	message := fmt.Sprintf("native helper protocol: %v", err)
-
 	if errors.Is(err, nanocodex.ErrClosed) {
-		cause = wire.CauseProcessExit
-		result, waitErr := rt.proc.Wait(context.Background())
-
-		message = fmt.Sprintf("native process exited (code %d, signal %d): %s", result.ExitCode, result.Signal, rt.proc.StderrTail())
-		if waitErr != nil {
-			message = fmt.Sprintf("native process wait failed: %v; %s", waitErr, rt.proc.StderrTail())
-		}
+		return wire.TurnFailed(vendor, wire.TransportFailure(context.Background(), rt.proc, "native helper", err, nil))
 	}
 
-	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: cause, Message: message})
+	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: "native helper protocol: " + err.Error()})
 }

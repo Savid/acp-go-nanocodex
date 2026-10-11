@@ -13,11 +13,11 @@ import (
 func ExampleNewNanocodexOptions() {
 	options := nanocodexacp.NewNanocodexOptions(
 		nanocodexacp.WithNanocodexModel("gpt-6.1-sol"),
-		nanocodexacp.WithNanocodexThinking("medium"),
+		nanocodexacp.WithNanocodexEffort("medium"),
 	)
 
 	fmt.Println(options.Model)
-	fmt.Println(options.Thinking)
+	fmt.Println(options.Effort)
 	// Output:
 	// gpt-6.1-sol
 	// medium

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
+	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,7 +87,7 @@ func TestReplayMalformedRecordsUseRestoreFailure(t *testing.T) {
 		`{"type":"response_item","payload":{"type":"message","content":"invalid"}}`,
 	} {
 		a, _, _, _ := fixtureAgent(t)
-		s := session{agent: a, rows: [][]byte{[]byte(row)}}
+		s := replaySession(t, a, [][]byte{[]byte(row)})
 		require.Equal(t, wire.RestoreFailed(vendor), s.replay(t.Context()))
 	}
 }
@@ -117,6 +120,20 @@ func TestReplayMalformedToolOutputRefusesRestoreWithoutRawFallback(t *testing.T)
 	}
 }
 
+// replaySession is a session whose committed rollout holds rows.
+func replaySession(t *testing.T, a *Agent, rows [][]byte) *session {
+	t.Helper()
+
+	home := t.TempDir()
+	path := filepath.Join(home, "sessions", "replay.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	require.NoError(t, os.WriteFile(path, append(bytes.Join(rows, []byte{'\n'}), '\n'), 0o600))
+	tail, err := nanocodex.ReadRows(home, path, sessionlog.Cursor{}, -1)
+	require.NoError(t, err)
+
+	return &session{agent: a, home: home, state: nanocodex.State{RolloutPath: path}, cursor: tail.Next}
+}
+
 func appendReplayItems(t *testing.T, path string, items []any) {
 	t.Helper()
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
@@ -134,7 +151,7 @@ func TestReplayCompactedTurnProjectsOnlyNewVisibleItems(t *testing.T) {
 	a, client, _, _ := fixtureAgent(t)
 	data, err := os.ReadFile("testdata/compacted-replay.jsonl")
 	require.NoError(t, err)
-	s := session{agent: a, rows: bytes.Split(bytes.TrimSpace(data), []byte{'\n'})}
+	s := replaySession(t, a, bytes.Split(bytes.TrimSpace(data), []byte{'\n'}))
 	require.NoError(t, s.replay(t.Context()))
 	notifications, frames := client.snapshot()
 	var users, thoughts []string

@@ -82,18 +82,17 @@ func (s *session) textUpdate(ctx context.Context, t *turn, kind string, data jso
 		return fmt.Errorf("unknown helper event %q", kind)
 	}
 
-	key := payload.ItemKey
-
 	text := payload.Text
 	if kind == "assistant_message" {
-		text = wire.UnstreamedSuffix(t.texts[key], text)
+		text = t.texts.Suffix(payload.ItemKey, text)
+	} else {
+		t.texts.Add(payload.ItemKey, text)
 	}
 
 	if text == "" {
 		return nil
 	}
 
-	t.texts[key] += text
 	t.hasText = true
 
 	update := acp.UpdateAgentMessageText(text)
@@ -119,12 +118,11 @@ func (s *session) nativeUpdate(ctx context.Context, t *turn, event nanocodex.Eve
 			return err
 		}
 
-		text := wire.UnstreamedSuffix(t.texts[payload.ItemID], payload.Text)
+		text := t.texts.Suffix(payload.ItemID, payload.Text)
 		if text == "" {
 			return nil
 		}
 
-		t.texts[payload.ItemID] += text
 		t.hasText = true
 
 		return s.emit(ctx, acp.UpdateAgentMessageText(text))

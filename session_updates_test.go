@@ -68,7 +68,7 @@ func TestGatewayTextRejectsMissingPresentationIdentity(t *testing.T) {
 	t.Parallel()
 	a, client, _, _ := fixtureAgent(t)
 	s := session{agent: a}
-	active := turn{texts: make(map[string]string)}
+	active := turn{}
 	err := s.textUpdate(t.Context(), &active, "assistant_message", json.RawMessage(`{"text":"unidentified output","responseId":"actual-provider-response"}`))
 	require.ErrorContains(t, err, "missing item key")
 	notifications, _ := client.snapshot()

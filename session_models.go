@@ -40,7 +40,7 @@ func (s *session) configOptions() []acp.SessionConfigOption {
 
 	options := []acp.SessionConfigOption{{Select: &acp.SessionConfigOptionSelect{Id: configModel, Name: "Model", Type: "select", Category: new(acp.SessionConfigOptionCategoryModel), CurrentValue: acp.SessionConfigValueId(s.options.Model), Options: acp.SessionConfigSelectOptions{Ungrouped: &models}}}}
 	if len(thinking) > 0 {
-		options = append(options, acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{Id: configThinking, Name: "Thought Level", Type: "select", Category: new(acp.SessionConfigOptionCategoryThoughtLevel), CurrentValue: acp.SessionConfigValueId(s.options.Thinking), Options: acp.SessionConfigSelectOptions{Ungrouped: &thinking}}})
+		options = append(options, acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{Id: configThinking, Name: "Thought Level", Type: "select", Category: new(acp.SessionConfigOptionCategoryThoughtLevel), CurrentValue: acp.SessionConfigValueId(s.options.Effort), Options: acp.SessionConfigSelectOptions{Ungrouped: &thinking}}})
 	}
 
 	return options
@@ -85,7 +85,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	s.mu.Lock()
 	previousOptions := s.options.clone()
 	previousState := s.state
-	previousRows := s.rows
+	previousCursor, previousRows := s.cursor, s.nativeRows
 	candidate := s.options.clone()
 	value := string(p.Value)
 
@@ -109,7 +109,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 			return acp.SetSessionConfigOptionResponse{}, wire.Unsupported("value")
 		}
 
-		candidate.Thinking = value
+		candidate.Effort = value
 	default:
 		s.mu.Unlock()
 
@@ -123,7 +123,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		s.mu.Lock()
 		s.options = previousOptions
 		s.state = previousState
-		s.rows = previousRows
+		s.cursor, s.nativeRows = previousCursor, previousRows
 		s.binding = nil
 		s.mu.Unlock()
 	}

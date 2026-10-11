@@ -86,7 +86,7 @@ func TestConformanceNativeProcessExitHasStableCause(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, "nanocodex_turn_failed", data["error"])
 		require.Equal(t, "process_exit", data["cause"])
-		require.Contains(t, data["message"], "code 37")
+		require.Contains(t, data["message"], "status 37")
 		require.Contains(t, data["message"], "fixture native crash")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 )
 
@@ -68,10 +69,10 @@ func (a *Agent) newSession(id acp.SessionId, cwd string, meta sessionMeta, ephem
 
 	home, err := a.nativeHome(options, cwd)
 	if err != nil {
-		return nil, wire.InternalFailure(vendor, "native_start")
+		return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
-	return &session{agent: a, id: id, cwd: cwd, home: home, options: options, ephemeral: ephemeral, gate: make(chan struct{}, 1), closed: make(chan struct{}), raw: wire.NewRawEvents(vendor, string(id), "native", meta.rawEvents), updatedAt: time.Now().UnixMilli()}, nil
+	return &session{agent: a, id: id, cwd: cwd, home: home, options: options, ephemeral: ephemeral, gate: make(chan struct{}, 1), mirror: sessionlog.NewMirror(a.store, string(id)), rawEvents: wire.NewRawEvents(vendor, string(id), "native", meta.rawEvents), updatedAt: formatUpdatedAt(time.Now())}, nil
 }
 
 func (a *Agent) install(s *session) error {
@@ -286,7 +287,7 @@ func (a *Agent) ListSessions(ctx context.Context, p acp.ListSessionsRequest) (ac
 
 	list := make([]acp.SessionInfo, 0, len(summaries))
 	for _, summary := range summaries {
-		stored, loadErr := a.loadStored(ctx, acp.SessionId(summary.SessionID))
+		r, found, loadErr := a.loadRecord(ctx, acp.SessionId(summary.SessionID))
 		if loadErr != nil {
 			if errors.Is(loadErr, errInvalidStoredSession) {
 				continue
@@ -295,11 +296,10 @@ func (a *Agent) ListSessions(ctx context.Context, p acp.ListSessionsRequest) (ac
 			return acp.ListSessionsResponse{}, loadErr
 		}
 
-		if !stored.found {
+		if !found {
 			continue
 		}
 
-		r := stored.record
 		if p.Cwd != nil && *p.Cwd != "" && *p.Cwd != r.Cwd {
 			continue
 		}
@@ -312,7 +312,7 @@ func (a *Agent) ListSessions(ctx context.Context, p acp.ListSessionsRequest) (ac
 			continue
 		}
 
-		updated := time.UnixMilli(r.UpdatedAtUnixMilli).UTC().Format("2006-01-02T15:04:05.000Z")
+		updated := formatUpdatedAt(time.UnixMilli(r.UpdatedAtUnixMilli))
 
 		item := acp.SessionInfo{SessionId: acp.SessionId(r.SessionID), Cwd: r.Cwd, Meta: wire.NativeSessionMeta(vendor, r.NativeSessionID), UpdatedAt: &updated}
 		if r.Title != "" {

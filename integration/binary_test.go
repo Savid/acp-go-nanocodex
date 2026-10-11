@@ -234,7 +234,7 @@ func TestSmokeStoreRestoresAfterNativeStateLoss(t *testing.T) {
 	first := startEmbedded(t, nativeHome, store)
 	initializeACP(t, first)
 	options := nanocodexacp.NewNanocodexOptions(
-		nanocodexacp.WithNanocodexModel("gpt-6.1-sol"), nanocodexacp.WithNanocodexThinking("high"),
+		nanocodexacp.WithNanocodexModel("gpt-6.1-sol"), nanocodexacp.WithNanocodexEffort("high"),
 		nanocodexacp.WithNanocodexAPIBaseURL(provider.server.URL+"/v1"), nanocodexacp.WithNanocodexModelIDPrefix("openai"),
 	)
 	session := first.call(t, "session/new", wire.NewSessionRequest(workspace, nanocodexacp.WithSessionNanocodexOptions(options)))

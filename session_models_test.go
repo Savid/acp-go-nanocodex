@@ -39,10 +39,14 @@ func TestFailedConfigObservationClearsStagedBinding(t *testing.T) {
 	require.NotEqual(t, raw, conflicting)
 	require.NoError(t, os.WriteFile(s.state.RolloutPath, conflicting, 0o600))
 	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
-	require.Equal(t, wire.InternalFailure(vendor, ""), err)
-	retained, err := store.Load(t.Context(), string(created.SessionId))
 	require.NoError(t, err)
-	require.Equal(t, generation, retained)
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, bytes.Split(bytes.TrimSpace(conflicting), []byte{'\n'}), rows)
+	require.Equal(t, s.state.NativeSessionID, record.NativeSessionID)
+	require.Len(t, generation[""], len(rows))
 }
 
 type configFailureStore struct {
@@ -58,11 +62,19 @@ func (s *configFailureStore) Replace(ctx context.Context, key acpcore.SessionKey
 	return s.SessionStore.Replace(ctx, key, replacements)
 }
 
+func (s *configFailureStore) Append(ctx context.Context, key acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.Load() {
+		return errors.New("fixture store unavailable")
+	}
+
+	return s.SessionStore.Append(ctx, key, base, entries, replacements)
+}
+
 func configSnapshot(t *testing.T, s *session) []byte {
 	t.Helper()
 
 	s.mu.Lock()
-	data, err := json.Marshal(map[string]any{"options": s.options, "state": s.state, "rows": s.rows})
+	data, err := json.Marshal(map[string]any{"options": s.options, "state": s.state, "rows": s.nativeRows})
 	s.mu.Unlock()
 	require.NoError(t, err)
 
@@ -82,7 +94,7 @@ func TestConfigSelectionUsesNativeValidation(t *testing.T) {
 	s, err := agent.lookup(created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	thinking := s.options.Thinking
+	thinking := s.options.Effort
 	s.mu.Unlock()
 	require.Equal(t, "unlisted-effort", thinking)
 	notifications, _ := client.snapshot()
@@ -313,7 +325,7 @@ func TestModelChangeDropsTheStoredThinkingLevel(t *testing.T) {
 		thinking string
 	}{
 		{name: "load without a thinking level", load: []NanocodexOption{WithNanocodexModel("kimi-k3")}, thinking: "low"},
-		{name: "load that supplies a thinking level", load: []NanocodexOption{WithNanocodexModel("kimi-k3"), WithNanocodexThinking("high")}, thinking: "high"},
+		{name: "load that supplies a thinking level", load: []NanocodexOption{WithNanocodexModel("kimi-k3"), WithNanocodexEffort("high")}, thinking: "high"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -323,11 +335,11 @@ func TestModelChangeDropsTheStoredThinkingLevel(t *testing.T) {
 			options := NewNanocodexOptions(WithNanocodexModel(gatewayModel), WithNanocodexAPIBaseURL("http://127.0.0.1:1/v1"))
 			created := fixtureSession(t, agent, workspace, WithSessionNanocodexOptions(options))
 			// The helper reports the Luna base model's default effort.
-			require.Equal(t, "medium", storedOptions(t, store, created.SessionId).Thinking)
+			require.Equal(t, "medium", storedOptions(t, store, created.SessionId).Effort)
 
 			require.NoError(t, loadWith(test.load...)(t.Context(), agent, created.SessionId, workspace))
 			stored := storedOptions(t, store, created.SessionId)
-			require.Equal(t, []string{"kimi-k3", test.thinking}, []string{stored.Model, stored.Thinking})
+			require.Equal(t, []string{"kimi-k3", test.thinking}, []string{stored.Model, stored.Effort})
 		})
 	}
 }
@@ -339,14 +351,14 @@ func TestLoadWithTheStoredModelKeepsItsSettings(t *testing.T) {
 	agent, _, _, workspace := fixtureAgent(t, WithSessionStore(store))
 	capture := filepath.Join(t.TempDir(), "initialize.jsonl")
 	options := gatewayOptions(capture)
-	options.Thinking = "high"
+	options.Effort = "high"
 	created := fixtureSession(t, agent, workspace, WithSessionNanocodexOptions(options))
 	require.NoError(t, loadWith(WithNanocodexModel(gatewayModel))(t.Context(), agent, created.SessionId, workspace))
 
 	initialized := lastInitialize(t, capture)
 	require.Equal(t, []any{gatewayModel, "kimi-k3", int64(262144), "high"}, []any{initialized.Model, initialized.BaseModel, initialized.ContextWindow, initialized.Thinking})
 	stored := storedOptions(t, store, created.SessionId)
-	require.Equal(t, []any{gatewayModel, "kimi-k3", int64(262144), "high"}, []any{stored.Model, stored.BaseModel, stored.ContextWindow, stored.Thinking})
+	require.Equal(t, []any{gatewayModel, "kimi-k3", int64(262144), "high"}, []any{stored.Model, stored.BaseModel, stored.ContextWindow, stored.Effort})
 }
 
 // loadWith closes a session and loads it with the given options.

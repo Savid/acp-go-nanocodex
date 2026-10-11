@@ -49,8 +49,10 @@ type NanocodexOptions struct {
 	// ContextWindow is the token window used for context accounting, usage
 	// size, and compaction; zero leaves the helper's environment value or the
 	// model default.
-	ContextWindow int64  `json:"contextWindow,omitempty"`
-	Thinking      string `json:"thinking,omitempty"`
+	ContextWindow int64 `json:"contextWindow,omitempty"`
+	// Effort is the native reasoning effort, carried as the "thinking"
+	// metadata key and the thought_level config option.
+	Effort        string `json:"thinking,omitempty"`
 	APIBaseURL    string `json:"apiBaseUrl,omitempty"`
 	WebsocketURL  string `json:"websocketUrl,omitempty"`
 	ModelIDPrefix string `json:"modelIdPrefix,omitempty"`
@@ -107,9 +109,9 @@ func WithNanocodexExtraPathDirs(dirs ...string) NanocodexOption {
 	return func(o *NanocodexOptions) { o.ExtraPathDirs = slices.Clone(cloned) }
 }
 
-// WithNanocodexThinking selects a native reasoning effort.
-func WithNanocodexThinking(thinking string) NanocodexOption {
-	return func(o *NanocodexOptions) { o.Thinking = thinking }
+// WithNanocodexEffort selects a native reasoning effort.
+func WithNanocodexEffort(effort string) NanocodexOption {
+	return func(o *NanocodexOptions) { o.Effort = effort }
 }
 
 // WithNanocodexAPIBaseURL selects the provider's API base URL.
@@ -206,7 +208,7 @@ func (options NanocodexOptions) strings() map[string]string {
 // stringOptionFields maps each string option's metadata key to its field.
 func stringOptionFields(options *NanocodexOptions) map[string]*string {
 	return map[string]*string{
-		metaModelKey: &options.Model, metaBaseModelKey: &options.BaseModel, metaThinkingKey: &options.Thinking,
+		metaModelKey: &options.Model, metaBaseModelKey: &options.BaseModel, metaThinkingKey: &options.Effort,
 		metaAPIBaseURLKey: &options.APIBaseURL, metaWebsocketURLKey: &options.WebsocketURL, metaModelIDPrefixKey: &options.ModelIDPrefix,
 		metaTransportKey: &options.Transport, metaAPIKeyEnvKey: &options.APIKeyEnv, metaAuthFileKey: &options.AuthFile,
 	}
@@ -214,7 +216,7 @@ func stringOptionFields(options *NanocodexOptions) map[string]*string {
 
 func (options NanocodexOptions) initialize(sessionID, nativeID string) nanocodex.Initialize {
 	return nanocodex.Initialize{
-		Model: options.Model, BaseModel: options.BaseModel, ContextWindow: options.ContextWindow, Thinking: options.Thinking,
+		Model: options.Model, BaseModel: options.BaseModel, ContextWindow: options.ContextWindow, Thinking: options.Effort,
 		APIBaseURL: options.APIBaseURL, WebsocketURL: options.WebsocketURL, ModelIDPrefix: options.ModelIDPrefix, Transport: options.Transport,
 		APIKeyEnv: options.APIKeyEnv, AuthFile: options.AuthFile, SessionID: sessionID, ResumeSessionID: nativeID,
 		ShellEnv: slices.Clone(options.ShellEnv),
@@ -442,7 +444,7 @@ func validEnvName(name string) bool {
 func (options NanocodexOptions) forModelChange() NanocodexOptions {
 	options.BaseModel = ""
 	options.ContextWindow = 0
-	options.Thinking = ""
+	options.Effort = ""
 
 	return options
 }

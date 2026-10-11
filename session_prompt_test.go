@@ -322,7 +322,9 @@ type terminalCommitStore struct {
 	release chan struct{}
 }
 
-func (s *terminalCommitStore) Replace(ctx context.Context, key acpcore.SessionKey, rows []acpcore.SessionStoreReplacement) error {
+// await blocks the third write: the terminal commit after the new session's
+// generation and its pre-turn native rebinding.
+func (s *terminalCommitStore) await(ctx context.Context) error {
 	if s.writes.Add(1) == 3 {
 		close(s.entered)
 		select {
@@ -332,7 +334,23 @@ func (s *terminalCommitStore) Replace(ctx context.Context, key acpcore.SessionKe
 		}
 	}
 
+	return nil
+}
+
+func (s *terminalCommitStore) Replace(ctx context.Context, key acpcore.SessionKey, rows []acpcore.SessionStoreReplacement) error {
+	if err := s.await(ctx); err != nil {
+		return err
+	}
+
 	return s.SessionStore.Replace(ctx, key, rows)
+}
+
+func (s *terminalCommitStore) Append(ctx context.Context, key acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, rows []acpcore.SessionStoreReplacement) error {
+	if err := s.await(ctx); err != nil {
+		return err
+	}
+
+	return s.SessionStore.Append(ctx, key, base, entries, rows)
 }
 
 func TestConformanceTerminalMirrorFailurePreservesGenerationAndFences(t *testing.T) {
@@ -386,7 +404,7 @@ func TestConformanceTerminalMirrorFailurePreservesGenerationAndFences(t *testing
 				require.True(t, ok)
 				require.Equal(t, "nanocodex_turn_failed", data["error"])
 				require.Equal(t, "process_exit", data["cause"])
-				require.Contains(t, data["message"], "code 37")
+				require.Contains(t, data["message"], "status 37")
 				require.Contains(t, data["message"], "fixture native crash")
 			default:
 				require.Equal(t, wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: "session mirror commit failed"}), result.err)

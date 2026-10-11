@@ -133,7 +133,7 @@ it with `NewNanocodexOptions`, then attach it using
 | `model` | `WithNanocodexModel` | Native model ID, or a gateway model ID on a configured gateway route. |
 | `baseModel` | `WithNanocodexBaseModel` | Native model whose settings a [gateway model](PROVIDERS.md#gateway-models) uses. |
 | `contextWindow` | `WithNanocodexContextWindow` | Token window for usage reporting and context management; see [gateway models](PROVIDERS.md#gateway-models). |
-| `thinking` | `WithNanocodexThinking` | Native reasoning effort. |
+| `thinking` | `WithNanocodexEffort` | Native reasoning effort; the `thought_level` config option selects the same value. |
 | `env` | `WithNanocodexEnv` | Session environment overlay. |
 | `extraPathDirs` | `WithNanocodexExtraPathDirs` | Ordered absolute directories prepended to `PATH`. |
 | `apiBaseUrl` | `WithNanocodexAPIBaseURL` | Responses API base URL. |
@@ -212,8 +212,21 @@ first appear on the next one.
 raw native rollout rows; `config` contains the ACP/native identities, relative
 rollout path, working directory, provider/model settings, accepted environment,
 title, timestamp, and the cumulative cost once a call is priced.
-`github.com/savid/acp-go-core` supplies the store types and atomic mirror
-operations.
+`github.com/savid/acp-go-core` supplies the store types and the session
+mirror.
+
+The adapter keeps no copy of the rollout in memory. Each commit reads only the
+records appended after the last committed byte offset and appends them to the
+store with the configuration record. The configuration record is replaced only
+when it changed, and its timestamp advances only when the rows or the rest of
+the record changed, so an unchanged session writes nothing. A rollout that was
+rewritten or truncated before the committed offset is republished whole.
+Before each helper launch, a rollout that no longer extends the committed
+records is hydrated again from the store. `session/list` reads configuration
+records only. Load replay streams the committed rollout one record at a time.
+Only newline-terminated records are mirrored. While the helper is stopped and
+its writer lock is held, a final record without its newline receives one when
+it is complete JSON and is removed otherwise.
 
 After a prompt, the helper stops the native writer and atomically saves the latest
 optional snapshot checkpoint in `<rollout>.acp-checkpoint.json`. The store mirrors
@@ -260,7 +273,7 @@ A native turn failure returns `nanocodex_turn_failed`. Provider rejections
 and failed provider or gateway connections, including a stream that ends
 before the response completes, have cause `provider`; invalid provider data
 and helper protocol failures have cause `transport`, and a helper exit has
-cause `process_exit`. A failed prompt mirror commit returns
+cause `process_exit` with its exit status or signal and stderr tail. A failed prompt mirror commit returns
 `nanocodex_turn_failed` with cause `transport` and message
 `session mirror commit failed`. Store failures outside
 a prompt return `nanocodex_internal_failure` without a class. Failed restoration returns
@@ -312,7 +325,8 @@ retry delays. Native default and WebSocket routes retain upstream transport
 behavior.
 Shell sessions and other in-memory tool state last for one prompt; subsequent
 prompts resume the saved conversation in a new helper.
-Prompt parameters are limited to 12 MiB of encoded JSON before admission.
+Prompt parameters are limited to 12 MiB of encoded JSON before admission; a
+larger prompt is refused as unsupported `prompt`.
 Gateway responses require `text/event-stream`; each event and the accumulated
 event data for one response are limited to 4 MiB. These limits leave room for
 native event envelopes. Compacted native rows can contain an entire history and

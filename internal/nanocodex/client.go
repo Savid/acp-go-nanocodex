@@ -2,7 +2,6 @@
 package nanocodex
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/savid/acp-go-core/wire"
 )
 
 // MaxFrameBytes bounds a single helper protocol frame, excluding its newline.
@@ -240,18 +241,30 @@ func (c *Client) write() {
 }
 
 func (c *Client) read() {
-	scanner := bufio.NewScanner(c.output)
-	scanner.Buffer(make([]byte, 64<<10), MaxFrameBytes+1)
+	lines := wire.NewLineReader(c.output, MaxFrameBytes)
 
-	for scanner.Scan() {
-		if len(scanner.Bytes()) > MaxFrameBytes {
+	for {
+		line, err := lines.Next()
+		if errors.Is(err, wire.ErrLineTooLong) {
 			c.fail(errors.New("helper response exceeds frame limit"))
 
 			return
 		}
 
+		if errors.Is(err, io.EOF) {
+			c.fail(ErrClosed)
+
+			return
+		}
+
+		if err != nil {
+			c.fail(fmt.Errorf("read helper stream: %w", err))
+
+			return
+		}
+
 		var frame Frame
-		if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+		if err = json.Unmarshal(line, &frame); err != nil {
 			c.fail(fmt.Errorf("invalid helper frame: %w", err))
 
 			return
@@ -277,14 +290,6 @@ func (c *Client) read() {
 			}
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		c.fail(fmt.Errorf("read helper stream: %w", err))
-
-		return
-	}
-
-	c.fail(ErrClosed)
 }
 
 func (f Frame) requestID() (uint64, error) {

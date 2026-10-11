@@ -333,7 +333,7 @@ func TestClientRejectsOversizedFrames(t *testing.T) {
 			))
 			written <- err
 		}()
-		require.ErrorContains(t, awaitClientValue(t, result), "token too long")
+		require.ErrorContains(t, awaitClientValue(t, result), "helper response exceeds frame limit")
 		awaitClientValue(t, pipes.client.Done())
 		pipes.stop()
 		err := awaitClientValue(t, written)

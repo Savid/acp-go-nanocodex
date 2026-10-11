@@ -140,7 +140,14 @@ func TestAgentConcurrentClosePreservesFailure(t *testing.T) {
 
 	store := &configFailureStore{SessionStore: acpcore.NewInMemorySessionStore()}
 	agent, _, workspace := closingFixtureAgent(t, store)
-	fixtureSession(t, agent, workspace)
+	created := fixtureSession(t, agent, workspace)
+	s, err := agent.lookup(created.SessionId)
+	require.NoError(t, err)
+	file, err := os.OpenFile(s.state.RolloutPath, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = file.WriteString(`{"timestamp":"2026-10-02T03:00:00Z","type":"event_msg","payload":{}}` + "\n")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
 	store.fail.Store(true)
 	start := make(chan struct{})
 	results := make(chan error, 8)

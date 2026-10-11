@@ -195,8 +195,30 @@ type countingStore struct {
 	acpcore.SessionStore
 	mu        sync.Mutex
 	writes    int
+	appends   int
+	appended  int
+	configs   int
 	deletes   int
 	deleteErr error
+}
+
+func (s *countingStore) Append(ctx context.Context, key acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, rows []acpcore.SessionStoreReplacement) error {
+	s.mu.Lock()
+	s.appends++
+	s.appended += len(entries)
+	s.configs += len(rows)
+	s.mu.Unlock()
+
+	return s.SessionStore.Append(ctx, key, base, entries, rows)
+}
+
+// counts reports full writes, appends, appended rows, and replaced
+// configuration records.
+func (s *countingStore) counts() [4]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return [4]int{s.writes, s.appends, s.appended, s.configs}
 }
 
 func (s *countingStore) Replace(ctx context.Context, key acpcore.SessionKey, rows []acpcore.SessionStoreReplacement) error {

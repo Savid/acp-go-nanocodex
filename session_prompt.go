@@ -28,7 +28,7 @@ type turn struct {
 	response       acp.PromptResponse
 	err            error
 	cleanupErr     error
-	texts          map[string]string
+	texts          wire.StreamedText
 	hasText        bool
 	nativeSeq      uint64
 	compactions    wire.Compactions
@@ -68,14 +68,15 @@ func (a *Agent) Prompt(ctx context.Context, p acp.PromptRequest) (resp acp.Promp
 		return resp, wire.UnknownSession()
 	}
 
-	if s.poisoned {
+	if s.poison != "" {
+		poison := s.poison
 		s.mu.Unlock()
 		release()
 
-		return resp, wire.SessionPoisoned(vendor, "native_session_identity_drift")
+		return resp, wire.SessionPoisoned(vendor, poison)
 	}
 
-	t := &turn{done: make(chan struct{}), submission: submission, texts: make(map[string]string)}
+	t := &turn{done: make(chan struct{}), submission: submission}
 	s.turn = t
 	s.mu.Unlock()
 
@@ -176,7 +177,7 @@ func (s *session) mapPrompt(ctx context.Context, blocks []acp.ContentBlock) ([]n
 
 	encoded, err := json.Marshal(map[string]any{"content": content})
 	if err != nil || len(encoded) > nanocodex.MaxPromptBytes {
-		return nil, acp.NewInvalidParams("prompt content exceeds 12 MiB")
+		return nil, wire.Unsupported("prompt")
 	}
 
 	return content, nil
@@ -319,9 +320,9 @@ func (s *session) applyPromptResult(t *turn, result nanocodex.Result) error {
 	defer s.mu.Unlock()
 
 	if result.NativeSessionID != s.state.NativeSessionID || result.RolloutPath != s.state.RolloutPath {
-		s.poisoned = true
+		s.poison = wire.CauseNativeSessionIdentityDrift
 
-		return wire.SessionPoisoned(vendor, "native_session_identity_drift")
+		return wire.SessionPoisoned(vendor, s.poison)
 	}
 
 	s.state.CommittedBytes = result.CommittedBytes
@@ -446,7 +447,7 @@ func (s *session) sendCancel(t *turn) {
 
 func (s *session) emitNativeRaw(ctx context.Context, data json.RawMessage) {
 	conn := s.agent.connection()
-	if conn == nil || s.raw == nil {
+	if conn == nil || !s.rawEvents.Enabled() {
 		return
 	}
 
@@ -457,7 +458,7 @@ func (s *session) emitNativeRaw(ctx context.Context, data json.RawMessage) {
 
 	omitRawImages(raw)
 
-	if err := s.raw.Emit(ctx, func(ctx context.Context, method string, params map[string]any) error {
+	if err := s.rawEvents.Emit(ctx, func(ctx context.Context, method string, params map[string]any) error {
 		return conn.NotifyExtension(ctx, method, params)
 	}, raw); err != nil {
 		s.agent.observe.RecordRawMessageEmitFailure(ctx, err)

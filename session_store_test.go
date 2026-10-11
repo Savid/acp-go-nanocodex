@@ -63,10 +63,10 @@ func TestFailedEmptyReplacementCommitRetriesFromDurableBinding(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, files, 3)
 	for _, path := range files {
-		rows, readErr := nanocodex.ReadRows(home, path, -1)
+		tail, readErr := nanocodex.ReadRows(home, path, sessionlog.Cursor{}, -1)
 		require.NoError(t, readErr)
 		var headers int
-		for _, row := range rows {
+		for _, row := range tail.Rows {
 			var envelope nanocodex.Row
 			require.NoError(t, json.Unmarshal(row, &envelope))
 			if envelope.Type == "session_meta" {
@@ -133,7 +133,7 @@ func TestPromptReportsProcessExitAfterResumeInitialization(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, "nanocodex_turn_failed", data["error"])
 		require.Equal(t, "process_exit", data["cause"])
-		require.Contains(t, data["message"], "code 17")
+		require.Contains(t, data["message"], "status 17")
 	}
 }
 
@@ -222,7 +222,9 @@ func TestNativeLockCoversHydrationAndRunningHelper(t *testing.T) {
 	lock, err := process.LockFile(lockPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lock.Close() })
-	header := append(bytes.Clone(s.rows[0]), '\n')
+	committed, err := os.ReadFile(s.state.RolloutPath)
+	require.NoError(t, err)
+	header := committed[:bytes.IndexByte(committed, '\n')+1]
 	require.NoError(t, os.WriteFile(s.state.RolloutPath, header, 0o600))
 	_, err = agent.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "cannot hydrate while locked"))
 	require.Equal(t, wire.RestoreFailed(vendor), err)
@@ -458,7 +460,7 @@ func TestStoredOptionsAreValidatedOnLoad(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	record.Options.ContextWindow = -1
-	require.NoError(t, sessionlog.Commit(t.Context(), store, string(created.SessionId), rows, record))
+	require.NoError(t, sessionlog.NewMirror(store, string(created.SessionId)).Commit(t.Context(), sessionlog.Rows(rows), record))
 	_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
 	require.Equal(t, wire.RestoreFailed(vendor), err)
 }
@@ -529,4 +531,132 @@ func TestStoredCostMustBeFiniteAndNonNegative(t *testing.T) {
 		_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
 		require.Equal(t, wire.RestoreFailed(vendor), err, cost)
 	}
+}
+
+func TestMirrorAppendsOnlyNewRowsAndSkipsUnchangedCommits(t *testing.T) {
+	t.Parallel()
+
+	store := &countingStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	agent, _, home, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, agent, workspace)
+	completed := fixturePrompt(t, agent, created.SessionId, "first")
+	path := rolloutPath(home, nativeID(t, completed.Meta))
+	before := store.counts()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	rowsBefore := bytes.Count(raw, []byte{'\n'})
+
+	fixturePrompt(t, agent, created.SessionId, "second")
+	raw, err = os.ReadFile(path)
+	require.NoError(t, err)
+	after := store.counts()
+	require.Equal(t, before[0], after[0], "a continuing turn never republishes the generation")
+	require.Equal(t, before[1]+1, after[1])
+	require.Equal(t, bytes.Count(raw, []byte{'\n'})-rowsBefore, after[2]-before[2])
+	require.Equal(t, before[3]+1, after[3])
+
+	_, err = agent.SetSessionConfigOption(t.Context(), wire.SetConfigOptionRequest(created.SessionId, configThinking, "high"))
+	require.NoError(t, err)
+	configured := store.counts()
+	require.Equal(t, [4]int{after[0], after[1] + 1, after[2], after[3] + 1}, configured, "a configuration change appends no rows")
+
+	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	require.Equal(t, configured, store.counts(), "an unchanged session writes nothing")
+
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, bytes.Split(bytes.TrimSpace(raw), []byte{'\n'}), rows)
+	require.Equal(t, "high", record.Options.Effort)
+}
+
+func TestRemovedRolloutIsHydratedFromTheStoreBeforeLaunch(t *testing.T) {
+	t.Parallel()
+
+	agent, client, home, workspace := fixtureAgent(t)
+	created := fixtureSession(t, agent, workspace)
+	completed := fixturePrompt(t, agent, created.SessionId, "remembered")
+	path := rolloutPath(home, nativeID(t, completed.Meta))
+	committed, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(path))
+	fixturePrompt(t, agent, created.SessionId, "after removal")
+	restored, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.True(t, bytes.HasPrefix(restored, committed))
+	client.reset()
+	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.NoError(t, err)
+	require.Contains(t, client.text(), "Hello world.")
+}
+
+// BenchmarkCommitMirror measures one turn's commit of a large rollout: append
+// continues from the committed cursor, full republishes the whole history.
+func BenchmarkCommitMirror(b *testing.B) {
+	for _, mode := range []string{"append", "full"} {
+		b.Run(mode, func(b *testing.B) {
+			agent, _, home, workspace := benchmarkAgent(b)
+			created, err := agent.NewSession(b.Context(), wire.NewSessionRequest(workspace))
+			require.NoError(b, err)
+			completed, err := agent.Prompt(b.Context(), wire.PromptRequest(created.SessionId, acp.TextBlock("seed")))
+			require.NoError(b, err)
+			s, err := agent.lookup(created.SessionId)
+			require.NoError(b, err)
+
+			value, _ := completed.Meta["nanocodex"].(map[string]any)
+			nativeSessionID, _ := value["nativeSessionId"].(string)
+			path := rolloutPath(home, nativeSessionID)
+			row := []byte(`{"timestamp":"2026-10-02T03:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"` + strings.Repeat("x", 1024) + `"}]}}` + "\n")
+			appendRows(b, path, row, 20000)
+			require.NoError(b, s.commitMirror(b.Context()))
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for range b.N {
+				b.StopTimer()
+				appendRows(b, path, row, 1)
+
+				if mode == "full" {
+					s.mirror.Reset()
+					s.cursor = sessionlog.Cursor{}
+				}
+				b.StartTimer()
+
+				require.NoError(b, s.commitMirror(b.Context()))
+			}
+		})
+	}
+}
+
+func benchmarkAgent(b *testing.B) (*Agent, *recordingClient, string, string) {
+	b.Helper()
+
+	exe, err := os.Executable()
+	require.NoError(b, err)
+
+	home, workspace := b.TempDir(), b.TempDir()
+	agent := NewAgent(WithExecutablePath(exe), WithHome(home), WithEnv(map[string]string{fakeHelperEnv: "1"}))
+	client := &recordingClient{wake: make(chan struct{}, 32)}
+	agent.attach(client, nil)
+	b.Cleanup(func() { _ = agent.Close() })
+	_, err = agent.Initialize(b.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(b, err)
+
+	return agent, client, home, workspace
+}
+
+func appendRows(b *testing.B, path string, row []byte, count int) {
+	b.Helper()
+
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(b, err)
+
+	_, err = file.Write(bytes.Repeat(row, count))
+	require.NoError(b, err)
+	require.NoError(b, file.Close())
 }
