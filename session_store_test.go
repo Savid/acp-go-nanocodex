@@ -398,7 +398,8 @@ func TestLoadOwnsForegroundUntilReplayCompletes(t *testing.T) {
 
 func TestRestoreRefusesAnActiveNativeWriterBeforeHydration(t *testing.T) {
 	t.Parallel()
-	a, _, home, workspace := fixtureAgent(t)
+	logger, logs := captureLogs()
+	a, _, home, workspace := fixtureAgent(t, WithLogger(logger))
 	created := fixtureSession(t, a, workspace)
 	completed := fixturePrompt(t, a, created.SessionId, "committed history")
 	_, err := a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
@@ -412,6 +413,7 @@ func TestRestoreRefusesAnActiveNativeWriterBeforeHydration(t *testing.T) {
 	defer lock.Close()
 	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
 	require.Equal(t, wire.RestoreFailed(vendor), err)
+	require.Contains(t, logs.String(), `level=ERROR msg="session restore failed" vendor=nanocodex session_id=`+string(created.SessionId)+` reason="lock native writer:`)
 	after, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, before, after)
@@ -733,4 +735,26 @@ func TestAcceptedPromptWithoutNativeRowsLeavesTheSessionRestorable(t *testing.T)
 	require.NoError(t, err)
 	_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
 	require.NoError(t, err, "restore after an accepted turn that recorded nothing")
+}
+
+func TestEnsureNativeReportsAStoreFailureWithoutRefusingRestore(t *testing.T) {
+	t.Parallel()
+
+	store := &listLoadFailureStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	logger, logs := captureLogs()
+	agent, _, _, workspace := fixtureAgent(t, WithSessionStore(store), WithLogger(logger))
+	created := fixtureSession(t, agent, workspace)
+	fixturePrompt(t, agent, created.SessionId, "committed history")
+	s, err := agent.lookup(created.SessionId)
+	require.NoError(t, err)
+	committed, err := os.ReadFile(s.state.RolloutPath)
+	require.NoError(t, err)
+	header := committed[:bytes.IndexByte(committed, '\n')+1]
+	require.NoError(t, os.WriteFile(s.state.RolloutPath, header, 0o600))
+	store.fail.Store(true)
+	_, err = agent.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "store unavailable"))
+	require.Equal(t, wire.InternalFailure(vendor, ""), err)
+	require.NotContains(t, logs.String(), "session restore failed")
+	store.fail.Store(false)
+	fixturePrompt(t, agent, created.SessionId, "store available again")
 }

@@ -3,12 +3,13 @@ package nanocodexacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/image"
-	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
 )
 
@@ -36,7 +37,7 @@ func (s *session) replay(ctx context.Context) error {
 	}
 
 	if err != nil {
-		return wire.RestoreFailed(vendor)
+		return s.restoreRefused(ctx, fmt.Errorf("read native rollout: %w", err))
 	}
 
 	return nil
@@ -45,7 +46,7 @@ func (s *session) replay(ctx context.Context) error {
 func (s *session) replayRow(ctx context.Context, raw []byte) error {
 	var row nanocodex.Row
 	if err := json.Unmarshal(raw, &row); err != nil {
-		return wire.RestoreFailed(vendor)
+		return s.restoreRefused(ctx, fmt.Errorf("decode native row: %w", err))
 	}
 
 	switch row.Type {
@@ -55,7 +56,7 @@ func (s *session) replayRow(ctx context.Context, raw []byte) error {
 			Input []nanocodex.Content `json:"input"`
 		}
 		if err := json.Unmarshal(row.Payload, &payload); err != nil {
-			return wire.RestoreFailed(vendor)
+			return s.restoreRefused(ctx, fmt.Errorf("decode native event: %w", err))
 		}
 
 		if payload.Type == "input_accepted" {
@@ -70,7 +71,7 @@ func (s *session) replayRow(ctx context.Context, raw []byte) error {
 			History []json.RawMessage `json:"replacement_history"` //nolint:tagliatelle // Native protocol field.
 		}
 		if err := json.Unmarshal(row.Payload, &payload); err != nil {
-			return wire.RestoreFailed(vendor)
+			return s.restoreRefused(ctx, fmt.Errorf("decode compacted history: %w", err))
 		}
 
 		start := len(payload.History)
@@ -80,7 +81,7 @@ func (s *session) replayRow(ctx context.Context, raw []byte) error {
 				Role string `json:"role"`
 			}
 			if err := json.Unmarshal(rawItem, &item); err != nil {
-				return wire.RestoreFailed(vendor)
+				return s.restoreRefused(ctx, fmt.Errorf("decode compacted history item: %w", err))
 			}
 
 			if item.Type == "message" && item.Role == "user" {
@@ -109,20 +110,16 @@ func (s *session) replayUserContent(ctx context.Context, content nanocodex.Conte
 	case "text":
 		return s.emit(ctx, acp.UpdateUserMessageText(content.Text))
 	case "image":
-		if content.ImageURL == "" {
-			return wire.RestoreFailed(vendor)
-		}
-
 		prefix, data, ok := strings.Cut(content.ImageURL, ",")
 		if !ok || !strings.HasPrefix(prefix, "data:") || !strings.HasSuffix(prefix, ";base64") {
-			return wire.RestoreFailed(vendor)
+			return s.restoreRefused(ctx, errors.New("replayed image is not a base64 data URL"))
 		}
 
 		mime := strings.TrimSuffix(strings.TrimPrefix(prefix, "data:"), ";base64")
 
 		output, refusal := image.DecodeOutput(data, mime, s.agent.options.ImageLimits.core().EffectiveOutputPerImage())
 		if refusal != nil {
-			return wire.RestoreFailed(vendor)
+			return s.restoreRefused(ctx, fmt.Errorf("replayed image is invalid: %w", refusal))
 		}
 
 		return s.emit(ctx, acp.UpdateUserMessage(acp.ImageBlock(output.Data, output.MIME)))
@@ -145,7 +142,7 @@ func (s *session) replayResponseItem(ctx context.Context, raw json.RawMessage) e
 		Summary   []replayTextPart `json:"summary"`
 	}
 	if err := json.Unmarshal(raw, &item); err != nil {
-		return wire.RestoreFailed(vendor)
+		return s.restoreRefused(ctx, fmt.Errorf("decode native response item: %w", err))
 	}
 
 	switch item.Type {
@@ -171,7 +168,7 @@ func (s *session) replayResponseItem(ctx context.Context, raw json.RawMessage) e
 		}
 	case "function_call", "custom_tool_call":
 		if item.CallID == "" || item.Name == "" {
-			return wire.RestoreFailed(vendor)
+			return s.restoreRefused(ctx, errors.New("replayed tool call lacks its call ID or name"))
 		}
 
 		var input any
@@ -193,12 +190,12 @@ func (s *session) replayResponseItem(ctx context.Context, raw json.RawMessage) e
 
 func (s *session) replayToolOutput(ctx context.Context, callID, status string, raw json.RawMessage) error {
 	if callID == "" {
-		return wire.RestoreFailed(vendor)
+		return s.restoreRefused(ctx, errors.New("replayed tool output lacks its call ID"))
 	}
 
 	content, err := nativeToolContent(raw)
 	if err != nil {
-		return wire.RestoreFailed(vendor)
+		return s.restoreRefused(ctx, fmt.Errorf("decode replayed tool output: %w", err))
 	}
 
 	var toolStatus acp.ToolCallStatus
@@ -211,7 +208,7 @@ func (s *session) replayToolOutput(ctx context.Context, callID, status string, r
 	case "in_progress":
 		toolStatus = acp.ToolCallStatusInProgress
 	default:
-		return wire.RestoreFailed(vendor)
+		return s.restoreRefused(ctx, fmt.Errorf("replayed tool output has unknown status %q", status))
 	}
 
 	return s.emit(ctx, acp.UpdateToolCall(acp.ToolCallId(callID), acp.WithUpdateStatus(toolStatus), acp.WithUpdateContent(content)))

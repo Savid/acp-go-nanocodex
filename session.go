@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -128,7 +129,7 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 			return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 		}
 
-		return nil, wire.RestoreFailed(vendor)
+		return nil, s.restoreRefused(ctx, fmt.Errorf("lock native session: %w", err))
 	}
 
 	locks := []*process.FileLock{lock}
@@ -146,7 +147,7 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 		s.pending = nil
 
 		if hydrateErr := s.hydrate(ctx, pending); hydrateErr != nil {
-			return nil, hydrateErr
+			return nil, s.restoreRefused(ctx, hydrateErr)
 		}
 	}
 
@@ -220,7 +221,7 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 			case nanocodex.InvalidConfig:
 				return nil, nativeErr
 			case "restore_failed":
-				return nil, wire.RestoreFailed(vendor)
+				return nil, s.restoreRefused(ctx, nativeErr)
 			}
 		}
 

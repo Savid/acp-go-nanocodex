@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"time"
 
@@ -241,13 +242,13 @@ func storedFailure(err error) error {
 		return wire.InternalFailure(vendor, "")
 	}
 
-	return errInvalidStoredSession
+	return fmt.Errorf("%w: %w", errInvalidStoredSession, err)
 }
 
 // loadRecord reads and checks only the configuration of a stored session.
 func (a *Agent) loadRecord(ctx context.Context, id acp.SessionId) (sessionRecord, bool, error) {
 	if err := wire.CheckSessionID(id); err != nil {
-		return sessionRecord{}, false, errInvalidStoredSession
+		return sessionRecord{}, false, fmt.Errorf("%w: session ID", errInvalidStoredSession)
 	}
 
 	var record sessionRecord
@@ -266,15 +267,15 @@ func (a *Agent) loadRecord(ctx context.Context, id acp.SessionId) (sessionRecord
 
 func validRecord(record sessionRecord, id acp.SessionId) error {
 	if record.SessionID != string(id) || !nanocodex.ValidSessionID(record.NativeSessionID) || !filepath.IsAbs(record.Cwd) || record.UpdatedAtUnixMilli <= 0 || !filepath.IsLocal(record.RolloutRelative) {
-		return errInvalidStoredSession
+		return fmt.Errorf("%w: identity, workspace, update time, or rollout path", errInvalidStoredSession)
 	}
 
 	if cost := record.CostUSD; cost != nil && *cost < 0 {
-		return errInvalidStoredSession
+		return fmt.Errorf("%w: negative cost", errInvalidStoredSession)
 	}
 
 	if err := validateNanocodexOptions(record.Options); err != nil {
-		return errInvalidStoredSession
+		return fmt.Errorf("%w: options: %w", errInvalidStoredSession, err)
 	}
 
 	return nil
@@ -282,7 +283,7 @@ func validRecord(record sessionRecord, id acp.SessionId) error {
 
 func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession, error) {
 	if err := wire.CheckSessionID(id); err != nil {
-		return storedSession{}, errInvalidStoredSession
+		return storedSession{}, fmt.Errorf("%w: session ID", errInvalidStoredSession)
 	}
 
 	var record sessionRecord
@@ -301,11 +302,11 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 	}
 
 	if err := nanocodex.ValidateRows(rows, record.NativeSessionID); err != nil {
-		return storedSession{}, errInvalidStoredSession
+		return storedSession{}, fmt.Errorf("%w: native rows: %w", errInvalidStoredSession, err)
 	}
 
 	if record.Started == (len(rows) == 1) {
-		return storedSession{}, errInvalidStoredSession
+		return storedSession{}, fmt.Errorf("%w: started state disagrees with %d native rows", errInvalidStoredSession, len(rows))
 	}
 
 	return storedSession{rows: rows, record: record, found: true}, nil
@@ -313,25 +314,26 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 
 // hydrate reconciles the native rollout with a stored generation: native rows
 // that extend the stored ones win, and a missing or shorter rollout is
-// rewritten from the store. The stored rows are released once reconciled.
+// rewritten from the store. The stored rows are released once reconciled. Its
+// error is the reason the session cannot be restored.
 func (s *session) hydrate(ctx context.Context, stored *storedSession) error {
 	if !nanocodex.ValidSessionID(stored.record.NativeSessionID) {
-		return wire.RestoreFailed(vendor)
+		return errors.New("invalid native session identity")
 	}
 
 	path := filepath.Join(s.home, stored.record.RolloutRelative)
 	if _, err := nanocodex.RolloutRelative(s.home, path); err != nil {
-		return wire.RestoreFailed(vendor)
+		return err
 	}
 
 	lock, err := process.LockFile(filepath.Join(s.home, "nanocodex", "acp-locks", stored.record.NativeSessionID+".writer.lock"))
 	if err != nil {
-		return wire.RestoreFailed(vendor)
+		return fmt.Errorf("lock native writer: %w", err)
 	}
 	defer lock.Close()
 
 	if err = nanocodex.RepairTail(s.home, path); err != nil {
-		return wire.RestoreFailed(vendor)
+		return fmt.Errorf("settle native rollout tail: %w", err)
 	}
 
 	storedRows := len(stored.rows)
@@ -342,7 +344,7 @@ func (s *session) hydrate(ctx context.Context, stored *storedSession) error {
 	stored.rows = nil
 
 	if err != nil {
-		return wire.RestoreFailed(vendor)
+		return fmt.Errorf("hydrate native rollout: %w", err)
 	}
 
 	// Native rows newer than the store keep the native checkpoint, which the
@@ -382,20 +384,40 @@ func (s *session) ensureNative(ctx context.Context) error {
 
 	lock, err := process.LockFile(filepath.Join(s.home, "nanocodex", "acp-locks", state.NativeSessionID+".lock"))
 	if err != nil {
-		return wire.RestoreFailed(vendor)
+		return s.restoreRefused(ctx, fmt.Errorf("lock native session: %w", err))
 	}
 	defer lock.Close()
 
-	if s.commit(ctx, true) == nil {
+	commitErr := s.commit(ctx, true)
+	if commitErr == nil {
 		return nil
 	}
 
+	commitErr = fmt.Errorf("commit native rows: %w", commitErr)
+
 	stored, err := s.agent.loadStored(ctx, s.id)
-	if err != nil || !stored.found || stored.record.NativeSessionID != state.NativeSessionID || filepath.Join(s.home, stored.record.RolloutRelative) != state.RolloutPath {
-		return wire.RestoreFailed(vendor)
+	switch {
+	case errors.Is(err, errInvalidStoredSession):
+		return s.restoreRefused(ctx, errors.Join(commitErr, err))
+	case err != nil:
+		return err
+	case !stored.found:
+		return s.restoreRefused(ctx, errors.Join(commitErr, errors.New("stored session is missing")))
+	case stored.record.NativeSessionID != state.NativeSessionID || filepath.Join(s.home, stored.record.RolloutRelative) != state.RolloutPath:
+		return s.restoreRefused(ctx, errors.Join(commitErr, errors.New("stored native binding differs from the session")))
 	}
 
-	return s.hydrate(ctx, &stored)
+	if err = s.hydrate(ctx, &stored); err != nil {
+		return s.restoreRefused(ctx, errors.Join(commitErr, err))
+	}
+
+	return nil
+}
+
+// restoreRefused logs why the session cannot be restored and returns the
+// uniform restore failure.
+func (s *session) restoreRefused(ctx context.Context, err error) *acp.RequestError {
+	return wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 }
 
 // LoadSession restores native state and replays the conversation to the client.
@@ -482,7 +504,7 @@ func (a *Agent) restore(ctx context.Context, id acp.SessionId, cwd string, dirs 
 	stored, err := a.loadStored(ctx, id)
 	if err != nil {
 		if errors.Is(err, errInvalidStoredSession) {
-			return nil, wire.RestoreFailed(vendor)
+			return nil, wire.RestoreRefused(ctx, a.log, vendor, id, err)
 		}
 
 		return nil, err
