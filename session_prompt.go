@@ -36,6 +36,9 @@ type turn struct {
 	// discardedUsage sums the reported usage of retried gateway attempts.
 	discardedUsage *acp.Usage
 	compactionKeys map[string]string
+	// itemMessages holds, per helper item key, the ACP messages whose chunks
+	// carried that item's text.
+	itemMessages map[string][]attemptMessage
 }
 
 // Prompt retains foreground ownership through persistence and terminal publication.

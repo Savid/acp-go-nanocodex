@@ -321,9 +321,13 @@ delivering assistant or reasoning output retries at most twice per model call;
 the retried response is presented as new text after the discarded partial
 text. Every retried attempt is published as
 `_meta.nanocodex.attemptDiscarded` on an otherwise empty
-`session_info_update`: `{kind, modelCallIndex, attempt, itemKeys,
+`session_info_update`: `{kind, modelCallIndex, attempt, itemKeys, messages,
 streamedBytes, code?, message?, statusCode?, providerCode?, usage?}`, where
 `usage` is the provider's report for the failed response in ACP usage fields.
+`messages` lists each `{messageId, kind}` that the attempt's discarded chunks
+carried, with `kind` `message` for agent message chunks and `thought` for
+thought chunks; chunks streamed before the provider disclosed the response ID
+carry no `messageId` and are not listed.
 That usage is added to the prompt response's `usage`; a stream that ends
 without a report contributes only its `streamedBytes`. Valid `Retry-After`
 and `retry-after-ms` delays up to 60 seconds are respected with the normal

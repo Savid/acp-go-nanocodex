@@ -311,7 +311,8 @@ func TestDiscardedAttemptIsPublishedAndCountedInUsage(t *testing.T) {
 		}
 	}
 	require.Len(t, discarded, 1)
-	require.Equal(t, []string{"0:1"}, discarded[0]["itemKeys"])
+	require.Equal(t, []string{"0:0", "0:1"}, discarded[0]["itemKeys"])
+	require.Equal(t, []attemptMessage{{MessageID: "resp_discarded", Kind: "thought"}, {MessageID: "resp_discarded", Kind: "message"}}, discarded[0]["messages"])
 	require.Equal(t, "connection_error", discarded[0]["code"])
 	usage, ok := discarded[0]["usage"].(acp.Usage)
 	require.True(t, ok)

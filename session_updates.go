@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
@@ -73,6 +74,7 @@ func (s *session) textUpdate(ctx context.Context, t *turn, kind string, data jso
 		update := acp.UpdateAgentThoughtText(payload.Text)
 		if payload.ResponseID != "" {
 			update.AgentThoughtChunk.MessageId = new(payload.ResponseID)
+			t.recordMessage(payload.ItemKey, attemptMessage{MessageID: payload.ResponseID, Kind: thoughtKind})
 		}
 
 		return s.emit(ctx, update)
@@ -98,9 +100,37 @@ func (s *session) textUpdate(ctx context.Context, t *turn, kind string, data jso
 	update := acp.UpdateAgentMessageText(text)
 	if payload.ResponseID != "" {
 		update.AgentMessageChunk.MessageId = new(payload.ResponseID)
+		t.recordMessage(payload.ItemKey, attemptMessage{MessageID: payload.ResponseID, Kind: messageKind})
 	}
 
 	return s.emit(ctx, update)
+}
+
+// Kinds of the ACP chunks an attemptMessage carried.
+const (
+	messageKind = "message"
+	thoughtKind = "thought"
+)
+
+// attemptMessage is an ACP message whose chunks carried a helper item's text,
+// with kind messageKind for agent message chunks or thoughtKind for thought
+// chunks.
+type attemptMessage struct {
+	MessageID string `json:"messageId"`
+	Kind      string `json:"kind"`
+}
+
+// recordMessage remembers that a chunk of the item's text carried the message.
+func (t *turn) recordMessage(itemKey string, message attemptMessage) {
+	if slices.Contains(t.itemMessages[itemKey], message) {
+		return
+	}
+
+	if t.itemMessages == nil {
+		t.itemMessages = map[string][]attemptMessage{}
+	}
+
+	t.itemMessages[itemKey] = append(t.itemMessages[itemKey], message)
 }
 
 func (s *session) nativeUpdate(ctx context.Context, t *turn, event nanocodex.Event) error {
@@ -324,21 +354,32 @@ type discardedAttempt struct {
 }
 
 // attemptDiscarded publishes a retried gateway attempt as
-// _meta.nanocodex.attemptDiscarded on a session_info_update, releases the
-// text its items streamed, and adds its reported usage to the turn's.
+// _meta.nanocodex.attemptDiscarded on a session_info_update with the ACP
+// messages its chunks carried, releases the text its items streamed, and adds
+// its reported usage to the turn's.
 func (s *session) attemptDiscarded(ctx context.Context, t *turn, data json.RawMessage) error {
 	var attempt discardedAttempt
 	if err := json.Unmarshal(data, &attempt); err != nil {
 		return err
 	}
 
+	messages := []attemptMessage{}
+
 	for _, key := range attempt.ItemKeys {
 		t.texts.Forget(key)
+
+		for _, message := range t.itemMessages[key] {
+			if !slices.Contains(messages, message) {
+				messages = append(messages, message)
+			}
+		}
+
+		delete(t.itemMessages, key)
 	}
 
 	published := map[string]any{
 		"kind": attempt.Kind, "modelCallIndex": attempt.ModelCallIndex, "attempt": attempt.Attempt,
-		"itemKeys": attempt.ItemKeys, "streamedBytes": attempt.StreamedBytes,
+		"itemKeys": attempt.ItemKeys, "messages": messages, "streamedBytes": attempt.StreamedBytes,
 	}
 
 	for name, value := range map[string]string{"code": attempt.Code, wire.FieldMessage: attempt.Message, "providerCode": attempt.ProviderCode} {

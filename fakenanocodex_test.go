@@ -365,12 +365,23 @@ func (f *fakeNative) accept(id uint64, command string) error {
 	if err := f.event(id, "accepted", map[string]any{"turnId": "fixture-turn"}); err != nil || command != "discard" {
 		return err
 	}
-	if err := f.event(id, "assistant_delta", map[string]any{"text": "partial ", "itemKey": "0:1"}); err != nil {
-		return err
+	for _, delta := range []struct{ event, text, key, response string }{
+		{"assistant_delta", "part", "0:1", ""},
+		{"reasoning_delta", "pondering", "0:0", "resp_discarded"},
+		{"assistant_delta", "ial ", "0:1", "resp_discarded"},
+		{"assistant_delta", "", "0:1", "resp_discarded"},
+	} {
+		data := map[string]any{"text": delta.text, "itemKey": delta.key}
+		if delta.response != "" {
+			data["responseId"] = delta.response
+		}
+		if err := f.event(id, delta.event, data); err != nil {
+			return err
+		}
 	}
 
 	return f.event(id, "attempt_discarded", map[string]any{
-		"kind": "generation", "modelCallIndex": 0, "attempt": 1, "itemKeys": []string{"0:1"}, "streamedBytes": 8,
+		"kind": "generation", "modelCallIndex": 0, "attempt": 1, "itemKeys": []string{"0:0", "0:1"}, "streamedBytes": 17,
 		"code": "connection_error", "message": "gateway connection ended before completion",
 		"usage": map[string]any{"input_tokens": 40, "output_tokens": 7, "total_tokens": 47, "input_tokens_details": map[string]any{"cached_tokens": 4}},
 	})
