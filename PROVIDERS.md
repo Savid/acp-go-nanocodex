@@ -206,8 +206,9 @@ account.
 - Gateways cache the shared request prefix without `prompt_cache_key`. A
   `thought_level` change starts a separate provider cache, so the next call is
   uncached.
-- Gateway failures without a terminal code retry up to five attempts before
-  output is delivered.
+- Gateway failures without a terminal code retry up to five attempts; at most
+  two of them may discard output already delivered. Generation responses are
+  bounded by `maxOutputTokens`, default 32768.
   See [retry and persistence behavior](README.md#scope).
 - Code Mode is disabled on every route. The freeform `apply_patch` tool is
   excluded on gateways; provider web search and image generation are disabled.

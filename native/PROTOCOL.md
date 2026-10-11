@@ -57,7 +57,9 @@ They have the same prompt `requestId` and are delivered after `accepted`.
 `itemKey` is the required private presentation identity built from the native
 model call index and the provider output index. It stays stable between deltas
 and completion, including items without provider IDs, and differs between
-items and model calls within its prompt. Standard Responses SSE text, reasoning,
+items and model calls within its prompt. A retry that discards output already
+delivered appends the retry generation, so `<call>:<index>:<n>` never extends
+the discarded text. Standard Responses SSE text, reasoning,
 and item-done events must include their `output_index`; completion array positions
 identify the same items. `responseId` is included only after the provider exposes
 the current response ID; the
@@ -70,8 +72,12 @@ operations use native direct tools. Unsupported custom tools are excluded.
 Gateway requests omit `prompt_cache_key` and carry the adapter's `User-Agent`.
 Only requests to `https://opencode.ai/zen/go/v1` carry the native conversation ID as
 `x-opencode-session`, including after a helper restart. Each SSE event is
-limited to 4 MiB before parsing; accumulated event data for one response also
-has a 4 MiB bound. Successful HTTP responses require `text/event-stream`.
+limited to 8 MiB before parsing. A response's output content is limited to
+4 MiB, counted separately for the text and reasoning deltas it streams and for
+the completed output items it returns; event envelopes do not count. Exceeding
+it fails as `transport_error` with `gateway response output exceeds 4 MiB`.
+Generation requests carry `max_output_tokens`, the session's `maxOutputTokens`
+or 32768. Successful HTTP responses require `text/event-stream`.
 Non-SSE success responses fail without retrying. Incomplete events never reach
 native tools.
 
@@ -139,15 +145,17 @@ minimum delay, including for zero server delays. Overflowing decimal values and
 delays over 60 seconds end the operation without retrying early. Each failed
 attempt writes one redacted stderr line with its attempt number, HTTP status or
 event type, `providerCode`, and whether it retries or why it stops.
-Generation never retries after delivering assistant or reasoning output. A retry
-cannot execute tools from an incomplete response. Cancellation interrupts both
+A generation attempt that fails after delivering assistant or reasoning output
+retries under the same rules, discarding that output, at most twice per model
+call; the stderr line says it discards partial output. A retry cannot execute
+tools from an incomplete response. Cancellation interrupts both
 requests and retry delays.
 
 ## Methods
 
 - `initialize`: `{sessionId, model?, baseModel?, contextWindow?, thinking?,
   apiBaseUrl?, websocketUrl?, modelIdPrefix?, transport?, apiKeyEnv?, authFile?,
-  resumeSessionId?, shellEnv?}`.
+  resumeSessionId?, shellEnv?, maxOutputTokens?}`.
   `sessionId` is a caller-generated UUIDv7 reserved under the native session
   lock. All six upstream model IDs are accepted, including those omitted
   from its default three-model picker. Native aliases such as `sol`, `luna`,
@@ -165,7 +173,10 @@ requests and retry delays.
   `baseModel`. `contextWindow` sets the positive token window for context
   accounting and any native automatic compaction threshold, at most the native
   or base model's maximum; without it the window is 272000 or that smaller
-  maximum. Resume accepts a changed `contextWindow`.
+  maximum. Resume accepts a changed `contextWindow`. `maxOutputTokens` is a
+  positive 32-bit bound on each gateway generation response, including
+  reasoning, defaulting to 32768; native routes keep the upstream request
+  shape and refuse it as `maxOutputTokens`.
   Explicit parameters override inherited `OPENAI_BASE_URL`,
   `NANOCODEX_MODEL_ID_PREFIX`, `NANOCODEX_TRANSPORT`, `NANOCODEX_API_KEY_ENV`,
   `NANOCODEX_BASE_MODEL`, `NANOCODEX_CONTEXT_WINDOW`, and
@@ -259,9 +270,9 @@ the candidate UUID. The helper holds `<uuid>.writer.lock` under
 `CODEX_HOME/nanocodex/acp-locks/` for every initialized and resumed UUID until
 shutdown. Hydration and stopped snapshots acquire that writer lock before
 accessing native files. Unrelated native consumers must honor writer exclusion.
-Native rollout files and complete records are preserved, including a valid final JSON record without a newline.
-Hydration may remove an invalid, unterminated trailing fragment after the
-helper exits.
+Native rollout files and complete records are preserved. After the helper
+exits, the adapter terminates a valid final JSON record that lacks its newline
+and removes an invalid unterminated fragment.
 
 The helper atomically replaces `<rollout>.acp-checkpoint.json` after a prompted
 helper shuts down its native writer. This optional file retains the native

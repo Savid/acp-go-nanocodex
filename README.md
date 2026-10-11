@@ -132,6 +132,7 @@ it with `NewNanocodexOptions`, then attach it using
 |---|---|---|
 | `model` | `WithNanocodexModel` | Native model ID, or a gateway model ID on a configured gateway route. |
 | `baseModel` | `WithNanocodexBaseModel` | Native model whose settings a [gateway model](PROVIDERS.md#gateway-models) uses. |
+| `maxOutputTokens` | `WithNanocodexMaxOutputTokens` | Output-token bound of each gateway generation response, including reasoning; default 32768. Native routes refuse it. |
 | `contextWindow` | `WithNanocodexContextWindow` | Token window for usage reporting and context management; see [gateway models](PROVIDERS.md#gateway-models). |
 | `thinking` | `WithNanocodexEffort` | Native reasoning effort; the `thought_level` config option selects the same value. |
 | `env` | `WithNanocodexEnv` | Session environment overlay. |
@@ -313,8 +314,10 @@ responses, and provider failure events whose code is missing, unrecognized, or
 a transient HTTP status, up to five total attempts with exponential backoff and
 jitter. Authorization, quota, model, invalid-request, context-window, image,
 and policy codes fail immediately, as do incomplete responses stopped by
-`max_output_tokens` or `content_filter`. Retries stop after assistant or
-reasoning output is delivered. Valid `Retry-After`
+`max_output_tokens` or `content_filter`. An attempt that fails after
+delivering assistant or reasoning output retries at most twice per model call;
+the retried response is presented as new text after the discarded partial
+text. Valid `Retry-After`
 and `retry-after-ms` delays up to 60 seconds are respected with the normal
 backoff as a minimum; longer delays fail without retrying early. Each failed
 attempt writes one redacted line to helper stderr. Turn errors carry the
@@ -327,8 +330,8 @@ Shell sessions and other in-memory tool state last for one prompt; subsequent
 prompts resume the saved conversation in a new helper.
 Prompt parameters are limited to 12 MiB of encoded JSON before admission; a
 larger prompt is refused as unsupported `prompt`.
-Gateway responses require `text/event-stream`; each event and the accumulated
-event data for one response are limited to 4 MiB. These limits leave room for
+Gateway responses require `text/event-stream`; each event is limited to 8 MiB,
+and a response's streamed or retained output content to 4 MiB. These limits leave room for
 native event envelopes. Compacted native rows can contain an entire history and
 are not limited to the helper's 32 MiB protocol frame size.
 Image tool outputs are not projected as ACP images.

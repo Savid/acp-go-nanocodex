@@ -249,6 +249,7 @@ struct Config {
     auth_file: Option<PathBuf>,
     resume_session_id: Option<String>,
     shell_env: Option<Vec<String>>,
+    max_output_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +277,10 @@ pub struct Session {
     compact_next: bool,
     _writer_locks: Vec<File>,
 }
+
+/// The output bound of a gateway generation response without a configured
+/// `maxOutputTokens`.
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32_768;
 
 fn context_window(model: Model) -> u64 {
     nanocodex::oai::tower::ResponsesServiceConfig::default()
@@ -642,10 +647,21 @@ impl Session {
                         .model_id_prefix
                         .as_ref()
                         .map(|prefix| prefix.trim().to_owned()),
+                    max_output_tokens: config
+                        .max_output_tokens
+                        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
                 })
             } else {
                 None
             };
+        // Only the gateway transport builds its own requests; native routes
+        // keep the upstream request shape.
+        if config
+            .max_output_tokens
+            .is_some_and(|tokens| tokens == 0 || gateway.is_none())
+        {
+            return Err(SessionError::config("maxOutputTokens"));
+        }
         let text_events = gateway.is_some();
         let (gateway_layer, gateway_events) =
             GatewayLayer::new(gateway).map_err(|_| SessionError::invalid_config())?;

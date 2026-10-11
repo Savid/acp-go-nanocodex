@@ -9,6 +9,8 @@ use std::{
 };
 
 const MAX_ATTEMPTS: u32 = 5;
+/// Bounds the attempts that discard output already delivered to the client.
+const MAX_DISCARDED_ATTEMPTS: u32 = 2;
 const MAX_SERVER_DELAY: Duration = Duration::from_secs(60);
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -238,22 +240,27 @@ fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
 
 pub struct Retry {
     attempt: u32,
+    discarded: u32,
 }
 
 impl Retry {
     pub fn new() -> Self {
-        Self { attempt: 1 }
+        Self {
+            attempt: 1,
+            discarded: 0,
+        }
     }
 
-    /// Returns the delay before the next attempt, or why there is none.
-    /// Output already delivered to the client is never replayed.
+    /// Returns the delay before the next attempt, or why there is none. An
+    /// attempt that delivered output retries at most `MAX_DISCARDED_ATTEMPTS`
+    /// times per request; its partial output is discarded.
     fn next_delay(
         &self,
         failure: &Failure,
         output_delivered: bool,
     ) -> Result<Duration, &'static str> {
-        if output_delivered {
-            return Err("output already delivered");
+        if output_delivered && self.discarded >= MAX_DISCARDED_ATTEMPTS {
+            return Err("partial output retry limit reached");
         }
         if !failure.retryable {
             return Err("terminal failure");
@@ -276,8 +283,14 @@ impl Retry {
         let (attempt, summary) = (self.attempt, &failure.summary);
         match self.next_delay(failure, output_delivered) {
             Ok(delay) => {
+                let discarding = if output_delivered {
+                    self.discarded += 1;
+                    " discarding partial output and"
+                } else {
+                    ""
+                };
                 eprintln!(
-                    "gateway attempt {attempt}/{MAX_ATTEMPTS} failed{summary}; retrying in {} ms",
+                    "gateway attempt {attempt}/{MAX_ATTEMPTS} failed{summary};{discarding} retrying in {} ms",
                     delay.as_millis()
                 );
                 self.attempt += 1;
@@ -337,7 +350,11 @@ mod tests {
         retry.attempt = MAX_ATTEMPTS;
         assert!(retry.next_delay(&failure, false).is_err());
         retry.attempt = 1;
+        assert!(retry.next_delay(&failure, true).is_ok());
+        retry.discarded = MAX_DISCARDED_ATTEMPTS;
         assert!(retry.next_delay(&failure, true).is_err());
+        assert!(retry.next_delay(&failure, false).is_ok());
+        retry.discarded = 0;
         failure.retry_after = Some(Duration::from_secs(60));
         assert_eq!(retry.next_delay(&failure, false).ok(), failure.retry_after);
         failure.retry_after = Some(Duration::from_secs(61));

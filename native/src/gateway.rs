@@ -34,6 +34,8 @@ pub struct GatewayConfig {
     pub model: Option<String>,
     pub model_id_prefix: Option<String>,
     pub session_id: String,
+    /// Bounds each generation response, including its reasoning.
+    pub max_output_tokens: u32,
 }
 
 pub struct GatewayEvent {
@@ -333,8 +335,15 @@ fn output_index(event: &Value) -> Result<usize, ResponseError> {
         .ok_or_else(|| failure("gateway event requires an output index"))
 }
 
-fn item_key(model_call_index: u32, output_index: usize) -> String {
-    format!("{model_call_index}:{output_index}")
+/// Presentation identity of one output item. Output delivered by an attempt
+/// that failed is discarded; each retry after it presents its items under a
+/// new `presentation` generation so they never extend the discarded text.
+fn item_key(model_call_index: u32, output_index: usize, presentation: u32) -> String {
+    if presentation == 0 {
+        format!("{model_call_index}:{output_index}")
+    } else {
+        format!("{model_call_index}:{output_index}:{presentation}")
+    }
 }
 
 fn public_input(request: &ResponsesAttempt) -> Result<(Vec<Value>, Vec<Value>), ResponseError> {
@@ -486,15 +495,25 @@ impl GatewayRoute {
             "include":["reasoning.encrypted_content"],
             "tool_choice":if compacting { "none" } else { "auto" }, "parallel_tool_calls":false,
         });
-        if compacting {
-            body["max_output_tokens"] = json!(SUMMARY_MAX_OUTPUT_TOKENS);
-        }
+        body["max_output_tokens"] = json!(if compacting {
+            SUMMARY_MAX_OUTPUT_TOKENS
+        } else {
+            self.config.max_output_tokens
+        });
         let mut retry = Retry::new();
         let mut trims = 0;
+        let mut presentation = 0;
         loop {
             let mut emitted_output = false;
             match self
-                .stream_attempt(&body, kind, model_call_index, started, &mut emitted_output)
+                .stream_attempt(
+                    &body,
+                    kind,
+                    model_call_index,
+                    presentation,
+                    started,
+                    &mut emitted_output,
+                )
                 .await
             {
                 Ok((output, committed_output)) => {
@@ -524,6 +543,9 @@ impl GatewayRoute {
                     }
                     if !retry.wait(&error, emitted_output).await {
                         return Err(error.error);
+                    }
+                    if emitted_output {
+                        presentation += 1;
                     }
                 }
             }
@@ -574,6 +596,7 @@ impl GatewayRoute {
         body: &Value,
         kind: ResponsesAttemptKind,
         model_call_index: u32,
+        presentation: u32,
         started: Instant,
         emitted_output: &mut bool,
     ) -> Result<(ResponsesOutput, Vec<Value>), Failure> {
@@ -612,6 +635,7 @@ impl GatewayRoute {
         let mut first_event = None;
         let mut first_output = None;
         let mut pipeline = ResponsePipelineStats::default();
+        let mut output = OutputBound::default();
         while let Some(frame) = stream.next().await {
             let frame = frame.map_err(|error| match error {
                 EventStreamError::Transport(error)
@@ -630,9 +654,6 @@ impl GatewayRoute {
             first_event.get_or_insert_with(|| elapsed(started));
             pipeline.event_count += 1;
             pipeline.event_bytes += frame.data.len() as u64;
-            if pipeline.event_bytes > MAX_RESPONSE_BYTES as u64 {
-                return Err(failure("gateway response exceeds 4 MiB").into());
-            }
             let event: Value = serde_json::from_str(&frame.data)
                 .map_err(|_| failure("invalid gateway event JSON"))?;
             if let Some(id) = event["response"]["id"].as_str().filter(|id| !id.is_empty()) {
@@ -644,10 +665,11 @@ impl GatewayRoute {
                     let text = event["delta"]
                         .as_str()
                         .ok_or_else(|| failure("invalid gateway text delta"))?;
+                    output.stream(text)?;
                     self.emit(
                         "assistant_delta",
                         text,
-                        &item_key(model_call_index, output_index(&event)?),
+                        &item_key(model_call_index, output_index(&event)?, presentation),
                         response_id.as_deref(),
                     )
                     .await?;
@@ -660,16 +682,18 @@ impl GatewayRoute {
                     let text = event["delta"]
                         .as_str()
                         .ok_or_else(|| failure("invalid gateway reasoning delta"))?;
+                    output.stream(text)?;
                     self.emit(
                         "reasoning_delta",
                         text,
-                        &item_key(model_call_index, output_index(&event)?),
+                        &item_key(model_call_index, output_index(&event)?, presentation),
                         response_id.as_deref(),
                     )
                     .await?;
                     *emitted_output = true;
                 }
                 Some("response.output_item.done") => {
+                    output.retain(frame.data.len())?;
                     let index = output_index(&event)?;
                     let item = event["item"].clone();
                     first_output.get_or_insert_with(|| elapsed(started));
@@ -678,7 +702,7 @@ impl GatewayRoute {
                             .emit_message(
                                 &item,
                                 &mut emitted_messages,
-                                &item_key(model_call_index, index),
+                                &item_key(model_call_index, index, presentation),
                                 response_id.as_deref(),
                             )
                             .await?;
@@ -703,7 +727,7 @@ impl GatewayRoute {
                                 .emit_message(
                                     item,
                                     &mut emitted_messages,
-                                    &item_key(model_call_index, index),
+                                    &item_key(model_call_index, index, presentation),
                                     response_id.as_deref(),
                                 )
                                 .await?;
@@ -913,7 +937,39 @@ fn sends_session_header(base_url: &str) -> bool {
     })
 }
 
-const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Bounds the output content of one response: its streamed text and,
+/// separately, the completed items it retains.
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bounds one SSE event before parsing. A completion event repeats every
+/// output item inside the response envelope, so it may exceed the output
+/// bound.
+const MAX_EVENT_BYTES: usize = 2 * MAX_OUTPUT_BYTES;
+
+#[derive(Default)]
+struct OutputBound {
+    streamed: usize,
+    retained: usize,
+}
+
+impl OutputBound {
+    fn stream(&mut self, text: &str) -> Result<(), ResponseError> {
+        self.streamed += text.len();
+        Self::check(self.streamed)
+    }
+
+    fn retain(&mut self, bytes: usize) -> Result<(), ResponseError> {
+        self.retained += bytes;
+        Self::check(self.retained)
+    }
+
+    fn check(bytes: usize) -> Result<(), ResponseError> {
+        if bytes > MAX_OUTPUT_BYTES {
+            return Err(failure("gateway response output exceeds 4 MiB"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 struct StreamBound {
@@ -932,8 +988,8 @@ impl StreamBound {
                 continue;
             }
             self.event_bytes += 1;
-            if self.event_bytes > MAX_RESPONSE_BYTES {
-                return Err(std::io::Error::other("gateway event exceeds 4 MiB"));
+            if self.event_bytes > MAX_EVENT_BYTES {
+                return Err(std::io::Error::other("gateway event exceeds 8 MiB"));
             }
             self.previous_cr = byte == b'\r';
             if byte == b'\r' || byte == b'\n' {

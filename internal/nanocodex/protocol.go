@@ -22,6 +22,7 @@ type Initialize struct {
 	APIKeyEnv       string `json:"apiKeyEnv,omitempty"`
 	AuthFile        string `json:"authFile,omitempty"`
 	ResumeSessionID string `json:"resumeSessionId,omitempty"`
+	MaxOutputTokens int64  `json:"maxOutputTokens,omitempty"`
 	// ShellEnv names helper environment variables the tool shell receives
 	// even though their names look sensitive; an empty list overrides the
 	// helper's environment selection.

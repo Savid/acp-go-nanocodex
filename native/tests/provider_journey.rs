@@ -2032,7 +2032,7 @@ async fn gateway_discards_uncommitted_tools_when_retrying_a_truncated_stream() {
 }
 
 #[tokio::test]
-async fn gateway_does_not_retry_after_publishing_assistant_or_reasoning_output() {
+async fn gateway_retries_after_publishing_output_under_new_item_keys() {
     for event in [
         json!({"type":"response.output_text.delta", "output_index":0, "delta":"partial text"}),
         json!({"type":"response.reasoning_summary_text.delta", "output_index":0, "delta":"partial reasoning"}),
@@ -2040,36 +2040,28 @@ async fn gateway_does_not_retry_after_publishing_assistant_or_reasoning_output()
             "type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"partial message"}]
         }}),
     ] {
-        let provider =
-            Provider::start([Reply::RawSse(sse(event)), Reply::Text("must not replay")]).await;
-        let workspace = TempDir::new().unwrap();
-        let native_home = TempDir::new().unwrap();
-        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
-        helper
-            .call(
-                1,
-                "initialize",
-                initialize(&provider, "FIXTURE_API_KEY", "openai"),
-            )
-            .await;
-        helper
-            .send(2, "prompt", prompt("stop after visible output"))
-            .await;
-        let result = helper.reply(2).await;
-        assert_eq!(result["error"]["code"], "connection_error");
-        assert_eq!(
-            helper
-                .events
-                .iter()
-                .filter(|event| matches!(
+        let (reply, events, requests) =
+            prompt_against(vec![Reply::RawSse(sse(event)), Reply::Text("recovered")]).await;
+        assert_eq!(reply["result"]["finalMessage"], "recovered");
+        let keys = events
+            .iter()
+            .filter(|event| {
+                matches!(
                     event["event"].as_str(),
                     Some("assistant_delta" | "reasoning_delta" | "assistant_message")
-                ))
-                .count(),
-            1
+                )
+            })
+            .map(|event| event["data"]["itemKey"].as_str().expect("item key"))
+            .collect::<Vec<_>>();
+        assert_eq!(keys[0].split(':').count(), 2, "{keys:?}");
+        assert!(
+            keys[1..]
+                .iter()
+                .all(|key| key.split(':').count() == 3 && key.ends_with(":1")),
+            "{keys:?}"
         );
-        helper.shutdown(3).await;
-        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, requests[1].body);
     }
 }
 
@@ -2555,30 +2547,109 @@ async fn gateway_keeps_authorization_quota_and_request_failure_events_terminal()
 }
 
 #[tokio::test]
-async fn gateway_never_retries_failure_events_after_visible_output() {
+async fn gateway_bounds_retries_that_discard_visible_output() {
     for failure in [
         response_failed(json!({"message":"fixture-bearer-token"})),
         response_failed(json!({"code":"server_error_xyz"})),
-        response_failed(json!({"code":"server_error"})),
+        response_failed(json!({"code":524})),
         json!({"type":"error", "code":"rate_limit_exceeded", "message":"fixture-bearer-token"}),
     ] {
-        let (reply, events, requests) = prompt_against(vec![
+        let partial = || {
             created_then([
                 json!({"type":"response.output_text.delta", "output_index":0, "delta":"partial text"}),
                 failure.clone(),
-            ]),
-            Reply::Text("must not replay"),
+            ])
+        };
+        let (reply, _, requests) = prompt_against(vec![partial(), Reply::Text("recovered")]).await;
+        assert_eq!(reply["result"]["finalMessage"], "recovered", "{failure}");
+        assert_eq!(requests.len(), 2, "{failure}");
+
+        let (reply, events, requests) = prompt_against(vec![
+            partial(),
+            partial(),
+            partial(),
+            Reply::Text("beyond the partial output limit"),
         ])
         .await;
         assert_eq!(reply["error"]["code"], "native_error", "{failure}");
+        assert!(!reply.to_string().contains("fixture-bearer-token"));
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event["event"] == "assistant_delta")
                 .count(),
-            1
+            3
         );
-        assert_eq!(requests.len(), 1, "retried after output: {failure}");
+        assert_eq!(requests.len(), 3, "{failure}");
+    }
+}
+
+#[tokio::test]
+async fn gateway_output_bound_counts_content_rather_than_event_envelopes() {
+    let padding = "p".repeat(256);
+    let deltas = (0..20_000).map(|_| {
+        json!({"type":"response.output_text.delta", "output_index":0, "item_id":padding, "delta":"x"})
+    });
+    let completed = json!({"type":"response.completed", "response":{
+        "id":"resp_failed", "status":"completed",
+        "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"x".repeat(20_000)}]}],
+        "usage":{"input_tokens":12, "output_tokens":3, "total_tokens":15}
+    }});
+    let (reply, _, _) = prompt_against(vec![created_then(deltas.chain([completed]))]).await;
+    assert_eq!(reply["result"]["finalMessage"], "x".repeat(20_000));
+
+    let chunk = "x".repeat(1024 * 1024);
+    let deltas = (0..5)
+        .map(|_| json!({"type":"response.output_text.delta", "output_index":0, "delta":chunk}));
+    let (reply, _, requests) = prompt_against(vec![created_then(deltas)]).await;
+    assert_eq!(reply["error"]["code"], "transport_error");
+    assert_eq!(
+        reply["error"]["message"],
+        "gateway response output exceeds 4 MiB"
+    );
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn gateway_generation_requests_bound_output_tokens() {
+    let provider = Provider::start([Reply::Text("default bound"), Reply::Text("configured")]).await;
+    for (id, bound) in [(None, 32_768), (Some(1_024), 1_024)] {
+        let workspace = TempDir::new().unwrap();
+        let native_home = TempDir::new().unwrap();
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        let mut config = initialize(&provider, "FIXTURE_API_KEY", "openai");
+        if let Some(tokens) = id {
+            config["maxOutputTokens"] = json!(tokens);
+        }
+        helper.call(1, "initialize", config).await;
+        helper.call(2, "prompt", prompt("bounded")).await;
+        helper.shutdown(3).await;
+        let requests = provider.requests();
+        assert_eq!(requests.last().unwrap().body["max_output_tokens"], bound);
+    }
+}
+
+#[tokio::test]
+async fn max_output_tokens_requires_a_gateway_route_and_a_positive_bound() {
+    let provider = Provider::start([]).await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut zero = initialize(&provider, "FIXTURE_API_KEY", "openai");
+    zero["maxOutputTokens"] = json!(0);
+    let mut native = initialize(&provider, "FIXTURE_API_KEY", "openai");
+    native["transport"] = json!("websocket");
+    native.as_object_mut().unwrap().remove("modelIdPrefix");
+    native["websocketUrl"] = json!(format!(
+        "{}/responses",
+        provider.base_url.replace("http://", "ws://")
+    ));
+    native["maxOutputTokens"] = json!(1_024);
+    for config in [zero, native] {
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+        helper.send(1, "initialize", config).await;
+        let reply = helper.reply(1).await;
+        assert_eq!(reply["error"]["code"], "invalid_config", "{reply}");
+        assert_eq!(reply["error"]["field"], "maxOutputTokens", "{reply}");
     }
 }
 

@@ -23,6 +23,7 @@ const (
 	metaExtraPathDirsKey = "extraPathDirs"
 	metaBaseModelKey     = "baseModel"
 	metaContextWindowKey = "contextWindow"
+	metaMaxOutputKey     = "maxOutputTokens"
 	metaThinkingKey      = "thinking"
 	metaAPIBaseURLKey    = "apiBaseUrl"
 	metaWebsocketURLKey  = "websocketUrl"
@@ -52,13 +53,16 @@ type NanocodexOptions struct {
 	ContextWindow int64 `json:"contextWindow,omitempty"`
 	// Effort is the native reasoning effort, carried as the "thinking"
 	// metadata key and the thought_level config option.
-	Effort        string `json:"thinking,omitempty"`
-	APIBaseURL    string `json:"apiBaseUrl,omitempty"`
-	WebsocketURL  string `json:"websocketUrl,omitempty"`
-	ModelIDPrefix string `json:"modelIdPrefix,omitempty"`
-	Transport     string `json:"transport,omitempty"`
-	APIKeyEnv     string `json:"apiKeyEnv,omitempty"`
-	AuthFile      string `json:"authFile,omitempty"`
+	Effort string `json:"thinking,omitempty"`
+	// MaxOutputTokens bounds each gateway generation response, including its
+	// reasoning; zero leaves the helper's default.
+	MaxOutputTokens int64  `json:"maxOutputTokens,omitempty"`
+	APIBaseURL      string `json:"apiBaseUrl,omitempty"`
+	WebsocketURL    string `json:"websocketUrl,omitempty"`
+	ModelIDPrefix   string `json:"modelIdPrefix,omitempty"`
+	Transport       string `json:"transport,omitempty"`
+	APIKeyEnv       string `json:"apiKeyEnv,omitempty"`
+	AuthFile        string `json:"authFile,omitempty"`
 	// ShellEnv names variables of the helper's environment that the tool
 	// shell receives even though their names look sensitive. Nil leaves
 	// NANOCODEX_SHELL_ENV in effect; an empty list withholds every name.
@@ -107,6 +111,12 @@ func WithNanocodexExtraPathDirs(dirs ...string) NanocodexOption {
 	cloned := slices.Clone(dirs)
 
 	return func(o *NanocodexOptions) { o.ExtraPathDirs = slices.Clone(cloned) }
+}
+
+// WithNanocodexMaxOutputTokens bounds each gateway generation response,
+// including its reasoning.
+func WithNanocodexMaxOutputTokens(tokens int64) NanocodexOption {
+	return func(o *NanocodexOptions) { o.MaxOutputTokens = tokens }
 }
 
 // WithNanocodexEffort selects a native reasoning effort.
@@ -193,6 +203,10 @@ func (options NanocodexOptions) values() map[string]any {
 		values[metaContextWindowKey] = options.ContextWindow
 	}
 
+	if options.MaxOutputTokens != 0 {
+		values[metaMaxOutputKey] = options.MaxOutputTokens
+	}
+
 	return values
 }
 
@@ -216,7 +230,7 @@ func stringOptionFields(options *NanocodexOptions) map[string]*string {
 
 func (options NanocodexOptions) initialize(sessionID, nativeID string) nanocodex.Initialize {
 	return nanocodex.Initialize{
-		Model: options.Model, BaseModel: options.BaseModel, ContextWindow: options.ContextWindow, Thinking: options.Effort,
+		Model: options.Model, BaseModel: options.BaseModel, ContextWindow: options.ContextWindow, Thinking: options.Effort, MaxOutputTokens: options.MaxOutputTokens,
 		APIBaseURL: options.APIBaseURL, WebsocketURL: options.WebsocketURL, ModelIDPrefix: options.ModelIDPrefix, Transport: options.Transport,
 		APIKeyEnv: options.APIKeyEnv, AuthFile: options.AuthFile, SessionID: sessionID, ResumeSessionID: nativeID,
 		ShellEnv: slices.Clone(options.ShellEnv),
@@ -347,6 +361,13 @@ func parseNanocodexOptions(values map[string]any) (NanocodexOptions, *acp.Reques
 			}
 
 			options.ContextWindow = tokens
+		case metaMaxOutputKey:
+			tokens, ok := positiveInteger(item)
+			if !ok || tokens > math.MaxUint32 {
+				return NanocodexOptions{}, wire.Unsupported(path)
+			}
+
+			options.MaxOutputTokens = tokens
 		default:
 			field, known := stringOptionFields(&options)[key]
 			text, ok := item.(string)
@@ -360,6 +381,20 @@ func parseNanocodexOptions(values map[string]any) (NanocodexOptions, *acp.Reques
 	}
 
 	return options, validateNanocodexOptions(options)
+}
+
+// validateTokenBounds refuses a negative context window and an output bound
+// the helper cannot represent.
+func validateTokenBounds(options NanocodexOptions) *acp.RequestError {
+	if options.ContextWindow < 0 {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaContextWindowKey))
+	}
+
+	if options.MaxOutputTokens < 0 || options.MaxOutputTokens > math.MaxUint32 {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaMaxOutputKey))
+	}
+
+	return nil
 }
 
 func validateNanocodexOptions(options NanocodexOptions) *acp.RequestError {
@@ -381,8 +416,8 @@ func validateNanocodexOptions(options NanocodexOptions) *acp.RequestError {
 		return wire.Unsupported(wire.MetaOptionPath(vendor, metaBaseModelKey))
 	}
 
-	if options.ContextWindow < 0 {
-		return wire.Unsupported(wire.MetaOptionPath(vendor, metaContextWindowKey))
+	if err := validateTokenBounds(options); err != nil {
+		return err
 	}
 
 	if options.Transport != "" && options.Transport != "https" && options.Transport != "websocket" {

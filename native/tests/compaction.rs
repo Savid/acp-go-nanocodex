@@ -469,7 +469,7 @@ fn assert_summary_request(request: &Value, generation: &Value) {
     };
     assert_eq!(keys(request), keys(&bounded));
     assert_eq!(request["max_output_tokens"], 16_384);
-    assert!(generation.get("max_output_tokens").is_none());
+    assert_eq!(generation["max_output_tokens"], 32_768);
     assert_eq!(generation["tool_choice"], "auto");
     assert_eq!(request["tool_choice"], "none");
     assert!(input_items(request, "compaction_trigger").is_empty());
@@ -490,7 +490,7 @@ fn assert_compacted_request(request: &Value, summary: &str) {
     assert!(input_items(request, "compaction").is_empty());
     assert!(input_items(request, "compaction_trigger").is_empty());
     assert_eq!(request["tool_choice"], "auto");
-    assert!(request.get("max_output_tokens").is_none());
+    assert_eq!(request["max_output_tokens"], 32_768);
     let summaries = summaries(request);
     assert_eq!(summaries.len(), 1, "{request}");
     assert!(summaries[0].ends_with(&format!("<summary>\n{summary}\n</summary>")));

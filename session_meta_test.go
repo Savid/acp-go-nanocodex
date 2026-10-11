@@ -13,10 +13,10 @@ import (
 func TestNanocodexOptionsMetaRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	options := NewNanocodexOptions(WithNanocodexModel("opencode-go/qwen3.8-flash"), WithNanocodexBaseModel("kimi-k3"), WithNanocodexContextWindow(262144), WithNanocodexShellEnv("EXAMPLE_API_TOKEN", "_ALT_KEY2"))
+	options := NewNanocodexOptions(WithNanocodexModel("opencode-go/qwen3.8-flash"), WithNanocodexBaseModel("kimi-k3"), WithNanocodexContextWindow(262144), WithNanocodexMaxOutputTokens(16384), WithNanocodexShellEnv("EXAMPLE_API_TOKEN", "_ALT_KEY2"))
 	encoded, err := json.Marshal(options.Meta())
 	require.NoError(t, err)
-	require.JSONEq(t, `{"nanocodex":{"options":{"model":"opencode-go/qwen3.8-flash","baseModel":"kimi-k3","contextWindow":262144,"shellEnv":["EXAMPLE_API_TOKEN","_ALT_KEY2"]}}}`, string(encoded))
+	require.JSONEq(t, `{"nanocodex":{"options":{"model":"opencode-go/qwen3.8-flash","baseModel":"kimi-k3","contextWindow":262144,"maxOutputTokens":16384,"shellEnv":["EXAMPLE_API_TOKEN","_ALT_KEY2"]}}}`, string(encoded))
 
 	var decoded map[string]any
 	require.NoError(t, json.Unmarshal(encoded, &decoded))
@@ -28,7 +28,7 @@ func TestNanocodexOptionsMetaRoundTrip(t *testing.T) {
 
 	require.Equal(t, nanocodex.Initialize{
 		SessionID: "session", ResumeSessionID: "native",
-		Model: "opencode-go/qwen3.8-flash", BaseModel: "kimi-k3", ContextWindow: 262144,
+		Model: "opencode-go/qwen3.8-flash", BaseModel: "kimi-k3", ContextWindow: 262144, MaxOutputTokens: 16384,
 		ShellEnv: []string{"EXAMPLE_API_TOKEN", "_ALT_KEY2"},
 	}, options.initialize("session", "native"))
 	require.Nil(t, NewNanocodexOptions().initialize("session", "").ShellEnv)
@@ -60,6 +60,9 @@ func TestValidateNanocodexSessionMeta(t *testing.T) {
 		{"null window", metaContextWindowKey, nil},
 		{"zero integer window", metaContextWindowKey, int64(0)},
 		{"negative integer window", metaContextWindowKey, -3},
+		{"zero output bound", metaMaxOutputKey, 0.0},
+		{"output bound beyond uint32", metaMaxOutputKey, math.Pow(2, 32)},
+		{"string output bound", metaMaxOutputKey, "1024"},
 		{"empty base model", metaBaseModelKey, ""},
 		{"padded base model", metaBaseModelKey, " kimi-k3"},
 		{"spaced base model", metaBaseModelKey, "kimi k3"},
