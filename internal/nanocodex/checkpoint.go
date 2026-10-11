@@ -14,9 +14,16 @@ const maxCheckpointBytes = 1 << 20
 // CheckpointStamp identifies one version of a checkpoint file: its identity,
 // size, and modification time. The zero stamp matches no file.
 type CheckpointStamp struct {
-	device, inode uint64
-	size          int64
-	modified      int64
+	file os.FileInfo
+}
+
+// matches reports whether both stamps describe the same version of one file.
+func (s CheckpointStamp) matches(other CheckpointStamp) bool {
+	if s.file == nil || other.file == nil {
+		return s.file == other.file
+	}
+
+	return os.SameFile(s.file, other.file) && s.file.Size() == other.file.Size() && s.file.ModTime().Equal(other.file.ModTime())
 }
 
 // ReadCheckpoint reads optional metadata separately from authoritative native
@@ -36,7 +43,7 @@ func ReadCheckpoint(home, path string, stamp CheckpointStamp) (data json.RawMess
 
 	file, err := root.OpenFile(rel+".acp-checkpoint.json", os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, CheckpointStamp{}, stamp != CheckpointStamp{}, nil
+		return nil, CheckpointStamp{}, stamp.file != nil, nil
 	}
 
 	if err != nil {
@@ -54,12 +61,8 @@ func ReadCheckpoint(home, path string, stamp CheckpointStamp) (data json.RawMess
 		return nil, CheckpointStamp{}, true, errors.New("invalid native checkpoint")
 	}
 
-	current = CheckpointStamp{size: info.Size(), modified: info.ModTime().UnixNano()}
-	if system, ok := info.Sys().(*syscall.Stat_t); ok {
-		current.device, current.inode = statDevice(system), system.Ino
-	}
-
-	if current == stamp {
+	current = CheckpointStamp{file: info}
+	if current.matches(stamp) {
 		return nil, current, false, nil
 	}
 
