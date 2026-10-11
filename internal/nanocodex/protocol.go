@@ -3,7 +3,7 @@ package nanocodex
 import "encoding/json"
 
 // HelperVersion identifies the helper release required by this adapter.
-const HelperVersion = "0.6.0"
+const HelperVersion = "0.7.0"
 
 // InternalEnvPrefix names the adapter's private child-process markers.
 const InternalEnvPrefix = "ACP_GO_NANOCODEX_INTERNAL_"
