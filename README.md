@@ -209,51 +209,38 @@ first appear on the next one.
 
 ## Persistence
 
-`SessionStoreFormat` is `nanocodex-rollout-jsonl-v3`. The main subpath contains
-raw native rollout rows; `config` contains the ACP/native identities, the
-absolute rollout path as `nativePath`, which must lie in the session's native
-home, working directory, provider/model settings, accepted environment,
-title, timestamp, and the cumulative cost once a call is priced.
-`github.com/savid/acp-go-core` supplies the store types and the session
-mirror.
+`WithSessionStore` mirrors the native rollout under
+`CODEX_HOME/sessions/`: each rollout record is one row under the main
+subpath, and the adapter's session record is under `config`, format
+`nanocodex-rollout-jsonl-v3`. Commit, restore, and recovery follow
+[Sessions and the Session Store](https://github.com/savid/acp-go-core/blob/master/docs/03-sessions-and-store.md).
+The record holds the ACP and native session IDs, the absolute rollout path as
+`nativePath`, which must lie in the session's native home, the working
+directory, the provider and model settings, the accepted environment, the
+title, the time of the last accepted turn or configuration change, whether the
+rollout holds rows beyond its header, the cumulative cost once a call is
+priced, and the latest checkpoint as `checkpoint`. The default store is in
+memory.
 
-The adapter keeps no copy of the rollout in memory. Each commit reads only the
-records appended after the last committed byte offset and appends them to the
-store with the configuration record. The configuration record is replaced only
-when it changed. Its timestamp is the session's last accepted turn or
-configuration change, and the checkpoint file is read again only when its
-identity, size, or modification time changed, so an unchanged session writes
-nothing. A rollout that was rewritten or truncated before the committed offset
-is republished whole. Before a prompt or configuration change, native rows that
-extend the store are committed, and a rollout that no longer extends the
-committed records is hydrated again from the store. `session/list` reads configuration
-records only. Load replay streams the committed rollout one record at a time.
-Only newline-terminated records are mirrored. While the helper is stopped and
-its writer lock is held, a final record without its newline receives one when
-it is a complete JSON object of any length and is removed otherwise.
+Only records below the helper's committed byte offset are mirrored while it
+runs. Before a prompt or configuration change, native rows that extend the
+store are committed, and a rollout that no longer extends them is hydrated
+again from the store. Replay streams the committed rollout: messages, visible
+reasoning summaries, and function and custom tool calls with their text
+results, including new output in compacted replacement history. Items native
+mid-turn compaction discarded before persistence cannot replay, and
+multimodal tool results replay only their text.
 
-After a prompt, the helper stops the native writer and atomically saves the latest
-optional snapshot checkpoint in `<rollout>.acp-checkpoint.json`. The store mirrors
-it in `config.checkpoint`. It retains token accounting, the request prefix, and a
-pending compaction after a context overflow, so the next helper can compact
-before its first model call. Conversation history
-remains in native records. Restore uses a checkpoint only when its byte boundary,
-history length, identity, and supported shape match; otherwise it rebuilds from
-native history. Checkpoint failures are diagnostic and do not fail a committed
-turn. Native history corruption still fails restore.
+After a prompt, the helper stops the native writer and atomically saves its
+latest snapshot checkpoint in `<rollout>.acp-checkpoint.json`. It retains token
+accounting, the request prefix, and a pending compaction after a context
+overflow, so the next helper can compact before its first model call. The
+adapter reads the file again only when its identity, size, or modification
+time changed. Restore uses a checkpoint only when its byte boundary, history
+length, identity, and supported shape match; otherwise it rebuilds from native
+history. Checkpoint failures are diagnostic and do not fail a committed turn.
 
-The store is authoritative even when the default in-memory store is used.
-An adapter never adopts a native-only session that lacks a store entry.
-`session/load` restores state and replays messages, visible reasoning summaries,
-and function/custom tool calls with their text results, including new output in
-compacted replacement history. Items discarded by native mid-turn compaction
-before persistence cannot replay. Multimodal tool results replay only their text
-parts. `session/resume` restores without replay.
-A native file with additional rows
-is adopted only when its shared prefix agrees with the store. Divergence fails
-restore. Deletion tombstones the store and leaves native files intact.
-
-Native files live under `CODEX_HOME/sessions/`. The Go adapter holds the native
+The Go adapter holds the native
 UUID lock from before hydration until the helper has exited and been reaped.
 The helper holds a separate writer lock for its lifetime; hydration and stopped
 snapshots refuse an active writer even after an adapter crash. New, load, and
@@ -280,8 +267,8 @@ and helper protocol failures have cause `transport`, and a helper exit has
 cause `process_exit` with its exit status or signal and stderr tail. A failed prompt mirror commit returns
 `nanocodex_turn_failed` with cause `transport` and message
 `session mirror commit failed`. Store failures outside
-a prompt return `nanocodex_internal_failure` without a class. Failed restoration returns
-`nanocodex_restore_failed` and leaves the store entry intact. Other internal
+a prompt return `nanocodex_internal_failure` without a class. Failed restoration logs its reason, returns
+`nanocodex_restore_failed`, and leaves the store entry intact. Other internal
 failures may carry one of these `class` values:
 
 | Class | Condition |
