@@ -56,7 +56,7 @@ func ReadCheckpoint(home, path string, stamp CheckpointStamp) (data json.RawMess
 
 	current = CheckpointStamp{size: info.Size(), modified: info.ModTime().UnixNano()}
 	if system, ok := info.Sys().(*syscall.Stat_t); ok {
-		current.device, current.inode = uint64(system.Dev), system.Ino //nolint:gosec // Device numbers are non-negative.
+		current.device, current.inode = statDevice(system), system.Ino
 	}
 
 	if current == stamp {
