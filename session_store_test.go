@@ -555,7 +555,7 @@ func TestMirrorAppendsOnlyNewRowsAndSkipsUnchangedCommits(t *testing.T) {
 	require.Equal(t, bytes.Count(raw, []byte{'\n'})-rowsBefore, after[2]-before[2])
 	require.Equal(t, before[3]+1, after[3])
 
-	_, err = agent.SetSessionConfigOption(t.Context(), wire.SetConfigOptionRequest(created.SessionId, configThinking, "high"))
+	_, err = agent.SetSessionConfigOption(t.Context(), wire.SetConfigOptionRequest(created.SessionId, configEffort, "high"))
 	require.NoError(t, err)
 	configured := store.counts()
 	require.Equal(t, [4]int{after[0], after[1] + 1, after[2], after[3] + 1}, configured, "a configuration change appends no rows")
@@ -658,4 +658,63 @@ func appendRows(b *testing.B, path string, row []byte, count int) {
 	_, err = file.Write(bytes.Repeat(row, count))
 	require.NoError(b, err)
 	require.NoError(b, file.Close())
+}
+
+// lateFailureStore refuses every write after its first two: the new
+// session's generation and its pre-turn native rebinding.
+type lateFailureStore struct {
+	acpcore.SessionStore
+	writes atomic.Int32
+}
+
+func (s *lateFailureStore) refuse() error {
+	if s.writes.Add(1) > 2 {
+		return errors.New("fixture store unavailable")
+	}
+
+	return nil
+}
+
+func (s *lateFailureStore) Replace(ctx context.Context, key acpcore.SessionKey, rows []acpcore.SessionStoreReplacement) error {
+	if err := s.refuse(); err != nil {
+		return err
+	}
+
+	return s.SessionStore.Replace(ctx, key, rows)
+}
+
+func (s *lateFailureStore) Append(ctx context.Context, key acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, rows []acpcore.SessionStoreReplacement) error {
+	if err := s.refuse(); err != nil {
+		return err
+	}
+
+	return s.SessionStore.Append(ctx, key, base, entries, rows)
+}
+
+func TestFailedCommitLeavesTheSessionUnstarted(t *testing.T) {
+	t.Parallel()
+
+	store := &lateFailureStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	agent, _, _, workspace := fixtureAgent(t, WithSessionStore(store))
+	options := NewNanocodexOptions(WithNanocodexEnv(map[string]string{"NANOCODEX_TEST_OMIT_EVENTS": "1"}))
+	created := fixtureSession(t, agent, workspace, WithSessionNanocodexOptions(options))
+	s, err := agent.lookup(created.SessionId)
+	require.NoError(t, err)
+	_, err = agent.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "rows without acceptance"))
+	require.Error(t, err)
+	s.mu.Lock()
+	started := s.started
+	s.mu.Unlock()
+	require.False(t, started, "a record the store refused must not change the session")
+	store.writes.Store(0)
+	require.NoError(t, s.commitMirror(t.Context()))
+	s.mu.Lock()
+	started = s.started
+	s.mu.Unlock()
+	require.True(t, started)
+	var record sessionRecord
+	_, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, record.Started)
 }

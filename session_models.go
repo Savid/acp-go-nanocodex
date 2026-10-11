@@ -41,7 +41,7 @@ func (s *session) configOptions() []acp.SessionConfigOption {
 
 	options := []acp.SessionConfigOption{{Select: &acp.SessionConfigOptionSelect{Id: configModel, Name: "Model", Type: "select", Category: new(acp.SessionConfigOptionCategoryModel), CurrentValue: acp.SessionConfigValueId(s.options.Model), Options: acp.SessionConfigSelectOptions{Ungrouped: &models}}}}
 	if len(thinking) > 0 {
-		options = append(options, acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{Id: configThinking, Name: "Thought Level", Type: "select", Category: new(acp.SessionConfigOptionCategoryThoughtLevel), CurrentValue: acp.SessionConfigValueId(s.options.Effort), Options: acp.SessionConfigSelectOptions{Ungrouped: &thinking}}})
+		options = append(options, acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{Id: configEffort, Name: "Effort", Type: "select", Category: new(acp.SessionConfigOptionCategoryThoughtLevel), CurrentValue: acp.SessionConfigValueId(s.options.Effort), Options: acp.SessionConfigSelectOptions{Ungrouped: &thinking}}})
 	}
 
 	return options
@@ -107,7 +107,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		}
 
 		candidate.Model = value
-	case configThinking:
+	case configEffort:
 		if value == "" {
 			s.mu.Unlock()
 
@@ -138,7 +138,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		rollback()
 
 		if refusal, ok := errors.AsType[*nanocodex.Error](nativeErr); ok && refusal.Code == nanocodex.InvalidConfig {
-			if (p.ConfigId == configModel && refusal.Field == string(configModel)) || (p.ConfigId == configThinking && refusal.Field == metaThinkingKey) {
+			if (p.ConfigId == configModel && refusal.Field == string(configModel)) || (p.ConfigId == configEffort && refusal.Field == metaEffortKey) {
 				return acp.SetSessionConfigOptionResponse{}, wire.Unsupported("value")
 			}
 		}

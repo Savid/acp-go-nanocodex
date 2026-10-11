@@ -134,7 +134,7 @@ it with `NewNanocodexOptions`, then attach it using
 | `baseModel` | `WithNanocodexBaseModel` | Native model whose settings a [gateway model](PROVIDERS.md#gateway-models) uses. |
 | `maxOutputTokens` | `WithNanocodexMaxOutputTokens` | Output-token bound of each gateway generation response, including reasoning; unset sends no bound. Native routes refuse it. |
 | `contextWindow` | `WithNanocodexContextWindow` | Token window for usage reporting and context management; see [gateway models](PROVIDERS.md#gateway-models). |
-| `thinking` | `WithNanocodexEffort` | Native reasoning effort; the `thought_level` config option selects the same value. |
+| `effort` | `WithNanocodexEffort` | Native reasoning effort; the `effort` config option selects the same value. |
 | `env` | `WithNanocodexEnv` | Session environment overlay. |
 | `extraPathDirs` | `WithNanocodexExtraPathDirs` | Ordered absolute directories prepended to `PATH`. |
 | `apiBaseUrl` | `WithNanocodexAPIBaseURL` | Responses API base URL. |
@@ -175,7 +175,7 @@ empty list withholds every name. Every tool command can read these values,
 including the provider key if `shellEnv` names it, so a host that relays
 client `_meta` should restrict which names it accepts.
 
-ACP config selectors are `model` (category `model`) and `thought_level`
+ACP config selectors are `model` (category `model`) and `effort`
 (category `thought_level`). The model can change before the first committed
 turn; later turns retain that model. Effort can change between turns.
 `SetModelRequest` builds a model selector request.
@@ -209,7 +209,7 @@ first appear on the next one.
 
 ## Persistence
 
-`SessionStoreFormat` is `nanocodex-rollout-jsonl-v1`. The main subpath contains
+`SessionStoreFormat` is `nanocodex-rollout-jsonl-v2`. The main subpath contains
 raw native rollout rows; `config` contains the ACP/native identities, relative
 rollout path, working directory, provider/model settings, accepted environment,
 title, timestamp, and the cumulative cost once a call is priced.

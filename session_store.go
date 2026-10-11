@@ -111,19 +111,18 @@ func (s *session) commit(ctx context.Context, sessionLocked bool) (err error) {
 	var (
 		checkpoint json.RawMessage
 		stamp      nanocodex.CheckpointStamp
+		started    bool
 	)
 
 	// The checkpoint is read after the rows, so the record describes them. A
 	// conversation is started once its rollout holds more than its header.
+	// The mirror may build the record more than once; only the record of a
+	// successful commit is applied to the session.
 	record := func(tail sessionlog.Tail) (any, error) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		if tail.Full {
-			s.started = s.started || len(tail.Rows) != 1
-		} else {
-			s.started = s.started || len(tail.Rows) > 0
-		}
+		started = s.started || len(tail.Rows) > 0 && (!tail.Full || len(tail.Rows) != 1)
 
 		data, current, changed, readErr := nanocodex.ReadCheckpoint(home, state.RolloutPath, s.checkpointStamp)
 		checkpoint, stamp = s.checkpoint, current
@@ -142,7 +141,7 @@ func (s *session) commit(ctx context.Context, sessionLocked bool) (err error) {
 			cost = new(*s.cost)
 		}
 
-		return sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: s.options.clone(), Title: s.title, Started: s.started, UpdatedAtUnixMilli: updatedAtMilli(s.updatedAt), CostUSD: cost}, nil
+		return sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: s.options.clone(), Title: s.title, Started: started, UpdatedAtUnixMilli: updatedAtMilli(s.updatedAt), CostUSD: cost}, nil
 	}
 
 	storeCtx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
@@ -156,6 +155,7 @@ func (s *session) commit(ctx context.Context, sessionLocked bool) (err error) {
 	s.mu.Lock()
 	s.checkpoint = checkpoint
 	s.checkpointStamp = stamp
+	s.started = s.started || started
 	s.binding = nil
 	s.mu.Unlock()
 

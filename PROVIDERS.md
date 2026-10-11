@@ -133,7 +133,7 @@ sets the session's context window for native and gateway models alike. It must
 be a positive integer no greater than the native or base model's maximum.
 Without it the session uses 272000, or the model's smaller maximum. Load and
 resume accept a changed `contextWindow`. A request that changes `model` before
-the first turn drops the stored `baseModel`, `contextWindow`, and `thinking`
+the first turn drops the stored `baseModel`, `contextWindow`, and `effort`
 unless it supplies them again.
 
 The GPT models compact automatically when the context reaches 90% of the
@@ -204,7 +204,7 @@ account.
   A started session cannot move between a custom endpoint and the native
   route; see [route pinning](README.md#scope).
 - Gateways cache the shared request prefix without `prompt_cache_key`. A
-  `thought_level` change starts a separate provider cache, so the next call is
+  `effort` change starts a separate provider cache, so the next call is
   uncached.
 - Gateway failures without a terminal code retry up to five attempts; at most
   two of them may discard output already delivered, and each retried attempt

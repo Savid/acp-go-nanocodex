@@ -24,7 +24,7 @@ const (
 	metaBaseModelKey     = "baseModel"
 	metaContextWindowKey = "contextWindow"
 	metaMaxOutputKey     = "maxOutputTokens"
-	metaThinkingKey      = "thinking"
+	metaEffortKey        = "effort"
 	metaAPIBaseURLKey    = "apiBaseUrl"
 	metaWebsocketURLKey  = "websocketUrl"
 	metaModelIDPrefixKey = "modelIdPrefix"
@@ -36,8 +36,8 @@ const (
 )
 
 const (
-	configModel    acp.SessionConfigId = "model"
-	configThinking acp.SessionConfigId = "thought_level"
+	configModel  acp.SessionConfigId = "model"
+	configEffort acp.SessionConfigId = "effort"
 )
 
 // NanocodexOptions selects one native agent's model, route, and environment.
@@ -51,9 +51,8 @@ type NanocodexOptions struct {
 	// size, and compaction; zero leaves the helper's environment value or the
 	// model default.
 	ContextWindow int64 `json:"contextWindow,omitempty"`
-	// Effort is the native reasoning effort, carried as the "thinking"
-	// metadata key and the thought_level config option.
-	Effort string `json:"thinking,omitempty"`
+	// Effort is the native reasoning effort.
+	Effort string `json:"effort,omitempty"`
 	// MaxOutputTokens bounds each gateway generation response, including its
 	// reasoning; zero sends no bound.
 	MaxOutputTokens int64  `json:"maxOutputTokens,omitempty"`
@@ -222,7 +221,7 @@ func (options NanocodexOptions) strings() map[string]string {
 // stringOptionFields maps each string option's metadata key to its field.
 func stringOptionFields(options *NanocodexOptions) map[string]*string {
 	return map[string]*string{
-		metaModelKey: &options.Model, metaBaseModelKey: &options.BaseModel, metaThinkingKey: &options.Effort,
+		metaModelKey: &options.Model, metaBaseModelKey: &options.BaseModel, metaEffortKey: &options.Effort,
 		metaAPIBaseURLKey: &options.APIBaseURL, metaWebsocketURLKey: &options.WebsocketURL, metaModelIDPrefixKey: &options.ModelIDPrefix,
 		metaTransportKey: &options.Transport, metaAPIKeyEnvKey: &options.APIKeyEnv, metaAuthFileKey: &options.AuthFile,
 	}

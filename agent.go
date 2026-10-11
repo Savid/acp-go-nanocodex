@@ -29,7 +29,7 @@ const (
 	// RawEventMethod delivers opted-in native events during live turns.
 	RawEventMethod = "_nanocodex/rawEvent"
 	// SessionStoreFormat identifies native rollout rows and their configuration.
-	SessionStoreFormat = "nanocodex-rollout-jsonl-v1"
+	SessionStoreFormat = "nanocodex-rollout-jsonl-v2"
 	vendor             = "nanocodex"
 )
 
