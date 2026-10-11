@@ -162,7 +162,8 @@ func TestSessionRestoresWithSymlinkedHome(t *testing.T) {
 func TestSessionRecoversUnterminatedNativeTail(t *testing.T) {
 	t.Parallel()
 
-	agent, _, _, workspace := fixtureAgent(t)
+	logger, logs := captureLogs()
+	agent, _, _, workspace := fixtureAgent(t, WithLogger(logger))
 	created := fixtureSession(t, agent, workspace)
 	fixturePrompt(t, agent, created.SessionId, "completed turn")
 	s, err := agent.lookup(created.SessionId)
@@ -184,6 +185,7 @@ func TestSessionRecoversUnterminatedNativeTail(t *testing.T) {
 		require.NotContains(t, string(raw), `{"timestamp":"interrupted`)
 		fixturePrompt(t, agent, created.SessionId, "continue after interrupted write")
 	}
+	require.Equal(t, 2, strings.Count(logs.String(), `level=WARN msg="native session file tail repaired" session_id=`+string(created.SessionId)+` bytes_cut=25 record_terminated=false`))
 }
 
 func TestSessionPreservesCompleteFinalRecordWithoutNewline(t *testing.T) {
@@ -462,7 +464,8 @@ func TestStoredOptionsAreValidatedOnLoad(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	record.Options.ContextWindow = -1
-	require.NoError(t, sessionlog.NewMirror(store, string(created.SessionId)).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil }))
+	_, err = sessionlog.NewMirror(store, string(created.SessionId)).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil })
+	require.NoError(t, err)
 	_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
 	require.Equal(t, wire.RestoreFailed(vendor), err)
 }
@@ -577,7 +580,8 @@ func TestMirrorAppendsOnlyNewRowsAndSkipsUnchangedCommits(t *testing.T) {
 func TestRemovedRolloutIsHydratedFromTheStoreBeforeLaunch(t *testing.T) {
 	t.Parallel()
 
-	agent, client, home, workspace := fixtureAgent(t)
+	logger, logs := captureLogs()
+	agent, client, home, workspace := fixtureAgent(t, WithLogger(logger))
 	created := fixtureSession(t, agent, workspace)
 	completed := fixturePrompt(t, agent, created.SessionId, "remembered")
 	path := rolloutPath(home, nativeID(t, completed.Meta))
@@ -588,6 +592,7 @@ func TestRemovedRolloutIsHydratedFromTheStoreBeforeLaunch(t *testing.T) {
 	restored, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.True(t, bytes.HasPrefix(restored, committed))
+	require.Contains(t, logs.String(), `level=WARN msg="native session file repaired on restore" session_id=`+string(created.SessionId)+` torn_bytes_cut=0 record_terminated=false invalid_bytes_cut=0 rewritten_from_store=true`)
 	client.reset()
 	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
 	require.NoError(t, err)
@@ -757,4 +762,31 @@ func TestEnsureNativeReportsAStoreFailureWithoutRefusingRestore(t *testing.T) {
 	require.NotContains(t, logs.String(), "session restore failed")
 	store.fail.Store(false)
 	fixturePrompt(t, agent, created.SessionId, "store available again")
+}
+
+type appendFailureStore struct {
+	acpcore.SessionStore
+	fail atomic.Bool
+}
+
+func (s *appendFailureStore) Append(ctx context.Context, main acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.Swap(false) {
+		return errors.New("append refused")
+	}
+
+	return s.SessionStore.Append(ctx, main, base, entries, replacements)
+}
+
+func TestFailedAppendRepublishesAndIsLogged(t *testing.T) {
+	t.Parallel()
+
+	store := &appendFailureStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	logger, logs := captureLogs()
+	agent, _, _, workspace := fixtureAgent(t, WithSessionStore(store), WithLogger(logger))
+	created := fixtureSession(t, agent, workspace)
+	fixturePrompt(t, agent, created.SessionId, "first turn")
+	require.NotContains(t, logs.String(), "session mirror republished")
+	store.fail.Store(true)
+	fixturePrompt(t, agent, created.SessionId, "second turn")
+	require.Contains(t, logs.String(), `level=WARN msg="session mirror republished" session_id=`+string(created.SessionId)+` reason=append_failed append_error="append refused"`)
 }

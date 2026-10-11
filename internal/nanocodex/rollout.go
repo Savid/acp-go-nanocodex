@@ -147,11 +147,11 @@ func EachRow(home, path string, fn func(row []byte) error) error {
 	}
 }
 
-// RepairTail settles an unterminated final record of a stopped rollout while
-// the caller holds its writer lock: a complete JSON object of any length
-// receives its newline and any other fragment is removed. It creates the rollout's
-// directory beneath home so a later publish cannot leave it.
-func RepairTail(home, path string) error {
+// ConfineRollout requires path to name a rollout in home's session tree that
+// is reached without leaving home and, when it exists, is a regular file. It
+// creates the rollout's directory beneath home so a later publish cannot
+// leave it.
+func ConfineRollout(home, path string) error {
 	rel, err := RolloutRelative(home, path)
 	if err != nil {
 		return err
@@ -166,14 +166,13 @@ func RepairTail(home, path string) error {
 		return err
 	}
 
-	mkdirErr := root.MkdirAll(filepath.Dir(rel), 0o700)
-	_ = root.Close()
+	defer root.Close()
 
-	if mkdirErr != nil {
+	if mkdirErr := root.MkdirAll(filepath.Dir(rel), 0o700); mkdirErr != nil {
 		return mkdirErr
 	}
 
-	file, err := openRollout(home, path, os.O_RDWR)
+	info, err := root.Lstat(rel)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -182,83 +181,21 @@ func RepairTail(home, path string) error {
 		return err
 	}
 
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return err
+	if !info.Mode().IsRegular() {
+		return errors.New("native rollout must be a regular file")
 	}
 
-	start, err := lastLineEnd(file, info.Size())
-	if err != nil || start == info.Size() {
-		return err
-	}
-
-	if completeRecord(io.NewSectionReader(file, start, info.Size()-start)) {
-		_, err = file.WriteAt([]byte{'\n'}, info.Size())
-	} else {
-		err = file.Truncate(start)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	return file.Sync()
+	return nil
 }
 
-// lastLineEnd returns the offset after the last newline of a file of size
-// bytes, or zero when it has none. It scans backwards one block at a time, so
-// a long final record is never held in memory.
-func lastLineEnd(file *os.File, size int64) (int64, error) {
-	block := make([]byte, 64<<10)
-
-	for end := size; end > 0; {
-		start := max(end-int64(len(block)), 0)
-		chunk := block[:end-start]
-
-		if _, err := file.ReadAt(chunk, start); err != nil && !errors.Is(err, io.EOF) {
-			return 0, err
-		}
-
-		if index := bytes.LastIndexByte(chunk, '\n'); index >= 0 {
-			return start + int64(index) + 1, nil
-		}
-
-		end = start
+// RepairTail confines a stopped rollout and settles its final record with
+// sessionlog.CutTornTail while the caller holds its writer lock.
+func RepairTail(home, path string) (sessionlog.TornTail, error) {
+	if err := ConfineRollout(home, path); err != nil {
+		return sessionlog.TornTail{}, err
 	}
 
-	return 0, nil
-}
-
-// completeRecord reports whether r holds exactly one JSON object and
-// whitespace. It decodes token by token, so a compacted record of any size is
-// checked without being held whole.
-func completeRecord(r io.Reader) bool {
-	decoder := json.NewDecoder(r)
-
-	token, err := decoder.Token()
-	if delimiter, ok := token.(json.Delim); err != nil || !ok || delimiter != '{' {
-		return false
-	}
-
-	for depth := 1; depth > 0; {
-		token, err = decoder.Token()
-		if err != nil {
-			return false
-		}
-
-		switch token {
-		case json.Delim('{'), json.Delim('['):
-			depth++
-		case json.Delim('}'), json.Delim(']'):
-			depth--
-		}
-	}
-
-	_, err = decoder.Token()
-
-	return errors.Is(err, io.EOF)
+	return sessionlog.CutTornTail(path)
 }
 
 // ValidSessionID requires the canonical UUID spelling used by native rollouts.

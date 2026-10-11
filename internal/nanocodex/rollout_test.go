@@ -84,9 +84,10 @@ func TestRepairTailSettlesTheFinalRecord(t *testing.T) {
 		name     string
 		contents []byte
 		want     []byte
+		torn     sessionlog.TornTail
 	}{
-		{name: "complete record", contents: append(bytes.Clone(header), last...), want: append(append(bytes.Clone(header), last...), '\n')},
-		{name: "invalid fragment", contents: append(bytes.Clone(header), `{"unfinished":`...), want: header},
+		{name: "complete record", contents: append(bytes.Clone(header), last...), want: append(append(bytes.Clone(header), last...), '\n'), torn: sessionlog.TornTail{Terminated: true}},
+		{name: "invalid fragment", contents: append(bytes.Clone(header), `{"unfinished":`...), want: header, torn: sessionlog.TornTail{Cut: int64(len(`{"unfinished":`))}},
 		{name: "terminated", contents: header, want: header},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -94,7 +95,9 @@ func TestRepairTailSettlesTheFinalRecord(t *testing.T) {
 
 			home, path := rolloutFixture(t)
 			require.NoError(t, os.WriteFile(path, test.contents, 0o600))
-			require.NoError(t, RepairTail(home, path))
+			torn, err := RepairTail(home, path)
+			require.NoError(t, err)
+			require.Equal(t, test.torn, torn)
 			actual, err := os.ReadFile(path)
 			require.NoError(t, err)
 			require.Equal(t, test.want, actual)
@@ -107,15 +110,32 @@ func TestRepairTailCreatesTheRolloutDirectoryInsideHome(t *testing.T) {
 
 	home := t.TempDir()
 	path := filepath.Join(home, "sessions", "2026", "rollout.jsonl")
-	require.NoError(t, RepairTail(home, path))
+	_, err := RepairTail(home, path)
+	require.NoError(t, err)
 	info, err := os.Stat(filepath.Dir(path))
 	require.NoError(t, err)
 	require.True(t, info.IsDir())
 	outside := t.TempDir()
 	require.NoError(t, os.Symlink(outside, filepath.Join(home, "sessions", "escape")))
-	require.Error(t, RepairTail(home, filepath.Join(home, "sessions", "escape", "nested", "rollout.jsonl")))
+	_, err = RepairTail(home, filepath.Join(home, "sessions", "escape", "nested", "rollout.jsonl"))
+	require.Error(t, err)
 	_, err = os.Stat(filepath.Join(outside, "nested"))
 	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestRepairTailRefusesARolloutThatIsNotARegularFile(t *testing.T) {
+	t.Parallel()
+
+	home, path := rolloutFixture(t)
+	outside := filepath.Join(t.TempDir(), "outside.jsonl")
+	torn := []byte(`{"torn":`)
+	require.NoError(t, os.WriteFile(outside, torn, 0o600))
+	require.NoError(t, os.Symlink(outside, path))
+	_, err := RepairTail(home, path)
+	require.ErrorContains(t, err, "must be a regular file")
+	contents, err := os.ReadFile(outside)
+	require.NoError(t, err)
+	require.Equal(t, torn, contents)
 }
 
 func TestEachRowStreamsCompleteRecords(t *testing.T) {
@@ -202,7 +222,8 @@ func TestRepairTailSettlesRecordsBeyondTheFrameBound(t *testing.T) {
 
 			home, path := rolloutFixture(t)
 			require.NoError(t, os.WriteFile(path, append(bytes.Clone(header), test.fragment...), 0o600))
-			require.NoError(t, RepairTail(home, path))
+			_, err := RepairTail(home, path)
+			require.NoError(t, err)
 			actual, err := os.ReadFile(path)
 			require.NoError(t, err)
 			require.True(t, bytes.Equal(test.want, actual))

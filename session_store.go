@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"time"
 
@@ -85,11 +86,15 @@ func (s *session) commit(ctx context.Context, sessionLocked bool) (err error) {
 		return nil
 	}
 
-	limit, unlock, err := lockRollout(home, state, rt, sessionLocked)
+	limit, torn, unlock, err := lockRollout(home, state, rt, sessionLocked)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+
+	if torn.Changed() {
+		s.agent.log.WarnContext(ctx, "native session file tail repaired", slog.String("session_id", string(s.id)), slog.Int64("bytes_cut", torn.Cut), slog.Bool("record_terminated", torn.Terminated))
+	}
 
 	rel, err := nanocodex.RolloutRelative(home, state.RolloutPath)
 	if err != nil {
@@ -146,8 +151,10 @@ func (s *session) commit(ctx context.Context, sessionLocked bool) (err error) {
 	}
 
 	storeCtx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
-	err = s.mirror.Commit(storeCtx, source, record)
+	report, err := s.mirror.Commit(storeCtx, source, record)
+	s.agent.observe.RecordRepublish(storeCtx, string(report.Republish))
 	finish(err)
+	s.logRepublish(ctx, report)
 
 	if err != nil {
 		return err
@@ -163,11 +170,19 @@ func (s *session) commit(ctx context.Context, sessionLocked bool) (err error) {
 	return nil
 }
 
+// logRepublish warns when a commit republished the whole session to recover
+// from a rewritten native history or a failed append.
+func (s *session) logRepublish(ctx context.Context, report sessionlog.CommitReport) {
+	if report.Recovery() {
+		s.agent.log.WarnContext(ctx, "session mirror republished", slog.String("session_id", string(s.id)), slog.String("reason", string(report.Republish)), slog.Any("append_error", report.AppendErr))
+	}
+}
+
 // lockRollout returns the byte boundary a commit may read: the helper's
 // committed bytes while it runs, else the whole rollout. A stopped rollout is
 // read under the writer lock, and the native session lock unless the caller
-// holds it, after its final record is settled.
-func lockRollout(home string, state nanocodex.State, rt *runtime, sessionLocked bool) (int64, func(), error) {
+// holds it, after its final record is settled; the returned report says how.
+func lockRollout(home string, state nanocodex.State, rt *runtime, sessionLocked bool) (int64, sessionlog.TornTail, func(), error) {
 	limit := state.CommittedBytes
 	if rt == nil {
 		limit = -1
@@ -180,7 +195,7 @@ func lockRollout(home string, state nanocodex.State, rt *runtime, sessionLocked 
 	}
 
 	if limit >= 0 {
-		return limit, func() {}, nil
+		return limit, sessionlog.TornTail{}, func() {}, nil
 	}
 
 	var locks []*process.FileLock
@@ -201,19 +216,20 @@ func lockRollout(home string, state nanocodex.State, rt *runtime, sessionLocked 
 		if err != nil {
 			unlock()
 
-			return 0, nil, err
+			return 0, sessionlog.TornTail{}, nil, err
 		}
 
 		locks = append(locks, lock)
 	}
 
-	if err := nanocodex.RepairTail(home, state.RolloutPath); err != nil {
+	torn, err := nanocodex.RepairTail(home, state.RolloutPath)
+	if err != nil {
 		unlock()
 
-		return 0, nil, err
+		return 0, sessionlog.TornTail{}, nil, err
 	}
 
-	return limit, unlock, nil
+	return limit, torn, unlock, nil
 }
 
 var errInvalidStoredSession = errors.New("invalid stored session")
@@ -332,16 +348,22 @@ func (s *session) hydrate(ctx context.Context, stored *storedSession) error {
 	}
 	defer lock.Close()
 
-	if err = nanocodex.RepairTail(s.home, path); err != nil {
-		return fmt.Errorf("settle native rollout tail: %w", err)
+	if confineErr := nanocodex.ConfineRollout(s.home, path); confineErr != nil {
+		return confineErr
 	}
 
 	storedRows := len(stored.rows)
 
-	rows, err := s.mirror.Hydrate(ctx, path, stored.rows, stored.record, func(rows [][]byte) error {
+	rows, hydrated, err := s.mirror.Hydrate(ctx, path, stored.rows, stored.record, func(rows [][]byte) error {
 		return nanocodex.ValidateRows(rows, stored.record.NativeSessionID)
 	})
 	stored.rows = nil
+
+	if hydrated.Changed() {
+		s.agent.log.WarnContext(ctx, "native session file repaired on restore", slog.String("session_id", string(s.id)), slog.Int64("torn_bytes_cut", hydrated.Tail.Cut), slog.Bool("record_terminated", hydrated.Tail.Terminated), slog.Int64("invalid_bytes_cut", hydrated.InvalidCut), slog.Bool("rewritten_from_store", hydrated.Rewritten))
+	}
+
+	s.logRepublish(ctx, hydrated.Commit)
 
 	if err != nil {
 		return fmt.Errorf("hydrate native rollout: %w", err)
