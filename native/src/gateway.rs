@@ -147,6 +147,16 @@ struct GatewayHistory {
     input: Vec<Value>,
     tools: Vec<Value>,
     response_id: Option<String>,
+    /// Effort of the latest committed `configuration_update` item.
+    effort: Option<String>,
+}
+
+/// Provider input built from a native request: the history items, the
+/// function tools, and the effort of its latest `configuration_update` item.
+struct PublicInput {
+    input: Vec<Value>,
+    tools: Vec<Value>,
+    effort: Option<String>,
 }
 
 impl<S> Layer<S> for GatewayLayer {
@@ -347,9 +357,14 @@ fn item_key(model_call_index: u32, output_index: usize, presentation: u32) -> St
     }
 }
 
-fn public_input(request: &ResponsesAttempt) -> Result<(Vec<Value>, Vec<Value>), ResponseError> {
+/// Native models that accept appended effort updates keep the request effort
+/// at the session's first effort and record each later change as a
+/// `configuration_update` history item. Gateways receive no such items, so the
+/// latest one becomes the request effort instead.
+fn public_input(request: &ResponsesAttempt) -> Result<PublicInput, ResponseError> {
     let mut input = Vec::new();
     let mut tools = Vec::new();
+    let mut effort = None;
     for item in request.input_items() {
         let mut item =
             serde_json::to_value(item).map_err(|_| failure("cannot encode provider input"))?;
@@ -365,7 +380,14 @@ fn public_input(request: &ResponsesAttempt) -> Result<(Vec<Value>, Vec<Value>), 
                         .cloned(),
                 );
             }
-            Some("configuration_update") => {}
+            Some("configuration_update") => {
+                effort = Some(
+                    item["reasoning"]["effort"]
+                        .as_str()
+                        .ok_or_else(|| failure("invalid native configuration update"))?
+                        .to_owned(),
+                );
+            }
             Some("compaction")
                 if item["encrypted_content"]
                     .as_str()
@@ -403,7 +425,11 @@ fn public_input(request: &ResponsesAttempt) -> Result<(Vec<Value>, Vec<Value>), 
             }
         }
     }
-    Ok((input, tools))
+    Ok(PublicInput {
+        input,
+        tools,
+        effort,
+    })
 }
 
 impl GatewayRoute {
@@ -450,7 +476,11 @@ impl GatewayRoute {
             .model_call_index()
             .ok_or_else(|| failure("gateway request requires a model call index"))?;
         let started = Instant::now();
-        let (mut input, mut tools) = public_input(&request)?;
+        let PublicInput {
+            mut input,
+            mut tools,
+            mut effort,
+        } = public_input(&request)?;
         let mut history = history.lock().await;
         if !request.is_full_replay() {
             if request.previous_response_id() != history.response_id.as_deref() {
@@ -462,6 +492,7 @@ impl GatewayRoute {
             full.append(&mut input);
             input = full;
             tools = history.tools.clone();
+            effort = effort.or_else(|| history.effort.clone());
         }
         // Gateways cannot create provider compaction items. A compaction attempt asks for a
         // plain-text summary over the same prefix so the provider cache still applies.
@@ -492,7 +523,7 @@ impl GatewayRoute {
         };
         let mut body = json!({
             "model":model, "input":input, "tools":tools, "stream":true, "store":false,
-            "reasoning":{"effort":request.thinking().as_str()},
+            "reasoning":{"effort":effort.as_deref().unwrap_or(request.thinking().as_str())},
             "include":["reasoning.encrypted_content"],
             "tool_choice":if compacting { "none" } else { "auto" }, "parallel_tool_calls":false,
         });
@@ -525,6 +556,7 @@ impl GatewayRoute {
                         history.input = input;
                         history.input.extend(committed_output);
                         history.tools = tools;
+                        history.effort = effort;
                         history.response_id = Some(generation.id.clone());
                     } else {
                         // Native compaction installs retained context and forces a full replay.

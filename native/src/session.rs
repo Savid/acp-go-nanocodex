@@ -137,10 +137,11 @@ impl SessionError {
                 ResponsesError::InvalidToolSchema { .. } => {
                     Self::new("native_error", "provider rejected a tool schema")
                 }
-                ResponsesError::Api { event } => serde_json::from_str::<Value>(event).map_or_else(
-                    |_| Self::new("native_error", "provider returned an error event"),
-                    |event| Self::provider_event(&event),
-                ),
+                ResponsesError::Api { event, .. } => serde_json::from_str::<Value>(event)
+                    .map_or_else(
+                        |_| Self::new("native_error", "provider returned an error event"),
+                        |event| Self::provider_event(&event),
+                    ),
                 ResponsesError::HandshakeTimeout { .. } | ResponsesError::SendTimeout { .. } => {
                     Self::connection("provider connection timed out")
                 }

@@ -757,6 +757,46 @@ async fn gateway_shell_tool_and_restored_rollout_continue_the_same_conversation(
     }
 }
 
+#[tokio::test]
+async fn gateway_requests_carry_the_selected_effort_after_it_changes() {
+    for prefix in [None, Some("openai")] {
+        let provider = Provider::start([
+            Reply::Text("first"),
+            Reply::Text("second"),
+            Reply::Text("third"),
+        ])
+        .await;
+        let workspace = TempDir::new().expect("workspace");
+        let native_home = TempDir::new().expect("native home");
+        let mut config = json!({
+            "sessionId": uuid::Uuid::now_v7().to_string(),
+            "model": "gpt-6.1-sol", "thinking": "low", "transport": "https",
+            "apiBaseUrl": provider.base_url, "apiKeyEnv": "OPENAI_API_KEY",
+        });
+        if let Some(prefix) = prefix {
+            config["modelIdPrefix"] = json!(prefix);
+        }
+        let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENAI_API_KEY");
+        let initialized = helper.call(1, "initialize", config.clone()).await;
+        helper.call(2, "prompt", prompt("first question")).await;
+        helper.shutdown(3).await;
+        config["resumeSessionId"] = initialized["nativeSessionId"].clone();
+        for (thinking, question) in [("high", "second question"), ("low", "third question")] {
+            config["thinking"] = json!(thinking);
+            let mut helper = Helper::start(workspace.path(), native_home.path(), "OPENAI_API_KEY");
+            helper.call(1, "initialize", config.clone()).await;
+            helper.call(2, "prompt", prompt(question)).await;
+            helper.shutdown(3).await;
+        }
+        let efforts = provider
+            .requests()
+            .iter()
+            .map(|request| request.body["reasoning"]["effort"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(efforts, ["low", "high", "low"], "prefix {prefix:?}");
+    }
+}
+
 const SHELL_ENV_PROBE: &str = "test \"${#FIXTURE_ALLOWED_TOKEN}\" = 22 && printf 'allowed-present '; printf '%s|%s|%s|%s' \"$FIXTURE_ALLOWED_TOKEN\" \"${FIXTURE_DENIED_TOKEN:-denied-absent}\" \"${FIXTURE_UNSET_TOKEN:-unset-absent}\" \"${FIXTURE_SHORT_TOKEN:-short-absent}\"";
 
 /// Runs one shell tool call with an allowed and a withheld sensitive variable

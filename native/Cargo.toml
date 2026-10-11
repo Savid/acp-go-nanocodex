@@ -7,7 +7,7 @@ publish = false
 license = "MIT"
 
 [dependencies]
-nanocodex = { git = "https://github.com/gakonst/nanocodex", rev = "ef6e62ef492f5eef3eee17eab6bced9c6b29947e", default-features = false, features = ["openai", "tools"] }
+nanocodex = { git = "https://github.com/gakonst/nanocodex", rev = "129cec7a8a987e1a90688e89b807ef917268d02a", default-features = false, features = ["openai", "tools"] }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["codec"] }
 serde = { version = "1", features = ["derive"] }

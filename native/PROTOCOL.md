@@ -70,6 +70,10 @@ adapter coalesces completed messages with any deltas already published.
 Only function tools are advertised through this transport; shell and file
 operations use native direct tools. Unsupported custom tools are excluded.
 Gateway requests omit `prompt_cache_key` and carry the adapter's `User-Agent`.
+Without a model ID prefix, a session whose native or base model is
+`gpt-6.1-sol` or `gpt-6-astra` keeps its first effort as the native request
+effort and records each later change as a `configuration_update` history item. Gateway requests omit these
+items and send the latest one's effort as `reasoning.effort`.
 Only requests to `https://opencode.ai/zen/go/v1` carry the native conversation ID as
 `x-opencode-session`, including after a helper restart. Each SSE event is
 limited to 8 MiB before parsing. A response's output content is limited to
