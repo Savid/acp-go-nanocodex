@@ -22,7 +22,8 @@ RELEASE_GLIBC_FLOOR := 2.28
 RELEASE_MACOS_FLOOR := 13.0
 RELEASE_TARGETS ?= $(if $(filter Darwin,$(shell uname -s)),darwin_arm64,linux_amd64 linux_arm64)
 RELEASE_LINUX_TARGETS = $(filter linux_%,$(RELEASE_TARGETS))
-RELEASE := python3 scripts/release.py
+RELEASE_GO_VERSION := 1.27.2
+RELEASE := RELEASE_GO_VERSION=$(RELEASE_GO_VERSION) python3 scripts/release.py
 TAG ?=
 RELEASE_BRANCH ?=
 RELEASE_TARGET ?=

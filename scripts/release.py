@@ -1,8 +1,8 @@
 """Build, verify and describe release archives for the adapter and its helper.
 
 Every subcommand works from the repository root and uses only the Python
-standard library, git, the pinned Go and Rust toolchains, and the pinned
-cargo-zigbuild and zig supplied by the Makefile.
+standard library, git, the pinned Rust toolchain, and the Go release,
+cargo-zigbuild and zig the Makefile pins.
 """
 
 import argparse
@@ -84,10 +84,10 @@ def lock_version():
 
 
 def go_environment(**overrides):
-    match = re.search(r"^go (\d+\.\d+\.\d+)$", read_text("go.mod"), re.MULTILINE)
-    if match is None:
-        raise ReleaseError("go.mod must declare an exact go version")
-    env = dict(os.environ, GOTOOLCHAIN=f"go{match[1]}", GOFLAGS="-mod=readonly", GOWORK="off")
+    version = os.environ.get("RELEASE_GO_VERSION", "")
+    if re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
+        raise ReleaseError("RELEASE_GO_VERSION must name an exact Go release")
+    env = dict(os.environ, GOTOOLCHAIN=f"go{version}", GOFLAGS="-mod=readonly", GOWORK="off")
     env.update(overrides)
     return env
 
