@@ -470,6 +470,25 @@ func TestStoredOptionsAreValidatedOnLoad(t *testing.T) {
 	require.Equal(t, wire.RestoreFailed(vendor), err)
 }
 
+func TestStoredNativePathMustLieInTheSessionHome(t *testing.T) {
+	t.Parallel()
+
+	store := acpcore.NewInMemorySessionStore()
+	agent, _, _, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, agent, workspace)
+	_, err := agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	record.NativePath = filepath.Join(t.TempDir(), "sessions", filepath.Base(record.NativePath))
+	_, err = sessionlog.NewMirror(store, string(created.SessionId)).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil })
+	require.NoError(t, err)
+	_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.Equal(t, wire.RestoreFailed(vendor), err)
+}
+
 func TestStartedSessionsKeepTheirRouteClass(t *testing.T) {
 	t.Parallel()
 

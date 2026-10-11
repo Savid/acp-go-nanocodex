@@ -467,10 +467,10 @@ func TestSmokeSymlinkedHomeRecoversInterruptedRollout(t *testing.T) {
 	generation, err := store.Load(t.Context(), string(id))
 	require.NoError(t, err)
 	var record struct {
-		RolloutRelative string `json:"rolloutRelative"`
+		NativePath string `json:"nativePath"`
 	}
 	require.NoError(t, json.Unmarshal(generation[sessionlog.ConfigSubpath][0], &record))
-	path := filepath.Join(home, record.RolloutRelative)
+	path := record.NativePath
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
 	require.NoError(t, err)
 	_, err = file.WriteString(`{"timestamp":"interrupted`)

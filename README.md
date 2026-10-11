@@ -209,9 +209,10 @@ first appear on the next one.
 
 ## Persistence
 
-`SessionStoreFormat` is `nanocodex-rollout-jsonl-v2`. The main subpath contains
-raw native rollout rows; `config` contains the ACP/native identities, relative
-rollout path, working directory, provider/model settings, accepted environment,
+`SessionStoreFormat` is `nanocodex-rollout-jsonl-v3`. The main subpath contains
+raw native rollout rows; `config` contains the ACP/native identities, the
+absolute rollout path as `nativePath`, which must lie in the session's native
+home, working directory, provider/model settings, accepted environment,
 title, timestamp, and the cumulative cost once a call is priced.
 `github.com/savid/acp-go-core` supplies the store types and the session
 mirror.

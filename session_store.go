@@ -23,7 +23,7 @@ type sessionRecord struct {
 	SessionID          string           `json:"sessionId"`
 	NativeSessionID    string           `json:"nativeSessionId"`
 	Cwd                string           `json:"cwd"`
-	RolloutRelative    string           `json:"rolloutRelative"`
+	NativePath         string           `json:"nativePath"`
 	Options            NanocodexOptions `json:"options"`
 	Title              string           `json:"title,omitempty"`
 	Started            bool             `json:"started"`
@@ -96,8 +96,7 @@ func (s *session) commit(ctx context.Context, sessionLocked bool) (err error) {
 		s.agent.log.WarnContext(ctx, "native session file tail repaired", slog.String("session_id", string(s.id)), slog.Int64("bytes_cut", torn.Cut), slog.Bool("record_terminated", torn.Terminated))
 	}
 
-	rel, err := nanocodex.RolloutRelative(home, state.RolloutPath)
-	if err != nil {
+	if _, err = nanocodex.RolloutRelative(home, state.RolloutPath); err != nil {
 		return err
 	}
 
@@ -147,7 +146,7 @@ func (s *session) commit(ctx context.Context, sessionLocked bool) (err error) {
 			cost = new(*s.cost)
 		}
 
-		return sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: s.options.clone(), Title: s.title, Started: started, UpdatedAtUnixMilli: updatedAtMilli(s.updatedAt), CostUSD: cost}, nil
+		return sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, NativePath: state.RolloutPath, Options: s.options.clone(), Title: s.title, Started: started, UpdatedAtUnixMilli: updatedAtMilli(s.updatedAt), CostUSD: cost}, nil
 	}
 
 	storeCtx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
@@ -282,7 +281,7 @@ func (a *Agent) loadRecord(ctx context.Context, id acp.SessionId) (sessionRecord
 }
 
 func validRecord(record sessionRecord, id acp.SessionId) error {
-	if record.SessionID != string(id) || !nanocodex.ValidSessionID(record.NativeSessionID) || !filepath.IsAbs(record.Cwd) || record.UpdatedAtUnixMilli <= 0 || !filepath.IsLocal(record.RolloutRelative) {
+	if record.SessionID != string(id) || !nanocodex.ValidSessionID(record.NativeSessionID) || !filepath.IsAbs(record.Cwd) || record.UpdatedAtUnixMilli <= 0 || !filepath.IsAbs(record.NativePath) {
 		return fmt.Errorf("%w: identity, workspace, update time, or rollout path", errInvalidStoredSession)
 	}
 
@@ -337,7 +336,7 @@ func (s *session) hydrate(ctx context.Context, stored *storedSession) error {
 		return errors.New("invalid native session identity")
 	}
 
-	path := filepath.Join(s.home, stored.record.RolloutRelative)
+	path := stored.record.NativePath
 	if _, err := nanocodex.RolloutRelative(s.home, path); err != nil {
 		return err
 	}
@@ -425,7 +424,7 @@ func (s *session) ensureNative(ctx context.Context) error {
 		return err
 	case !stored.found:
 		return s.restoreRefused(ctx, errors.Join(commitErr, errors.New("stored session is missing")))
-	case stored.record.NativeSessionID != state.NativeSessionID || filepath.Join(s.home, stored.record.RolloutRelative) != state.RolloutPath:
+	case stored.record.NativeSessionID != state.NativeSessionID || stored.record.NativePath != state.RolloutPath:
 		return s.restoreRefused(ctx, errors.Join(commitErr, errors.New("stored native binding differs from the session")))
 	}
 
@@ -558,7 +557,7 @@ func (a *Agent) restore(ctx context.Context, id acp.SessionId, cwd string, dirs 
 		return nil, err
 	}
 
-	s.state = nanocodex.State{NativeSessionID: stored.record.NativeSessionID, RolloutPath: filepath.Join(s.home, stored.record.RolloutRelative)}
+	s.state = nanocodex.State{NativeSessionID: stored.record.NativeSessionID, RolloutPath: stored.record.NativePath}
 	s.pending = &storedSession{rows: stored.rows, record: stored.record, found: true}
 	stored.rows = nil
 	s.checkpoint = stored.record.Checkpoint
