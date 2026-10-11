@@ -387,6 +387,15 @@ func (f *fakeNative) accept(id uint64, command string) error {
 	})
 }
 
+// exitAfterAcceptance accepts an "accept-exit" prompt and exits before the
+// native writer records anything.
+func (f *fakeNative) exitAfterAcceptance(id uint64, command string) {
+	if command == "accept-exit" {
+		_ = f.event(id, "accepted", map[string]any{"turnId": "fixture-turn"})
+		os.Exit(38)
+	}
+}
+
 func (f *fakeNative) prompt(req fakeRequest) error {
 	var params struct {
 		Content []nanocodex.Content `json:"content"`
@@ -406,6 +415,7 @@ func (f *fakeNative) prompt(req fakeRequest) error {
 		return err
 	}
 
+	f.exitAfterAcceptance(req.ID, command)
 	if err := f.appendRow("event_msg", map[string]any{"type": "input_accepted", "input": params.Content}); err != nil {
 		return err
 	}

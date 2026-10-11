@@ -267,8 +267,6 @@ func (s *session) runPrompt(ctx context.Context, p acp.PromptRequest, content []
 
 	if t.accepted.Load() {
 		s.mu.Lock()
-
-		s.started = true
 		s.updatedAt = formatUpdatedAt(time.Now())
 
 		if s.title == "" {

@@ -718,3 +718,19 @@ func TestFailedCommitLeavesTheSessionUnstarted(t *testing.T) {
 	require.True(t, found)
 	require.True(t, record.Started)
 }
+
+// A first prompt the helper accepts but dies before recording any row leaves
+// a stored record marked started over a header-only rollout; every later
+// restore refuses it.
+func TestAcceptedPromptWithoutNativeRowsLeavesTheSessionRestorable(t *testing.T) {
+	t.Parallel()
+
+	agent, _, _, workspace := fixtureAgent(t)
+	created := fixtureSession(t, agent, workspace)
+	_, err := agent.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "accept-exit"))
+	require.Error(t, err)
+	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
+	require.NoError(t, err, "restore after an accepted turn that recorded nothing")
+}
