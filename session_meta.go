@@ -55,7 +55,7 @@ type NanocodexOptions struct {
 	// metadata key and the thought_level config option.
 	Effort string `json:"thinking,omitempty"`
 	// MaxOutputTokens bounds each gateway generation response, including its
-	// reasoning; zero leaves the helper's default.
+	// reasoning; zero sends no bound.
 	MaxOutputTokens int64  `json:"maxOutputTokens,omitempty"`
 	APIBaseURL      string `json:"apiBaseUrl,omitempty"`
 	WebsocketURL    string `json:"websocketUrl,omitempty"`

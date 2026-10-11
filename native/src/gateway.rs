@@ -16,7 +16,8 @@ use nanocodex::oai::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    error::Error,
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -34,8 +35,8 @@ pub struct GatewayConfig {
     pub model: Option<String>,
     pub model_id_prefix: Option<String>,
     pub session_id: String,
-    /// Bounds each generation response, including its reasoning.
-    pub max_output_tokens: u32,
+    /// Bounds each generation response, including its reasoning, when set.
+    pub max_output_tokens: Option<u32>,
 }
 
 pub struct GatewayEvent {
@@ -495,16 +496,19 @@ impl GatewayRoute {
             "include":["reasoning.encrypted_content"],
             "tool_choice":if compacting { "none" } else { "auto" }, "parallel_tool_calls":false,
         });
-        body["max_output_tokens"] = json!(if compacting {
-            SUMMARY_MAX_OUTPUT_TOKENS
+        let max_output_tokens = if compacting {
+            Some(SUMMARY_MAX_OUTPUT_TOKENS)
         } else {
             self.config.max_output_tokens
-        });
+        };
+        if let Some(tokens) = max_output_tokens {
+            body["max_output_tokens"] = json!(tokens);
+        }
         let mut retry = Retry::new();
         let mut trims = 0;
         let mut presentation = 0;
         loop {
-            let mut emitted_output = false;
+            let mut progress = Progress::default();
             match self
                 .stream_attempt(
                     &body,
@@ -512,7 +516,7 @@ impl GatewayRoute {
                     model_call_index,
                     presentation,
                     started,
-                    &mut emitted_output,
+                    &mut progress,
                 )
                 .await
             {
@@ -541,10 +545,16 @@ impl GatewayRoute {
                         );
                         continue;
                     }
-                    if !retry.wait(&error, emitted_output).await {
+                    let attempt = retry.attempt();
+                    if !retry.wait(&error, !progress.item_keys.is_empty()).await {
                         return Err(error.error);
                     }
-                    if emitted_output {
+                    self.send(
+                        "attempt_discarded",
+                        discarded_attempt(kind, model_call_index, attempt, &error, &progress),
+                    )
+                    .await?;
+                    if !progress.item_keys.is_empty() {
                         presentation += 1;
                     }
                 }
@@ -598,7 +608,7 @@ impl GatewayRoute {
         model_call_index: u32,
         presentation: u32,
         started: Instant,
-        emitted_output: &mut bool,
+        progress: &mut Progress,
     ) -> Result<(ResponsesOutput, Vec<Value>), Failure> {
         let compacting = matches!(kind, ResponsesAttemptKind::Compaction);
         let response = self.response(body).await?;
@@ -635,7 +645,6 @@ impl GatewayRoute {
         let mut first_event = None;
         let mut first_output = None;
         let mut pipeline = ResponsePipelineStats::default();
-        let mut output = OutputBound::default();
         while let Some(frame) = stream.next().await {
             let frame = frame.map_err(|error| match error {
                 EventStreamError::Transport(error)
@@ -665,15 +674,11 @@ impl GatewayRoute {
                     let text = event["delta"]
                         .as_str()
                         .ok_or_else(|| failure("invalid gateway text delta"))?;
-                    output.stream(text)?;
-                    self.emit(
-                        "assistant_delta",
-                        text,
-                        &item_key(model_call_index, output_index(&event)?, presentation),
-                        response_id.as_deref(),
-                    )
-                    .await?;
-                    *emitted_output = true;
+                    progress.stream(text)?;
+                    let key = item_key(model_call_index, output_index(&event)?, presentation);
+                    self.emit("assistant_delta", text, &key, response_id.as_deref())
+                        .await?;
+                    progress.item_keys.insert(key);
                 }
                 Some(
                     "response.reasoning_summary_text.delta" | "response.reasoning_summary.delta",
@@ -682,30 +687,30 @@ impl GatewayRoute {
                     let text = event["delta"]
                         .as_str()
                         .ok_or_else(|| failure("invalid gateway reasoning delta"))?;
-                    output.stream(text)?;
-                    self.emit(
-                        "reasoning_delta",
-                        text,
-                        &item_key(model_call_index, output_index(&event)?, presentation),
-                        response_id.as_deref(),
-                    )
-                    .await?;
-                    *emitted_output = true;
+                    progress.stream(text)?;
+                    let key = item_key(model_call_index, output_index(&event)?, presentation);
+                    self.emit("reasoning_delta", text, &key, response_id.as_deref())
+                        .await?;
+                    progress.item_keys.insert(key);
                 }
                 Some("response.output_item.done") => {
-                    output.retain(frame.data.len())?;
+                    progress.retain(frame.data.len())?;
                     let index = output_index(&event)?;
                     let item = event["item"].clone();
                     first_output.get_or_insert_with(|| elapsed(started));
                     if !compacting {
-                        *emitted_output |= self
+                        let key = item_key(model_call_index, index, presentation);
+                        if self
                             .emit_message(
                                 &item,
                                 &mut emitted_messages,
-                                &item_key(model_call_index, index, presentation),
+                                &key,
                                 response_id.as_deref(),
                             )
-                            .await?;
+                            .await?
+                        {
+                            progress.item_keys.insert(key);
+                        }
                     }
                     done_items.insert(index, item);
                 }
@@ -723,14 +728,18 @@ impl GatewayRoute {
                     }
                     if !compacting && let Some(items) = response["output"].as_array() {
                         for (index, item) in items.iter().enumerate() {
-                            *emitted_output |= self
+                            let key = item_key(model_call_index, index, presentation);
+                            if self
                                 .emit_message(
                                     item,
                                     &mut emitted_messages,
-                                    &item_key(model_call_index, index, presentation),
+                                    &key,
                                     response_id.as_deref(),
                                 )
-                                .await?;
+                                .await?
+                            {
+                                progress.item_keys.insert(key);
+                            }
                         }
                     }
                     let committed_output =
@@ -946,13 +955,16 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 /// bound.
 const MAX_EVENT_BYTES: usize = 2 * MAX_OUTPUT_BYTES;
 
+/// What one attempt delivered: the presentation keys of the items it
+/// published and the output content it streamed and retained.
 #[derive(Default)]
-struct OutputBound {
+struct Progress {
+    item_keys: BTreeSet<String>,
     streamed: usize,
     retained: usize,
 }
 
-impl OutputBound {
+impl Progress {
     fn stream(&mut self, text: &str) -> Result<(), ResponseError> {
         self.streamed += text.len();
         Self::check(self.streamed)
@@ -969,6 +981,43 @@ impl OutputBound {
         }
         Ok(())
     }
+}
+
+/// Describes a failed attempt that is retried, discarding whatever it
+/// delivered: the items it published, the content it streamed, why it failed,
+/// and the provider's usage for it when the failure reported any.
+fn discarded_attempt(
+    kind: ResponsesAttemptKind,
+    model_call_index: u32,
+    attempt: u32,
+    failure: &Failure,
+    progress: &Progress,
+) -> Value {
+    let mut data = json!({
+        "kind": if matches!(kind, ResponsesAttemptKind::Compaction) { "compaction" } else { "generation" },
+        "modelCallIndex": model_call_index,
+        "attempt": attempt,
+        "itemKeys": progress.item_keys,
+        "streamedBytes": progress.streamed,
+    });
+    if let Some(error) = failure
+        .error
+        .source()
+        .and_then(|source| source.downcast_ref::<SessionError>())
+    {
+        data["code"] = json!(error.code);
+        data["message"] = json!(error.message);
+        if let Some(status) = error.status_code {
+            data["statusCode"] = json!(status);
+        }
+        if let Some(code) = &error.provider_code {
+            data["providerCode"] = json!(code);
+        }
+    }
+    if let Some(usage) = &failure.usage {
+        data["usage"] = usage.clone();
+    }
+    data
 }
 
 #[derive(Default)]

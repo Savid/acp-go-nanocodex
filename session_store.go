@@ -2,7 +2,6 @@ package nanocodexacp
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
@@ -50,33 +50,24 @@ func updatedAtMilli(value string) int64 {
 }
 
 // commitMirror publishes the native rows appended since the last commit with
-// the current configuration. The update time advances only when the rows or
-// the rest of the record changed, so an unchanged session writes nothing.
-func (s *session) commitMirror(ctx context.Context) (err error) {
+// the current configuration. The mirror reads only the rows after its
+// committed position; the record carries the update time of the session's
+// last turn or configuration change, so a commit that adds nothing writes
+// nothing.
+func (s *session) commitMirror(ctx context.Context) error { return s.commit(ctx, false) }
+
+// commit is commitMirror for a caller that may already hold the native
+// session lock.
+func (s *session) commit(ctx context.Context, sessionLocked bool) (err error) {
 	s.mu.Lock()
 	state := s.state
 	home := s.home
 	binding := s.binding
-	options := s.options.clone()
-	title := s.title
-	cursor := s.cursor
-	nativeRows := s.nativeRows
-	updatedAt := s.updatedAt
-	recordDigest := s.recordDigest
-
-	var cost *float64
-	if s.cost != nil {
-		cost = new(*s.cost)
-	}
-
 	rt := s.rt
 	s.mu.Unlock()
 
 	if binding != nil {
 		s.mirror.Reset()
-
-		cursor = sessionlog.Cursor{}
-		nativeRows = 0
 
 		defer func() {
 			if err != nil {
@@ -85,21 +76,26 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 		}()
 	}
 
-	if state.NativeSessionID == "" {
+	if state.NativeSessionID == "" || s.ephemeral {
+		s.mu.Lock()
+		s.binding = nil
+		s.mu.Unlock()
+
 		return nil
 	}
 
-	limit, unlock, err := lockRollout(home, state, rt)
+	limit, unlock, err := lockRollout(home, state, rt, sessionLocked)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	if !s.mirror.Committed() {
-		cursor = sessionlog.Cursor{}
+	rel, err := nanocodex.RolloutRelative(home, state.RolloutPath)
+	if err != nil {
+		return err
 	}
 
-	read := func(from sessionlog.Cursor) (sessionlog.Tail, error) {
+	source := func(from sessionlog.Cursor) (sessionlog.Tail, error) {
 		tail, readErr := nanocodex.ReadRows(home, state.RolloutPath, from, limit)
 		if readErr != nil {
 			return sessionlog.Tail{}, readErr
@@ -112,78 +108,55 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 		return tail, nanocodex.ValidateTail(tail.Rows)
 	}
 
-	tail, err := read(cursor)
-	if err != nil {
-		return err
-	}
+	var (
+		checkpoint json.RawMessage
+		stamp      nanocodex.CheckpointStamp
+	)
 
-	rows := nativeRows + len(tail.Rows)
-	if tail.Full {
-		rows = len(tail.Rows)
-	}
+	// The checkpoint is read after the rows, so the record describes them. A
+	// conversation is started once its rollout holds more than its header.
+	record := func(tail sessionlog.Tail) (any, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	rel, err := nanocodex.RolloutRelative(home, state.RolloutPath)
-	if err != nil {
-		return err
-	}
-
-	checkpoint, checkpointErr := nanocodex.ReadCheckpoint(home, state.RolloutPath)
-	if checkpointErr != nil {
-		s.agent.log.WarnContext(ctx, "native checkpoint unavailable; mirroring native history")
-	}
-
-	started := rows != 1
-	record := sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: options, Title: title, Started: started, UpdatedAtUnixMilli: updatedAtMilli(updatedAt), CostUSD: cost}
-
-	digest, err := digestRecord(record)
-	if err != nil {
-		return err
-	}
-
-	if rows != nativeRows || digest != recordDigest {
-		now := time.Now()
-		updatedAt = formatUpdatedAt(now)
-		record.UpdatedAtUnixMilli = now.UnixMilli()
-
-		if digest, err = digestRecord(record); err != nil {
-			return err
-		}
-	}
-
-	if !s.ephemeral {
-		// A Full tail serves any cursor; the mirror reads the whole history
-		// again only when its cursor is not the one the tail continued from.
-		source := func(from sessionlog.Cursor) (sessionlog.Tail, error) {
-			if tail.Full || from == cursor {
-				return tail, nil
-			}
-
-			reread, readErr := read(sessionlog.Cursor{})
-			if readErr == nil {
-				tail = reread
-				rows = len(reread.Rows)
-			}
-
-			return reread, readErr
+		if tail.Full {
+			s.started = s.started || len(tail.Rows) != 1
+		} else {
+			s.started = s.started || len(tail.Rows) > 0
 		}
 
-		storeCtx, finish := s.agent.observe.StartSessionStore(ctx, "commit")
-		err = s.mirror.Commit(storeCtx, source, record)
-		finish(err)
+		data, current, changed, readErr := nanocodex.ReadCheckpoint(home, state.RolloutPath, s.checkpointStamp)
+		checkpoint, stamp = s.checkpoint, current
 
-		if err != nil {
-			return err
+		switch {
+		case readErr != nil:
+			s.agent.log.WarnContext(ctx, "native checkpoint unavailable; mirroring native history")
+
+			checkpoint = nil
+		case changed:
+			checkpoint = data
 		}
+
+		var cost *float64
+		if s.cost != nil {
+			cost = new(*s.cost)
+		}
+
+		return sessionRecord{Checkpoint: checkpoint, SessionID: string(s.id), NativeSessionID: state.NativeSessionID, Cwd: s.cwd, RolloutRelative: rel, Options: s.options.clone(), Title: s.title, Started: s.started, UpdatedAtUnixMilli: updatedAtMilli(s.updatedAt), CostUSD: cost}, nil
+	}
+
+	storeCtx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
+	err = s.mirror.Commit(storeCtx, source, record)
+	finish(err)
+
+	if err != nil {
+		return err
 	}
 
 	s.mu.Lock()
-	s.cursor = tail.Next
-	s.nativeRows = rows
-	s.recordDigest = digest
 	s.checkpoint = checkpoint
+	s.checkpointStamp = stamp
 	s.binding = nil
-	s.started = started
-	s.updatedAt = updatedAt
 	s.mu.Unlock()
 
 	return nil
@@ -191,9 +164,9 @@ func (s *session) commitMirror(ctx context.Context) (err error) {
 
 // lockRollout returns the byte boundary a commit may read: the helper's
 // committed bytes while it runs, else the whole rollout. A stopped rollout is
-// read under the native session and writer locks after its final record is
-// settled.
-func lockRollout(home string, state nanocodex.State, rt *runtime) (int64, func(), error) {
+// read under the writer lock, and the native session lock unless the caller
+// holds it, after its final record is settled.
+func lockRollout(home string, state nanocodex.State, rt *runtime, sessionLocked bool) (int64, func(), error) {
 	limit := state.CommittedBytes
 	if rt == nil {
 		limit = -1
@@ -218,7 +191,7 @@ func lockRollout(home string, state nanocodex.State, rt *runtime) (int64, func()
 	}
 
 	names := []string{state.NativeSessionID + ".writer.lock"}
-	if rt == nil || len(rt.locks) == 0 || rt.locksReleased.Load() {
+	if !sessionLocked && (rt == nil || len(rt.locks) == 0 || rt.locksReleased.Load()) {
 		names = []string{state.NativeSessionID + ".lock", state.NativeSessionID + ".writer.lock"}
 	}
 
@@ -242,19 +215,14 @@ func lockRollout(home string, state nanocodex.State, rt *runtime) (int64, func()
 	return limit, unlock, nil
 }
 
-func digestRecord(record sessionRecord) ([sha256.Size]byte, error) {
-	encoded, err := json.Marshal(record)
-	if err != nil {
-		return [sha256.Size]byte{}, err
-	}
-
-	return sha256.Sum256(encoded), nil
-}
-
 var errInvalidStoredSession = errors.New("invalid stored session")
 
+// storeLoadError marks a failure of the store itself. sessionlog reports a
+// failed store read and an undecodable generation alike; a store outage is an
+// internal failure, never a refused restore or a session listing skips.
 type storeLoadError struct{ error }
 
+// storeLoadBoundary tags the store's own Load failures as storeLoadError.
 type storeLoadBoundary struct{ acpcore.SessionStore }
 
 func (s storeLoadBoundary) Load(ctx context.Context, id string) (map[string][]acpcore.SessionStoreEntry, error) {
@@ -377,9 +345,11 @@ func (s *session) hydrate(ctx context.Context, stored *storedSession) error {
 		return wire.RestoreFailed(vendor)
 	}
 
+	// Native rows newer than the store keep the native checkpoint, which the
+	// next commit reads; otherwise the stored checkpoint is restored.
 	checkpoint := stored.record.Checkpoint
 	if len(rows) > storedRows {
-		checkpoint, _ = nanocodex.ReadCheckpoint(s.home, path)
+		checkpoint = nil
 	} else if err := nanocodex.WriteCheckpoint(s.home, path, checkpoint); err != nil {
 		s.agent.log.WarnContext(ctx, "native checkpoint unavailable; restoring native history")
 	}
@@ -388,8 +358,7 @@ func (s *session) hydrate(ctx context.Context, stored *storedSession) error {
 	s.state.NativeSessionID = stored.record.NativeSessionID
 	s.state.RolloutPath = path
 	s.checkpoint = checkpoint
-	s.nativeRows = len(rows)
-	s.cursor = sessionlog.Cursor{}
+	s.checkpointStamp = nanocodex.CheckpointStamp{}
 	s.started = len(rows) != 1
 	s.title = stored.record.Title
 	s.mu.Unlock()
@@ -398,52 +367,35 @@ func (s *session) hydrate(ctx context.Context, stored *storedSession) error {
 }
 
 // ensureNative keeps the native rollout of a committed session before a
-// helper launch and returns how many rows it holds. A rollout that still
-// extends the committed rows is used as it is; one that was removed,
-// truncated, or rewritten is hydrated again from the store.
-func (s *session) ensureNative(ctx context.Context) (int, error) {
+// helper launch, while the session still holds its committed configuration.
+// Committing adopts native rows that extend the store; a rollout that was
+// removed, truncated, or no longer agrees is hydrated again from the store.
+func (s *session) ensureNative(ctx context.Context) error {
 	s.mu.Lock()
 	state := s.state
-	cursor := s.cursor
-	committed := s.nativeRows
+	skip := state.NativeSessionID == "" || s.ephemeral || s.pending != nil
 	s.mu.Unlock()
 
-	lock, err := process.LockFile(filepath.Join(s.home, "nanocodex", "acp-locks", state.NativeSessionID+".writer.lock"))
-	if err != nil {
-		return 0, wire.RestoreFailed(vendor)
+	if skip {
+		return nil
 	}
 
-	if err = nanocodex.RepairTail(s.home, state.RolloutPath); err == nil && cursor.Offset() > 0 {
-		var tail sessionlog.Tail
-
-		tail, err = nanocodex.ReadRows(s.home, state.RolloutPath, cursor, -1)
-		if err == nil && !tail.Full {
-			_ = lock.Close()
-
-			if validateErr := nanocodex.ValidateTail(tail.Rows); validateErr != nil {
-				return 0, wire.RestoreFailed(vendor)
-			}
-
-			return committed + len(tail.Rows), nil
-		}
-	}
-
-	_ = lock.Close()
-
+	lock, err := process.LockFile(filepath.Join(s.home, "nanocodex", "acp-locks", state.NativeSessionID+".lock"))
 	if err != nil {
-		return 0, wire.RestoreFailed(vendor)
+		return wire.RestoreFailed(vendor)
+	}
+	defer lock.Close()
+
+	if s.commit(ctx, true) == nil {
+		return nil
 	}
 
 	stored, err := s.agent.loadStored(ctx, s.id)
 	if err != nil || !stored.found || stored.record.NativeSessionID != state.NativeSessionID || filepath.Join(s.home, stored.record.RolloutRelative) != state.RolloutPath {
-		return 0, wire.RestoreFailed(vendor)
+		return wire.RestoreFailed(vendor)
 	}
 
-	if err := s.hydrate(ctx, &stored); err != nil {
-		return 0, err
-	}
-
-	return s.nativeRows, nil
+	return s.hydrate(ctx, &stored)
 }
 
 // LoadSession restores native state and replays the conversation to the client.

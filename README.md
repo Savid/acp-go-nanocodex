@@ -132,7 +132,7 @@ it with `NewNanocodexOptions`, then attach it using
 |---|---|---|
 | `model` | `WithNanocodexModel` | Native model ID, or a gateway model ID on a configured gateway route. |
 | `baseModel` | `WithNanocodexBaseModel` | Native model whose settings a [gateway model](PROVIDERS.md#gateway-models) uses. |
-| `maxOutputTokens` | `WithNanocodexMaxOutputTokens` | Output-token bound of each gateway generation response, including reasoning; default 32768. Native routes refuse it. |
+| `maxOutputTokens` | `WithNanocodexMaxOutputTokens` | Output-token bound of each gateway generation response, including reasoning; unset sends no bound. Native routes refuse it. |
 | `contextWindow` | `WithNanocodexContextWindow` | Token window for usage reporting and context management; see [gateway models](PROVIDERS.md#gateway-models). |
 | `thinking` | `WithNanocodexEffort` | Native reasoning effort; the `thought_level` config option selects the same value. |
 | `env` | `WithNanocodexEnv` | Session environment overlay. |
@@ -219,15 +219,17 @@ mirror.
 The adapter keeps no copy of the rollout in memory. Each commit reads only the
 records appended after the last committed byte offset and appends them to the
 store with the configuration record. The configuration record is replaced only
-when it changed, and its timestamp advances only when the rows or the rest of
-the record changed, so an unchanged session writes nothing. A rollout that was
-rewritten or truncated before the committed offset is republished whole.
-Before each helper launch, a rollout that no longer extends the committed
-records is hydrated again from the store. `session/list` reads configuration
+when it changed. Its timestamp is the session's last accepted turn or
+configuration change, and the checkpoint file is read again only when its
+identity, size, or modification time changed, so an unchanged session writes
+nothing. A rollout that was rewritten or truncated before the committed offset
+is republished whole. Before a prompt or configuration change, native rows that
+extend the store are committed, and a rollout that no longer extends the
+committed records is hydrated again from the store. `session/list` reads configuration
 records only. Load replay streams the committed rollout one record at a time.
 Only newline-terminated records are mirrored. While the helper is stopped and
 its writer lock is held, a final record without its newline receives one when
-it is complete JSON and is removed otherwise.
+it is a complete JSON object of any length and is removed otherwise.
 
 After a prompt, the helper stops the native writer and atomically saves the latest
 optional snapshot checkpoint in `<rollout>.acp-checkpoint.json`. The store mirrors
@@ -317,7 +319,13 @@ and policy codes fail immediately, as do incomplete responses stopped by
 `max_output_tokens` or `content_filter`. An attempt that fails after
 delivering assistant or reasoning output retries at most twice per model call;
 the retried response is presented as new text after the discarded partial
-text. Valid `Retry-After`
+text. Every retried attempt is published as
+`_meta.nanocodex.attemptDiscarded` on an otherwise empty
+`session_info_update`: `{kind, modelCallIndex, attempt, itemKeys,
+streamedBytes, code?, message?, statusCode?, providerCode?, usage?}`, where
+`usage` is the provider's report for the failed response in ACP usage fields.
+That usage is added to the prompt response's `usage`; a stream that ends
+without a report contributes only its `streamedBytes`. Valid `Retry-After`
 and `retry-after-ms` delays up to 60 seconds are respected with the normal
 backoff as a minimum; longer delays fail without retrying early. Each failed
 attempt writes one redacted line to helper stderr. Turn errors carry the
@@ -331,8 +339,7 @@ prompts resume the saved conversation in a new helper.
 Prompt parameters are limited to 12 MiB of encoded JSON before admission; a
 larger prompt is refused as unsupported `prompt`.
 Gateway responses require `text/event-stream`; each event is limited to 8 MiB,
-and a response's streamed or retained output content to 4 MiB. These limits leave room for
-native event envelopes. Compacted native rows can contain an entire history and
+and a response's streamed delta text, or its completed-item events, to 4 MiB. Compacted native rows can contain an entire history and
 are not limited to the helper's 32 MiB protocol frame size.
 Image tool outputs are not projected as ACP images.
 

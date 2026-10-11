@@ -114,9 +114,9 @@ func ReadRows(home, path string, from sessionlog.Cursor, limit int64) (sessionlo
 	return tail, nil
 }
 
-// EachRow streams the non-empty records in the first limit bytes of the
-// rollout to fn, one at a time.
-func EachRow(home, path string, limit int64, fn func(row []byte) error) error {
+// EachRow streams the complete non-empty records of the rollout to fn, one
+// at a time; an unterminated final record is not complete and is skipped.
+func EachRow(home, path string, fn func(row []byte) error) error {
 	file, err := openRollout(home, path, os.O_RDONLY)
 	if err != nil {
 		return err
@@ -125,11 +125,11 @@ func EachRow(home, path string, limit int64, fn func(row []byte) error) error {
 	defer file.Close()
 
 	// Compacted rows carry whole histories, so records have no length bound.
-	reader := wire.NewLineReader(io.LimitReader(file, limit), math.MaxInt)
+	reader := wire.NewLineReader(file, math.MaxInt)
 
 	for {
 		row, readErr := reader.Next()
-		if errors.Is(readErr, io.EOF) {
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 			return nil
 		}
 
@@ -148,8 +148,8 @@ func EachRow(home, path string, limit int64, fn func(row []byte) error) error {
 }
 
 // RepairTail settles an unterminated final record of a stopped rollout while
-// the caller holds its writer lock: a complete JSON record receives its
-// newline and an invalid fragment is removed. It creates the rollout's
+// the caller holds its writer lock: a complete JSON object of any length
+// receives its newline and any other fragment is removed. It creates the rollout's
 // directory beneath home so a later publish cannot leave it.
 func RepairTail(home, path string) error {
 	rel, err := RolloutRelative(home, path)
@@ -189,15 +189,15 @@ func RepairTail(home, path string) error {
 		return err
 	}
 
-	fragment, err := unterminatedTail(file, info.Size())
-	if err != nil || len(fragment) == 0 {
+	start, err := lastLineEnd(file, info.Size())
+	if err != nil || start == info.Size() {
 		return err
 	}
 
-	if trimmed := bytes.TrimSpace(fragment); len(trimmed) > 0 && trimmed[0] == '{' && json.Valid(trimmed) {
+	if completeRecord(io.NewSectionReader(file, start, info.Size()-start)) {
 		_, err = file.WriteAt([]byte{'\n'}, info.Size())
 	} else {
-		err = file.Truncate(info.Size() - int64(len(fragment)))
+		err = file.Truncate(start)
 	}
 
 	if err != nil {
@@ -207,34 +207,58 @@ func RepairTail(home, path string) error {
 	return file.Sync()
 }
 
-// unterminatedTail returns the bytes after the last newline of a file of
-// size bytes. A fragment longer than a protocol frame is refused.
-func unterminatedTail(file *os.File, size int64) ([]byte, error) {
-	const chunk = 64 << 10
-
-	var fragment []byte
+// lastLineEnd returns the offset after the last newline of a file of size
+// bytes, or zero when it has none. It scans backwards one block at a time, so
+// a long final record is never held in memory.
+func lastLineEnd(file *os.File, size int64) (int64, error) {
+	block := make([]byte, 64<<10)
 
 	for end := size; end > 0; {
-		start := max(end-chunk, 0)
-		block := make([]byte, end-start)
+		start := max(end-int64(len(block)), 0)
+		chunk := block[:end-start]
 
-		if _, err := file.ReadAt(block, start); err != nil && !errors.Is(err, io.EOF) {
-			return nil, err
+		if _, err := file.ReadAt(chunk, start); err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
 		}
 
-		if index := bytes.LastIndexByte(block, '\n'); index >= 0 {
-			return append(block[index+1:], fragment...), nil
-		}
-
-		fragment = append(block, fragment...)
-		if len(fragment) > MaxFrameBytes {
-			return nil, errors.New("native rollout row exceeds limit")
+		if index := bytes.LastIndexByte(chunk, '\n'); index >= 0 {
+			return start + int64(index) + 1, nil
 		}
 
 		end = start
 	}
 
-	return fragment, nil
+	return 0, nil
+}
+
+// completeRecord reports whether r holds exactly one JSON object and
+// whitespace. It decodes token by token, so a compacted record of any size is
+// checked without being held whole.
+func completeRecord(r io.Reader) bool {
+	decoder := json.NewDecoder(r)
+
+	token, err := decoder.Token()
+	if delimiter, ok := token.(json.Delim); err != nil || !ok || delimiter != '{' {
+		return false
+	}
+
+	for depth := 1; depth > 0; {
+		token, err = decoder.Token()
+		if err != nil {
+			return false
+		}
+
+		switch token {
+		case json.Delim('{'), json.Delim('['):
+			depth++
+		case json.Delim('}'), json.Delim(']'):
+			depth--
+		}
+	}
+
+	_, err = decoder.Token()
+
+	return errors.Is(err, io.EOF)
 }
 
 // ValidSessionID requires the canonical UUID spelling used by native rollouts.

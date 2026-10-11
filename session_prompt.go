@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/image"
@@ -18,20 +19,22 @@ import (
 )
 
 type turn struct {
-	done           chan struct{}
-	cancelled      atomic.Bool
-	cancelOnce     sync.Once
-	abortOnce      sync.Once
-	accepted       atomic.Bool
-	submission     lifecycle.Submission
-	cycle          lifecycle.Cycle
-	response       acp.PromptResponse
-	err            error
-	cleanupErr     error
-	texts          wire.StreamedText
-	hasText        bool
-	nativeSeq      uint64
-	compactions    wire.Compactions
+	done        chan struct{}
+	cancelled   atomic.Bool
+	cancelOnce  sync.Once
+	abortOnce   sync.Once
+	accepted    atomic.Bool
+	submission  lifecycle.Submission
+	cycle       lifecycle.Cycle
+	response    acp.PromptResponse
+	err         error
+	cleanupErr  error
+	texts       wire.StreamedText
+	hasText     bool
+	nativeSeq   uint64
+	compactions wire.Compactions
+	// discardedUsage sums the reported usage of retried gateway attempts.
+	discardedUsage *acp.Usage
 	compactionKeys map[string]string
 }
 
@@ -184,6 +187,10 @@ func (s *session) mapPrompt(ctx context.Context, blocks []acp.ContentBlock) ([]n
 }
 
 func (s *session) runPrompt(ctx context.Context, p acp.PromptRequest, content []nanocodex.Content, t *turn) (resp acp.PromptResponse, err error) {
+	if nativeErr := s.ensureNative(ctx); nativeErr != nil {
+		return resp, nativeErr
+	}
+
 	rt, err := s.launch(ctx)
 	if err != nil {
 		return resp, nativeLaunchError(err, nil)
@@ -259,6 +266,8 @@ func (s *session) runPrompt(ctx context.Context, p acp.PromptRequest, content []
 		s.mu.Lock()
 
 		s.started = true
+		s.updatedAt = formatUpdatedAt(time.Now())
+
 		if s.title == "" {
 			s.title = wire.PromptTitle(p.Prompt)
 		}
@@ -298,6 +307,8 @@ func (s *session) runPrompt(ctx context.Context, p acp.PromptRequest, content []
 		resp.Usage = promptUsage(*result.Usage)
 	}
 
+	resp.Usage = addUsage(resp.Usage, t.discardedUsage)
+
 	if t.accepted.Load() {
 		if idleErr := s.lc.Idle(ctx, t.cycle, string(resp.StopReason), outcome); idleErr != nil {
 			return acp.PromptResponse{}, wire.InternalFailure(vendor, "lifecycle")
@@ -334,6 +345,11 @@ func (s *session) promptEvent(ctx context.Context, t *turn, frame nanocodex.Fram
 	// A billed call counts even when it precedes acceptance or follows a cancel.
 	if frame.Event == "call_cost" {
 		return s.callCost(ctx, frame.Data)
+	}
+
+	// A retried attempt costs as much before acceptance as after it.
+	if frame.Event == "attempt_discarded" {
+		return s.attemptDiscarded(ctx, t, frame.Data)
 	}
 
 	if frame.Event == "accepted" {

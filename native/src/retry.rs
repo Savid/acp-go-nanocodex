@@ -102,6 +102,8 @@ fn summary(origin: String, provider_code: Option<&str>) -> String {
 
 pub struct Failure {
     pub error: ResponseError,
+    /// The provider's usage for the failed response, when it reported one.
+    pub usage: Option<Value>,
     retryable: bool,
     retry_after: Option<Duration>,
     /// Redacted attempt details for stderr: status, event type, and code.
@@ -112,6 +114,7 @@ impl From<ResponseError> for Failure {
     fn from(error: ResponseError) -> Self {
         Self {
             error,
+            usage: None,
             retryable: false,
             retry_after: None,
             summary: String::new(),
@@ -171,6 +174,7 @@ impl Failure {
         Self {
             summary: summary(format!(" status={status}"), error.provider_code.as_deref()),
             error: ResponseError::service(error.with_provider_source()),
+            usage: None,
             retryable,
             retry_after,
         }
@@ -201,6 +205,9 @@ impl Failure {
             summary: summary(format!(" event={kind}"), error.provider_code.as_deref()),
             retryable: !error.provider_code.as_deref().is_some_and(is_terminal),
             error: ResponseError::service(error.with_provider_source()),
+            usage: event["response"]["usage"]
+                .is_object()
+                .then(|| event["response"]["usage"].clone()),
             retry_after: error_object(event)
                 .unwrap_or(event)
                 .get("retry_after")
@@ -249,6 +256,11 @@ impl Retry {
             attempt: 1,
             discarded: 0,
         }
+    }
+
+    /// The number of the attempt in progress, starting at 1.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
     }
 
     /// Returns the delay before the next attempt, or why there is none. An

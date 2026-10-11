@@ -278,10 +278,6 @@ pub struct Session {
     _writer_locks: Vec<File>,
 }
 
-/// The output bound of a gateway generation response without a configured
-/// `maxOutputTokens`.
-const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32_768;
-
 fn context_window(model: Model) -> u64 {
     nanocodex::oai::tower::ResponsesServiceConfig::default()
         .context_window_tokens
@@ -647,9 +643,7 @@ impl Session {
                         .model_id_prefix
                         .as_ref()
                         .map(|prefix| prefix.trim().to_owned()),
-                    max_output_tokens: config
-                        .max_output_tokens
-                        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
+                    max_output_tokens: config.max_output_tokens,
                 })
             } else {
                 None

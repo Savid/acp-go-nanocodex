@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/wire"
@@ -82,10 +83,14 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		return acp.SetSessionConfigOptionResponse{}, openErr
 	}
 
+	if nativeErr := s.ensureNative(ctx); nativeErr != nil {
+		return acp.SetSessionConfigOptionResponse{}, nativeErr
+	}
+
 	s.mu.Lock()
 	previousOptions := s.options.clone()
 	previousState := s.state
-	previousCursor, previousRows := s.cursor, s.nativeRows
+	previousUpdatedAt := s.updatedAt
 	candidate := s.options.clone()
 	value := string(p.Value)
 
@@ -117,13 +122,14 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	}
 
 	s.options = candidate
+	s.updatedAt = formatUpdatedAt(time.Now())
 	s.mu.Unlock()
 
 	rollback := func() {
 		s.mu.Lock()
 		s.options = previousOptions
 		s.state = previousState
-		s.cursor, s.nativeRows = previousCursor, previousRows
+		s.updatedAt = previousUpdatedAt
 		s.binding = nil
 		s.mu.Unlock()
 	}

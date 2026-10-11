@@ -118,22 +118,22 @@ func TestRepairTailCreatesTheRolloutDirectoryInsideHome(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
-func TestEachRowStreamsCommittedRecords(t *testing.T) {
+func TestEachRowStreamsCompleteRecords(t *testing.T) {
 	t.Parallel()
 
 	home, path := rolloutFixture(t)
 	header := rolloutHeader(rolloutSessionID)
 	committed := append(bytes.Clone(header), "\n\n"...)
-	require.NoError(t, os.WriteFile(path, append(bytes.Clone(committed), `{"later":true}`+"\n"...), 0o600))
+	require.NoError(t, os.WriteFile(path, append(bytes.Clone(committed), `{"torn":`...), 0o600))
 
 	var rows [][]byte
-	require.NoError(t, EachRow(home, path, int64(len(committed)), func(row []byte) error {
+	require.NoError(t, EachRow(home, path, func(row []byte) error {
 		rows = append(rows, row)
 
 		return nil
 	}))
 	require.Equal(t, [][]byte{header}, rows)
-	require.Error(t, EachRow(home, filepath.Join(filepath.Dir(path), "missing.jsonl"), 1, func([]byte) error { return nil }))
+	require.Error(t, EachRow(home, filepath.Join(filepath.Dir(path), "missing.jsonl"), func([]byte) error { return nil }))
 }
 
 func TestReadRowsRefusesEscapesAndNonRegularFiles(t *testing.T) {
@@ -184,15 +184,30 @@ func TestReadRowsRefusesEscapesAndNonRegularFiles(t *testing.T) {
 	})
 }
 
-func TestRepairTailBoundsUnterminatedRecord(t *testing.T) {
+func TestRepairTailSettlesRecordsBeyondTheFrameBound(t *testing.T) {
 	t.Parallel()
 
-	home, path := rolloutFixture(t)
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
-	require.NoError(t, err)
-	require.NoError(t, file.Truncate(MaxFrameBytes+1))
-	require.NoError(t, file.Close())
-	require.ErrorContains(t, RepairTail(home, path), "row exceeds limit")
+	header := append(rolloutHeader(rolloutSessionID), '\n')
+	large := []byte(`{"type":"compacted","payload":{"replacement_history":[{"text":"` + strings.Repeat("x", MaxFrameBytes) + `"}]}}`)
+	for _, test := range []struct {
+		name     string
+		fragment []byte
+		want     []byte
+	}{
+		{name: "complete", fragment: large, want: append(append(bytes.Clone(header), large...), '\n')},
+		{name: "torn", fragment: large[:len(large)-2], want: header},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			home, path := rolloutFixture(t)
+			require.NoError(t, os.WriteFile(path, append(bytes.Clone(header), test.fragment...), 0o600))
+			require.NoError(t, RepairTail(home, path))
+			actual, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.True(t, bytes.Equal(test.want, actual))
+		})
+	}
 }
 
 func TestValidateRowsRequiresCanonicalIdentity(t *testing.T) {
@@ -234,7 +249,7 @@ func TestCompactedHistoryCanExceedProtocolFrameLimit(t *testing.T) {
 	require.Equal(t, [][]byte{row}, tail.Rows)
 
 	var streamed [][]byte
-	require.NoError(t, EachRow(home, path, int64(len(row)+1), func(row []byte) error {
+	require.NoError(t, EachRow(home, path, func(row []byte) error {
 		streamed = append(streamed, row)
 
 		return nil

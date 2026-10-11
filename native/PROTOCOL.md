@@ -73,11 +73,12 @@ Gateway requests omit `prompt_cache_key` and carry the adapter's `User-Agent`.
 Only requests to `https://opencode.ai/zen/go/v1` carry the native conversation ID as
 `x-opencode-session`, including after a helper restart. Each SSE event is
 limited to 8 MiB before parsing. A response's output content is limited to
-4 MiB, counted separately for the text and reasoning deltas it streams and for
-the completed output items it returns; event envelopes do not count. Exceeding
-it fails as `transport_error` with `gateway response output exceeds 4 MiB`.
-Generation requests carry `max_output_tokens`, the session's `maxOutputTokens`
-or 32768. Successful HTTP responses require `text/event-stream`.
+4 MiB, counted separately as the bytes of the text and reasoning deltas it
+streams and as the data of the `response.output_item.done` events it receives,
+envelope included; other events do not count. Exceeding it fails as
+`transport_error` with `gateway response output exceeds 4 MiB`. Generation
+requests carry `max_output_tokens` only when the session sets
+`maxOutputTokens`. Successful HTTP responses require `text/event-stream`.
 Non-SSE success responses fail without retrying. Incomplete events never reach
 native tools.
 
@@ -148,7 +149,13 @@ event type, `providerCode`, and whether it retries or why it stops.
 A generation attempt that fails after delivering assistant or reasoning output
 retries under the same rules, discarding that output, at most twice per model
 call; the stderr line says it discards partial output. A retry cannot execute
-tools from an incomplete response. Cancellation interrupts both
+tools from an incomplete response. Before each retry the helper sends an
+`attempt_discarded` event with `data: {kind, modelCallIndex, attempt, itemKeys,
+streamedBytes, code?, message?, statusCode?, providerCode?, usage?}`: whether
+the attempt was a generation or compaction summary, the failed attempt number,
+the item keys it had delivered, the bytes of text and reasoning it streamed,
+the fixed error classification, and the provider's `usage` object when the
+failure reported one. It may precede `accepted` for compaction. Cancellation interrupts both
 requests and retry delays.
 
 ## Methods
@@ -175,8 +182,8 @@ requests and retry delays.
   or base model's maximum; without it the window is 272000 or that smaller
   maximum. Resume accepts a changed `contextWindow`. `maxOutputTokens` is a
   positive 32-bit bound on each gateway generation response, including
-  reasoning, defaulting to 32768; native routes keep the upstream request
-  shape and refuse it as `maxOutputTokens`.
+  reasoning; without it generation requests carry no bound. Native routes keep
+  the upstream request shape and refuse it as `maxOutputTokens`.
   Explicit parameters override inherited `OPENAI_BASE_URL`,
   `NANOCODEX_MODEL_ID_PREFIX`, `NANOCODEX_TRANSPORT`, `NANOCODEX_API_KEY_ENV`,
   `NANOCODEX_BASE_MODEL`, `NANOCODEX_CONTEXT_WINDOW`, and
@@ -271,7 +278,7 @@ the candidate UUID. The helper holds `<uuid>.writer.lock` under
 shutdown. Hydration and stopped snapshots acquire that writer lock before
 accessing native files. Unrelated native consumers must honor writer exclusion.
 Native rollout files and complete records are preserved. After the helper
-exits, the adapter terminates a valid final JSON record that lacks its newline
+exits, the adapter terminates a valid final JSON object of any length that lacks its newline
 and removes an invalid unterminated fragment.
 
 The helper atomically replaces `<rollout>.acp-checkpoint.json` after a prompted

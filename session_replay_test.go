@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-nanocodex/internal/nanocodex"
 	"github.com/stretchr/testify/require"
@@ -128,10 +127,8 @@ func replaySession(t *testing.T, a *Agent, rows [][]byte) *session {
 	path := filepath.Join(home, "sessions", "replay.jsonl")
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 	require.NoError(t, os.WriteFile(path, append(bytes.Join(rows, []byte{'\n'}), '\n'), 0o600))
-	tail, err := nanocodex.ReadRows(home, path, sessionlog.Cursor{}, -1)
-	require.NoError(t, err)
 
-	return &session{agent: a, home: home, state: nanocodex.State{RolloutPath: path}, cursor: tail.Next}
+	return &session{agent: a, home: home, state: nanocodex.State{RolloutPath: path}}
 }
 
 func appendReplayItems(t *testing.T, path string, items []any) {

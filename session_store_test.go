@@ -442,7 +442,7 @@ func TestCheckpointMetadataMirrorsAndRehydratesWithoutAddingNativeRows(t *testin
 	require.NoError(t, os.Remove(path+".acp-checkpoint.json"))
 	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
 	require.NoError(t, err)
-	hydrated, err := nanocodex.ReadCheckpoint(home, path)
+	hydrated, _, _, err := nanocodex.ReadCheckpoint(home, path, nanocodex.CheckpointStamp{})
 	require.NoError(t, err)
 	require.JSONEq(t, string(checkpoint), string(hydrated))
 }
@@ -460,7 +460,7 @@ func TestStoredOptionsAreValidatedOnLoad(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	record.Options.ContextWindow = -1
-	require.NoError(t, sessionlog.NewMirror(store, string(created.SessionId)).Commit(t.Context(), sessionlog.Rows(rows), record))
+	require.NoError(t, sessionlog.NewMirror(store, string(created.SessionId)).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil }))
 	_, err = agent.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, workspace))
 	require.Equal(t, wire.RestoreFailed(vendor), err)
 }
@@ -623,7 +623,6 @@ func BenchmarkCommitMirror(b *testing.B) {
 
 				if mode == "full" {
 					s.mirror.Reset()
-					s.cursor = sessionlog.Cursor{}
 				}
 				b.StartTimer()
 

@@ -2054,6 +2054,15 @@ async fn gateway_retries_after_publishing_output_under_new_item_keys() {
             .map(|event| event["data"]["itemKey"].as_str().expect("item key"))
             .collect::<Vec<_>>();
         assert_eq!(keys[0].split(':').count(), 2, "{keys:?}");
+        let discarded = events
+            .iter()
+            .filter(|event| event["event"] == "attempt_discarded")
+            .collect::<Vec<_>>();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0]["data"]["kind"], "generation");
+        assert_eq!(discarded[0]["data"]["attempt"], 1);
+        assert_eq!(discarded[0]["data"]["itemKeys"], json!([keys[0]]));
+        assert_eq!(discarded[0]["data"]["code"], "connection_error");
         assert!(
             keys[1..]
                 .iter()
@@ -2548,6 +2557,22 @@ async fn gateway_keeps_authorization_quota_and_request_failure_events_terminal()
 
 #[tokio::test]
 async fn gateway_bounds_retries_that_discard_visible_output() {
+    let (_, events, _) = prompt_against(vec![
+        created_then([json!({"type":"response.failed", "response":{
+            "id":"resp_failed", "status":"failed", "error":{"code":"server_error"},
+            "usage":{"input_tokens":40, "output_tokens":7, "total_tokens":47}
+        }})]),
+        Reply::Text("recovered"),
+    ])
+    .await;
+    let discarded = events
+        .iter()
+        .find(|event| event["event"] == "attempt_discarded")
+        .expect("discarded attempt");
+    assert_eq!(discarded["data"]["usage"]["output_tokens"], 7);
+    assert_eq!(discarded["data"]["providerCode"], "server_error");
+    assert_eq!(discarded["data"]["itemKeys"], json!([]));
+
     for failure in [
         response_failed(json!({"message":"fixture-bearer-token"})),
         response_failed(json!({"code":"server_error_xyz"})),
@@ -2571,6 +2596,17 @@ async fn gateway_bounds_retries_that_discard_visible_output() {
             Reply::Text("beyond the partial output limit"),
         ])
         .await;
+        let discarded = events
+            .iter()
+            .filter(|event| event["event"] == "attempt_discarded")
+            .collect::<Vec<_>>();
+        assert_eq!(discarded.len(), 2, "{failure}");
+        for (index, event) in discarded.iter().enumerate() {
+            assert_eq!(event["data"]["attempt"], index + 1);
+            assert_eq!(event["data"]["streamedBytes"], "partial text".len());
+            assert_eq!(event["data"]["itemKeys"].as_array().unwrap().len(), 1);
+            assert!(!event.to_string().contains("fixture-bearer-token"));
+        }
         assert_eq!(reply["error"]["code"], "native_error", "{failure}");
         assert!(!reply.to_string().contains("fixture-bearer-token"));
         assert_eq!(
@@ -2613,7 +2649,7 @@ async fn gateway_output_bound_counts_content_rather_than_event_envelopes() {
 #[tokio::test]
 async fn gateway_generation_requests_bound_output_tokens() {
     let provider = Provider::start([Reply::Text("default bound"), Reply::Text("configured")]).await;
-    for (id, bound) in [(None, 32_768), (Some(1_024), 1_024)] {
+    for (id, bound) in [(None, Value::Null), (Some(1_024), json!(1_024))] {
         let workspace = TempDir::new().unwrap();
         let native_home = TempDir::new().unwrap();
         let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");

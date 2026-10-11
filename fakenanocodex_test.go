@@ -359,6 +359,23 @@ func (f *fakeNative) charge(id uint64, command string) (bool, error) {
 	}
 }
 
+// accept acknowledges the prompt and, for the "discard" command, delivers
+// partial text from an attempt the helper then retries.
+func (f *fakeNative) accept(id uint64, command string) error {
+	if err := f.event(id, "accepted", map[string]any{"turnId": "fixture-turn"}); err != nil || command != "discard" {
+		return err
+	}
+	if err := f.event(id, "assistant_delta", map[string]any{"text": "partial ", "itemKey": "0:1"}); err != nil {
+		return err
+	}
+
+	return f.event(id, "attempt_discarded", map[string]any{
+		"kind": "generation", "modelCallIndex": 0, "attempt": 1, "itemKeys": []string{"0:1"}, "streamedBytes": 8,
+		"code": "connection_error", "message": "gateway connection ended before completion",
+		"usage": map[string]any{"input_tokens": 40, "output_tokens": 7, "total_tokens": 47, "input_tokens_details": map[string]any{"cached_tokens": 4}},
+	})
+}
+
 func (f *fakeNative) prompt(req fakeRequest) error {
 	var params struct {
 		Content []nanocodex.Content `json:"content"`
@@ -399,7 +416,7 @@ func (f *fakeNative) prompt(req fakeRequest) error {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	if err := f.event(req.ID, "accepted", map[string]any{"turnId": "fixture-turn"}); err != nil {
+	if err := f.accept(req.ID, command); err != nil {
 		return err
 	}
 	if done, err := f.charge(req.ID, command); done || err != nil {

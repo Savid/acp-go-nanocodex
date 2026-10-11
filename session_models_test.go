@@ -74,7 +74,7 @@ func configSnapshot(t *testing.T, s *session) []byte {
 	t.Helper()
 
 	s.mu.Lock()
-	data, err := json.Marshal(map[string]any{"options": s.options, "state": s.state, "rows": s.nativeRows})
+	data, err := json.Marshal(map[string]any{"options": s.options, "state": s.state, "started": s.started, "updatedAt": s.updatedAt})
 	s.mu.Unlock()
 	require.NoError(t, err)
 
@@ -382,4 +382,20 @@ func TestConfigModelRefusalOfAnEnvironmentDefaultIsInternal(t *testing.T) {
 		_, err := agent.SetSessionConfigOption(t.Context(), SetModelRequest(created.SessionId, "refuse-"+field))
 		require.Equal(t, wire.InternalFailure(vendor, "native_start"), err)
 	}
+}
+
+func TestRefusedConfigChangeLeavesTheStoredRecord(t *testing.T) {
+	t.Parallel()
+
+	store := acpcore.NewInMemorySessionStore()
+	agent, _, _, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, agent, workspace, WithSessionNanocodexOptions(NewNanocodexOptions(WithNanocodexModel("kimi-k3"))))
+	fixturePrompt(t, agent, created.SessionId, "started")
+	before, err := store.Load(t.Context(), string(created.SessionId))
+	require.NoError(t, err)
+	_, err = agent.SetSessionConfigOption(t.Context(), wire.SetConfigOptionRequest(created.SessionId, configThinking, "medium"))
+	require.Equal(t, wire.Unsupported("value"), err)
+	after, err := store.Load(t.Context(), string(created.SessionId))
+	require.NoError(t, err)
+	require.Equal(t, before, after)
 }

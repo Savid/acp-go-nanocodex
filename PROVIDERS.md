@@ -207,8 +207,9 @@ account.
   `thought_level` change starts a separate provider cache, so the next call is
   uncached.
 - Gateway failures without a terminal code retry up to five attempts; at most
-  two of them may discard output already delivered. Generation responses are
-  bounded by `maxOutputTokens`, default 32768.
+  two of them may discard output already delivered, and each retried attempt
+  is reported as `attemptDiscarded`. Generation responses are bounded only
+  when `maxOutputTokens` is set.
   See [retry and persistence behavior](README.md#scope).
 - Code Mode is disabled on every route. The freeform `apply_patch` tool is
   excluded on gateways; provider web search and image generation are disabled.

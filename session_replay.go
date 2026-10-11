@@ -21,12 +21,11 @@ type replayTextPart struct {
 func (s *session) replay(ctx context.Context) error {
 	s.mu.Lock()
 	path := s.state.RolloutPath
-	committed := s.cursor.Offset()
 	s.mu.Unlock()
 
 	var replayErr error
 
-	err := nanocodex.EachRow(s.home, path, committed, func(raw []byte) error {
+	err := nanocodex.EachRow(s.home, path, func(raw []byte) error {
 		replayErr = s.replayRow(ctx, raw)
 
 		return replayErr

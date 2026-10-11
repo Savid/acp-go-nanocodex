@@ -288,3 +288,32 @@ func TestHelperCallCostRequiresANonNegativeCost(t *testing.T) {
 	}
 	require.Nil(t, s.cost)
 }
+
+func TestDiscardedAttemptIsPublishedAndCountedInUsage(t *testing.T) {
+	t.Parallel()
+
+	a, client, _, workspace := fixtureAgent(t)
+	created := fixtureSession(t, a, workspace)
+	baseline := fixturePrompt(t, a, created.SessionId, "hello")
+	client.reset()
+	response := fixturePrompt(t, a, created.SessionId, "discard")
+	require.Equal(t, "partial Hello world.Second answer.", client.text())
+	require.Equal(t, baseline.Usage.TotalTokens+47, response.Usage.TotalTokens)
+	require.Equal(t, baseline.Usage.OutputTokens+7, response.Usage.OutputTokens)
+
+	notifications, _ := client.snapshot()
+	var discarded []map[string]any
+	for _, notification := range notifications {
+		if meta, ok := notification.Meta[vendor].(map[string]any); ok && notification.Update.SessionInfoUpdate != nil {
+			attempt, ok := meta["attemptDiscarded"].(map[string]any)
+			require.True(t, ok)
+			discarded = append(discarded, attempt)
+		}
+	}
+	require.Len(t, discarded, 1)
+	require.Equal(t, []string{"0:1"}, discarded[0]["itemKeys"])
+	require.Equal(t, "connection_error", discarded[0]["code"])
+	usage, ok := discarded[0]["usage"].(acp.Usage)
+	require.True(t, ok)
+	require.Equal(t, 47, usage.TotalTokens)
+}

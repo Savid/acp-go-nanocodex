@@ -297,3 +297,110 @@ func nativeToolContent(raw json.RawMessage) ([]acp.ToolCallContent, error) {
 
 	return content, nil
 }
+
+// discardedAttempt is a gateway attempt the helper retried, discarding the
+// output it had delivered.
+type discardedAttempt struct {
+	Kind           string   `json:"kind"`
+	ModelCallIndex int      `json:"modelCallIndex"`
+	Attempt        int      `json:"attempt"`
+	ItemKeys       []string `json:"itemKeys"`
+	StreamedBytes  int64    `json:"streamedBytes"`
+	Code           string   `json:"code,omitempty"`
+	Message        string   `json:"message,omitempty"`
+	StatusCode     int      `json:"statusCode,omitempty"`
+	ProviderCode   string   `json:"providerCode,omitempty"`
+	Usage          *struct {
+		Input   int `json:"input_tokens"`  //nolint:tagliatelle // Provider usage fields use snake_case.
+		Output  int `json:"output_tokens"` //nolint:tagliatelle // Provider usage fields use snake_case.
+		Total   int `json:"total_tokens"`  //nolint:tagliatelle // Provider usage fields use snake_case.
+		Details *struct {
+			Cached *int `json:"cached_tokens"` //nolint:tagliatelle // Provider usage fields use snake_case.
+		} `json:"input_tokens_details"` //nolint:tagliatelle // Provider usage fields use snake_case.
+		OutputDetails *struct {
+			Reasoning *int `json:"reasoning_tokens"` //nolint:tagliatelle // Provider usage fields use snake_case.
+		} `json:"output_tokens_details"` //nolint:tagliatelle // Provider usage fields use snake_case.
+	} `json:"usage,omitempty"`
+}
+
+// attemptDiscarded publishes a retried gateway attempt as
+// _meta.nanocodex.attemptDiscarded on a session_info_update, releases the
+// text its items streamed, and adds its reported usage to the turn's.
+func (s *session) attemptDiscarded(ctx context.Context, t *turn, data json.RawMessage) error {
+	var attempt discardedAttempt
+	if err := json.Unmarshal(data, &attempt); err != nil {
+		return err
+	}
+
+	for _, key := range attempt.ItemKeys {
+		t.texts.Forget(key)
+	}
+
+	published := map[string]any{
+		"kind": attempt.Kind, "modelCallIndex": attempt.ModelCallIndex, "attempt": attempt.Attempt,
+		"itemKeys": attempt.ItemKeys, "streamedBytes": attempt.StreamedBytes,
+	}
+
+	for name, value := range map[string]string{"code": attempt.Code, wire.FieldMessage: attempt.Message, "providerCode": attempt.ProviderCode} {
+		if value != "" {
+			published[name] = value
+		}
+	}
+
+	if attempt.StatusCode > 0 {
+		published["statusCode"] = attempt.StatusCode
+	}
+
+	if usage := attempt.Usage; usage != nil && usage.Total > 0 {
+		discarded := acp.Usage{InputTokens: usage.Input, OutputTokens: usage.Output, TotalTokens: usage.Total}
+		if usage.Details != nil {
+			discarded.CachedReadTokens = usage.Details.Cached
+		}
+
+		if usage.OutputDetails != nil {
+			discarded.ThoughtTokens = usage.OutputDetails.Reasoning
+		}
+
+		published["usage"] = discarded
+		t.discardedUsage = addUsage(t.discardedUsage, &discarded)
+	}
+
+	conn := s.agent.connection()
+	if conn == nil {
+		return nil
+	}
+
+	return conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: s.id,
+		Update:    acp.SessionUpdate{SessionInfoUpdate: &acp.SessionSessionInfoUpdate{}},
+		Meta:      map[string]any{vendor: map[string]any{"attemptDiscarded": published}},
+	})
+}
+
+// addUsage sums two turn usages; a nil usage adds nothing.
+func addUsage(total, usage *acp.Usage) *acp.Usage {
+	if usage == nil {
+		return total
+	}
+
+	if total == nil {
+		return &acp.Usage{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens, CachedReadTokens: addCount(nil, usage.CachedReadTokens), CachedWriteTokens: addCount(nil, usage.CachedWriteTokens), ThoughtTokens: addCount(nil, usage.ThoughtTokens)}
+	}
+
+	return &acp.Usage{
+		InputTokens: total.InputTokens + usage.InputTokens, OutputTokens: total.OutputTokens + usage.OutputTokens, TotalTokens: total.TotalTokens + usage.TotalTokens,
+		CachedReadTokens: addCount(total.CachedReadTokens, usage.CachedReadTokens), ThoughtTokens: addCount(total.ThoughtTokens, usage.ThoughtTokens),
+		CachedWriteTokens: addCount(total.CachedWriteTokens, usage.CachedWriteTokens),
+	}
+}
+
+func addCount(total, count *int) *int {
+	switch {
+	case count == nil:
+		return total
+	case total == nil:
+		return new(*count)
+	default:
+		return new(*total + *count)
+	}
+}

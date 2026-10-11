@@ -3,7 +3,6 @@ package nanocodexacp
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -40,8 +39,6 @@ type sessionBinding struct {
 	checkpoint json.RawMessage
 	state      nanocodex.State
 	options    NanocodexOptions
-	cursor     sessionlog.Cursor
-	nativeRows int
 	started    bool
 }
 
@@ -64,14 +61,10 @@ type session struct {
 	title      string
 	updatedAt  string
 	started    bool
-	// mirror publishes the native rollout; cursor and nativeRows describe the
-	// rows it last committed, and recordDigest the configuration record.
-	mirror       *sessionlog.Mirror
-	cursor       sessionlog.Cursor
-	nativeRows   int
-	recordDigest [sha256.Size]byte
-	// headerOnly reports that the launched rollout held only its header.
-	headerOnly bool
+	// mirror publishes the native rollout; checkpointStamp identifies the
+	// checkpoint file the session last read.
+	mirror          *sessionlog.Mirror
+	checkpointStamp nanocodex.CheckpointStamp
 	// pending is a stored generation the next launch hydrates.
 	pending   *storedSession
 	rt        *runtime
@@ -149,29 +142,17 @@ func (s *session) launch(ctx context.Context) (*runtime, error) {
 		}
 	}()
 
-	nativeRows := s.nativeRows
-
 	if pending := s.pending; pending != nil {
 		s.pending = nil
 
 		if hydrateErr := s.hydrate(ctx, pending); hydrateErr != nil {
 			return nil, hydrateErr
 		}
-
-		nativeRows = s.nativeRows
-	} else if nativeRows > 0 && !s.ephemeral {
-		if nativeRows, err = s.ensureNative(ctx); err != nil {
-			return nil, err
-		}
 	}
 
-	// A rollout holding only its header has no resumable conversation, so
-	// the helper binds a fresh native session in its place.
-	s.mu.Lock()
-	s.headerOnly = nativeRows == 1
-	s.mu.Unlock()
-
-	if nativeRows == 1 {
+	// A conversation without accepted input has no resumable native history,
+	// so the helper binds a fresh native session in its place.
+	if s.state.NativeSessionID != "" && !s.started {
 		generated, generateErr := uuid.NewV7()
 		if generateErr != nil {
 			return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
@@ -348,13 +329,13 @@ func (s *session) applyState(state nanocodex.State) error {
 	}
 
 	if s.state.NativeSessionID != "" && s.state.NativeSessionID != state.NativeSessionID {
-		if s.started || !s.headerOnly || state.ReplacedNativeSessionID != s.state.NativeSessionID {
+		if s.started || state.ReplacedNativeSessionID != s.state.NativeSessionID {
 			s.poison = wire.CauseNativeSessionIdentityDrift
 
 			return wire.SessionPoisoned(vendor, s.poison)
 		}
 
-		s.binding = &sessionBinding{checkpoint: s.checkpoint, state: s.state, options: s.options.clone(), cursor: s.cursor, nativeRows: s.nativeRows, started: s.started}
+		s.binding = &sessionBinding{checkpoint: s.checkpoint, state: s.state, options: s.options.clone(), started: s.started}
 	}
 
 	s.state = state
@@ -392,8 +373,6 @@ func (s *session) rollbackBinding() {
 	if binding := s.binding; binding != nil {
 		s.state = binding.state
 		s.options = binding.options
-		s.cursor = binding.cursor
-		s.nativeRows = binding.nativeRows
 		s.checkpoint = binding.checkpoint
 		s.started = binding.started
 		s.binding = nil
