@@ -507,7 +507,17 @@ func (f *fakeNative) prompt(req fakeRequest) error {
 		return err
 	}
 
-	return f.reply(req.ID, f.result("end_turn"))
+	return f.reply(req.ID, f.result(stopReason(command)))
+}
+
+// stopReason is the helper's stop reason for a fixture prompt: "truncate"
+// stops at the output-token bound.
+func stopReason(command string) string {
+	if command == "truncate" {
+		return "max_tokens"
+	}
+
+	return "end_turn"
 }
 
 func (f *fakeNative) compact(id uint64, command string) (int, error) {

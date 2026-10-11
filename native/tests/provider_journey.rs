@@ -2416,6 +2416,63 @@ async fn oversized_prompt_leaves_native_history_usable() {
     assert!(rollout.contains("accepted after oversize"));
 }
 
+#[tokio::test]
+async fn output_token_limit_ends_the_turn_with_its_partial_text() {
+    let message = json!({"id":"msg_partial", "type":"message", "role":"assistant", "status":"incomplete",
+        "content":[{"type":"output_text", "text":"partial answer", "annotations":[]}]});
+    let call = json!({"id":"fc_partial", "type":"function_call", "call_id":"call_partial", "name":"exec_command",
+        "status":"incomplete", "arguments":json!({"cmd":"touch must-not-run", "login":false}).to_string()});
+    let provider = Provider::start([
+        created_then([
+            json!({"type":"response.output_text.delta", "item_id":"msg_partial", "output_index":0, "content_index":0, "delta":"partial answer"}),
+            json!({"type":"response.incomplete", "response":{
+                "id":"resp_failed", "status":"incomplete", "incomplete_details":{"reason":"max_output_tokens"},
+                "output":[message, call],
+                "usage":{"input_tokens":10, "output_tokens":5, "total_tokens":15, "cost":0.5}
+            }}),
+        ]),
+        Reply::Text("continued"),
+    ])
+    .await;
+    let workspace = TempDir::new().unwrap();
+    let native_home = TempDir::new().unwrap();
+    let mut helper = Helper::start(workspace.path(), native_home.path(), "FIXTURE_API_KEY");
+    helper
+        .call(
+            1,
+            "initialize",
+            initialize(&provider, "FIXTURE_API_KEY", "openai"),
+        )
+        .await;
+    let truncated = helper.call(2, "prompt", prompt("answer at length")).await;
+    assert_eq!(truncated["stopReason"], "max_tokens");
+    assert_eq!(truncated["finalMessage"], "partial answer");
+    assert!(
+        helper
+            .events
+            .iter()
+            .any(|event| event["event"] == "call_cost" && event["data"]["cost"] == 0.5)
+    );
+    assert!(
+        helper
+            .events
+            .iter()
+            .all(|event| event["data"]["type"] != "tool.call")
+    );
+    let next = helper.call(3, "prompt", prompt("go on")).await;
+    assert_eq!(next["stopReason"], "end_turn");
+    helper.shutdown(4).await;
+    assert!(!workspace.path().join("must-not-run").exists());
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let history = requests[1].body["input"].as_array().unwrap();
+    assert!(history.iter().any(|item| item["type"] == "message"
+        && item["role"] == "assistant"
+        && item["content"][0]["text"] == "partial answer"
+        && item.get("status").is_none()));
+    assert!(history.iter().all(|item| item["type"] != "function_call"));
+}
+
 fn created_then(events: impl IntoIterator<Item = Value>) -> Reply {
     let mut body = sse(
         json!({"type":"response.created", "response":{"id":"resp_failed", "status":"in_progress"}}),

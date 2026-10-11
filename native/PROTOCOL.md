@@ -143,7 +143,11 @@ so a missing or unrecognized code retries. A three-digit code is an HTTP status
 under the same status rule. Other terminal codes cover authorization, quota and
 billing, model access, invalid requests, context windows, image input, and
 content policy, plus the `max_output_tokens` and `content_filter` incomplete
-reasons. Malformed provider data fails immediately. Backoff is exponential with
+reasons. A generation response stopped at `max_output_tokens` that carries
+assistant text instead ends the turn with stop reason `max_tokens`: native
+history keeps its assistant messages, without their incomplete status, and
+drops its incomplete tool calls and reasoning. Malformed provider data fails
+immediately. Backoff is exponential with
 random jitter. Valid `Retry-After` delays and event `retry_after` values up to
 60 seconds are honored, as are `retry-after-ms` values. Backoff remains the
 minimum delay, including for zero server delays. Overflowing decimal values and
@@ -246,7 +250,7 @@ already been reported.
   never receive this fallback.
 - `prompt`: `{content:[{type:"text",text:string}|{type:"image",image_url:string}]}`.
   Only one turn may be active. The reply waits for completion and contains
-  `{stopReason:"end_turn"|"cancelled", finalMessage, usage?, nativeSessionId,
+  `{stopReason:"end_turn"|"max_tokens"|"cancelled", finalMessage, usage?, nativeSessionId,
   rolloutPath, committedBytes}`. Usage has `inputTokens`, `cachedInputTokens`,
   `outputTokens`, `reasoningOutputTokens`, and `totalTokens`. A failed turn
   returns an error after flushing its native state. A turn that fails with a

@@ -316,7 +316,10 @@ responses, and provider failure events whose code is missing, unrecognized, or
 a transient HTTP status, up to five total attempts with exponential backoff and
 jitter. Authorization, quota, model, invalid-request, context-window, image,
 and policy codes fail immediately, as do incomplete responses stopped by
-`max_output_tokens` or `content_filter`. An attempt that fails after
+`content_filter`. A generation response stopped by `max_output_tokens` ends
+the prompt with stop reason `max_tokens` when it carries assistant text, which
+is committed to native history; its incomplete tool calls never run, and one
+without assistant text fails. An attempt that fails after
 delivering assistant or reasoning output retries at most twice per model call;
 the retried response is presented as new text after the discarded partial
 text. Every retried attempt is published, before its retry delay, as

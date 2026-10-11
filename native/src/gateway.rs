@@ -20,7 +20,10 @@ use std::{
     error::Error,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -54,6 +57,8 @@ struct GatewayRoute {
     client: reqwest::Client,
     events: mpsc::Sender<GatewayEvent>,
     cache_usage: Mutex<HashMap<u32, CacheUsage>>,
+    /// A generation response stopped at `max_output_tokens` and ended the turn.
+    truncated: AtomicBool,
 }
 
 struct CacheUsage {
@@ -80,10 +85,19 @@ impl GatewayLayer {
                     client,
                     events,
                     cache_usage: Mutex::default(),
+                    truncated: AtomicBool::new(false),
                 }))
             })
             .transpose()?;
         Ok((Self { route }, receiver))
+    }
+
+    /// Reports, and clears, whether the turn ended at a generation response
+    /// that stopped at `max_output_tokens`.
+    pub fn take_truncated(&self) -> bool {
+        self.route
+            .as_ref()
+            .is_some_and(|route| route.truncated.swap(false, Ordering::AcqRel))
     }
 
     /// Preserves the provider's optional cache counts on a native call event.
@@ -749,10 +763,18 @@ impl GatewayRoute {
                     }
                     done_items.insert(index, item);
                 }
-                Some("response.completed") => {
+                Some(terminal @ ("response.completed" | "response.incomplete"))
+                    if terminal == "response.completed"
+                        || (!compacting
+                            && event["response"]["incomplete_details"]["reason"]
+                                == "max_output_tokens") =>
+                {
                     self.charge(&event["response"]).await?;
+                    let truncated = terminal == "response.incomplete";
                     let mut response = event["response"].clone();
-                    if response["output"].as_array().is_none_or(Vec::is_empty) {
+                    if truncated && response["output"].as_array().is_none_or(Vec::is_empty) {
+                        response["output"] = json!(done_items.into_values().collect::<Vec<_>>());
+                    } else if response["output"].as_array().is_none_or(Vec::is_empty) {
                         if done_items.keys().copied().ne(0..done_items.len()) {
                             return Err(failure(
                                 "gateway completion has incomplete output indexes",
@@ -760,6 +782,14 @@ impl GatewayRoute {
                             .into());
                         }
                         response["output"] = json!(done_items.into_values().collect::<Vec<_>>());
+                    }
+                    if truncated {
+                        let output = truncated_output(&response["output"]);
+                        // Without assistant text the stopped response is a failure.
+                        if output.is_empty() {
+                            return Err(Failure::event(&event));
+                        }
+                        response["output"] = json!(output);
                     }
                     if !compacting && let Some(items) = response["output"].as_array() {
                         for (index, item) in items.iter().enumerate() {
@@ -789,7 +819,9 @@ impl GatewayRoute {
                     if compacting && response.status == "incomplete" {
                         return Err(summary_failure(SUMMARY_TRUNCATED).into());
                     }
-                    if response.status != "completed" || response.id.trim().is_empty() {
+                    if (response.status != "completed" && !truncated)
+                        || response.id.trim().is_empty()
+                    {
                         return Err(failure("gateway response did not complete").into());
                     }
                     if compacting {
@@ -811,6 +843,9 @@ impl GatewayRoute {
                         .lock()
                         .unwrap()
                         .insert(model_call_index, cache_usage);
+                    if truncated {
+                        self.truncated.store(true, Ordering::Release);
+                    }
                     return Ok((ResponsesOutput::Generation(output), committed_output));
                 }
                 Some("response.incomplete") if compacting => {
@@ -871,6 +906,26 @@ fn reported_cost(response: &Value) -> Option<f64> {
         .as_f64()
         .filter(|cost| *cost >= 0.0)
         .map(|cost| cost + 0.0)
+}
+
+/// Keeps the assistant messages of a response stopped at `max_output_tokens`,
+/// without their incomplete status, so the native history records the
+/// partial text. Its tool calls are incomplete and never run, and its
+/// reasoning cannot be replayed.
+fn truncated_output(output: &Value) -> Vec<Value> {
+    output
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+        .map(|item| {
+            let mut item = item.clone();
+            if let Some(fields) = item.as_object_mut() {
+                fields.remove("status");
+            }
+            item
+        })
+        .collect()
 }
 
 fn generation_output(

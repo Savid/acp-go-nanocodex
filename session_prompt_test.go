@@ -15,6 +15,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/stretchr/testify/require"
 )
@@ -543,4 +544,22 @@ func TestConformanceSDKCancellationWaitsForCommitAndIdle(t *testing.T) {
 			require.Equal(t, lifecycle.OutcomeCancelled, last.Event.State.Outcome)
 		})
 	}
+}
+
+func TestOutputTokenLimitStopsTheTurnAndCommitsItsOutput(t *testing.T) {
+	t.Parallel()
+
+	store := acpcore.NewInMemorySessionStore()
+	agent, client, _, workspace := fixtureAgent(t, WithSessionStore(store))
+	created := fixtureSession(t, agent, workspace)
+	response, err := agent.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "truncate"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonMaxTokens, response.StopReason)
+	require.Equal(t, "Hello world.Second answer.", client.text())
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Contains(t, string(rows[len(rows)-1]), "Second answer.")
+	fixturePrompt(t, agent, created.SessionId, "continue after the bound")
 }

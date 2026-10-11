@@ -150,13 +150,14 @@ impl Server {
         }
         self.gateway_drain(active.id).await?;
         let session = self.session.as_mut().expect("active turn owns a session");
+        let truncated = session.gateway_layer.take_truncated();
         let flushed = session.agent.flush_rollout().await;
         let response = match flushed {
             Err(_) => Err(SessionError::persistence()),
             Ok(()) => match result {
                 Ok(result) => {
                     let mut value = session.rollout_state();
-                    value["stopReason"] = json!("end_turn");
+                    value["stopReason"] = json!(if truncated { "max_tokens" } else { "end_turn" });
                     value["finalMessage"] = json!(result.final_message());
                     if let Some(usage) = result.usage() {
                         value["usage"] = json!({

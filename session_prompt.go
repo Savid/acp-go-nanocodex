@@ -291,6 +291,8 @@ func (s *session) runPrompt(ctx context.Context, p acp.PromptRequest, content []
 	case err != nil:
 		outcome = lifecycle.OutcomeFailed
 		err = s.processFailure(rt, err)
+	case result.StopReason == "max_tokens":
+		resp.StopReason = acp.StopReasonMaxTokens
 	case result.StopReason != "end_turn":
 		outcome = lifecycle.OutcomeFailed
 		err = wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: "unrecognized native stop reason"})
