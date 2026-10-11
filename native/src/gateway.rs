@@ -578,14 +578,17 @@ impl GatewayRoute {
                         continue;
                     }
                     let attempt = retry.attempt();
-                    if !retry.wait(&error, !progress.item_keys.is_empty()).await {
+                    let Some(delay) = retry.retry(&error, !progress.item_keys.is_empty()) else {
                         return Err(error.error);
-                    }
+                    };
+                    // The client learns of the discarded attempt before the
+                    // delay, which a cancellation may cut short.
                     self.send(
                         "attempt_discarded",
                         discarded_attempt(kind, model_call_index, attempt, &error, &progress),
                     )
                     .await?;
+                    tokio::time::sleep(delay).await;
                     if !progress.item_keys.is_empty() {
                         presentation += 1;
                     }

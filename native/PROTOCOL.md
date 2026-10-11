@@ -153,14 +153,15 @@ event type, `providerCode`, and whether it retries or why it stops.
 A generation attempt that fails after delivering assistant or reasoning output
 retries under the same rules, discarding that output, at most twice per model
 call; the stderr line says it discards partial output. A retry cannot execute
-tools from an incomplete response. Before each retry the helper sends an
+tools from an incomplete response. Before each retry delay the helper sends an
 `attempt_discarded` event with `data: {kind, modelCallIndex, attempt, itemKeys,
 streamedBytes, code?, message?, statusCode?, providerCode?, usage?}`: whether
 the attempt was a generation or compaction summary, the failed attempt number,
 the item keys it had delivered, the bytes of text and reasoning it streamed,
 the fixed error classification, and the provider's `usage` object when the
 failure reported one. It may precede `accepted` for compaction. Cancellation interrupts both
-requests and retry delays.
+requests and retry delays; an attempt discarded before a cancelled delay has
+already been reported.
 
 ## Methods
 

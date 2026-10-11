@@ -319,7 +319,7 @@ and policy codes fail immediately, as do incomplete responses stopped by
 `max_output_tokens` or `content_filter`. An attempt that fails after
 delivering assistant or reasoning output retries at most twice per model call;
 the retried response is presented as new text after the discarded partial
-text. Every retried attempt is published as
+text. Every retried attempt is published, before its retry delay, as
 `_meta.nanocodex.attemptDiscarded` on an otherwise empty
 `session_info_update`: `{kind, modelCallIndex, attempt, itemKeys, messages,
 streamedBytes, code?, message?, statusCode?, providerCode?, usage?}`, where

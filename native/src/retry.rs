@@ -289,9 +289,9 @@ impl Retry {
         Ok(Duration::from_millis(base_ms * jitter / 100).max(server))
     }
 
-    /// Writes one redacted stderr line for the failed attempt and waits when
-    /// another attempt follows.
-    pub async fn wait(&mut self, failure: &Failure, output_delivered: bool) -> bool {
+    /// Writes one redacted stderr line for the failed attempt and returns the
+    /// delay before the next attempt, or `None` when none follows.
+    pub fn retry(&mut self, failure: &Failure, output_delivered: bool) -> Option<Duration> {
         let (attempt, summary) = (self.attempt, &failure.summary);
         match self.next_delay(failure, output_delivered) {
             Ok(delay) => {
@@ -306,14 +306,13 @@ impl Retry {
                     delay.as_millis()
                 );
                 self.attempt += 1;
-                tokio::time::sleep(delay).await;
-                true
+                Some(delay)
             }
             Err(reason) => {
                 eprintln!(
                     "gateway attempt {attempt}/{MAX_ATTEMPTS} failed{summary}; not retrying: {reason}"
                 );
-                false
+                None
             }
         }
     }

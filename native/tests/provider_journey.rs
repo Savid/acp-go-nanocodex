@@ -2208,14 +2208,19 @@ async fn cancellation_interrupts_retry_after_and_leaves_the_session_usable() {
     helper.send(3, "cancel", json!({})).await;
     timeout(Duration::from_secs(2), async {
         let mut replies = 0;
+        let mut discarded = false;
         while replies < 2 {
             let frame = helper.next().await;
             if frame.get("event").is_some() {
+                discarded |= frame["event"] == "attempt_discarded" && frame["requestId"] == 2;
                 continue;
             }
             assert!(frame.get("error").is_none());
             match frame["id"].as_u64() {
-                Some(2) => assert_eq!(frame["result"]["stopReason"], "cancelled"),
+                Some(2) => {
+                    assert!(discarded, "the discarded attempt precedes its retry delay");
+                    assert_eq!(frame["result"]["stopReason"], "cancelled");
+                }
                 Some(3) => assert_eq!(frame["result"]["cancelled"], true),
                 _ => panic!("unexpected cancellation reply: {frame}"),
             }
