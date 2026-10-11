@@ -304,6 +304,9 @@ def build(tag, targets, glibc_floor, macos_floor, zig_dir, cargo_zigbuild):
         SOURCE_DATE_EPOCH=str(epoch),
         CARGO_TARGET_DIR=str(WORK / "cargo"),
         CARGO_PROFILE_RELEASE_STRIP="symbols",
+        # Stripping proc-macro dylibs corrupts them on current macOS linkers;
+        # only the shipped helper is stripped.
+        CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP="none",
         CARGO_INCREMENTAL="0",
         MACOSX_DEPLOYMENT_TARGET=macos_floor,
         RUSTFLAGS=" ".join(f"--remap-path-prefix={source}={target}" for source, target in remaps.items()),
